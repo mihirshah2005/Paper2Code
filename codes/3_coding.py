@@ -160,7 +160,14 @@ for todo_file_name in todo_file_lst:
     
     with open(f"{output_dir}/{save_todo_file_name}_simple_analysis_response.json") as f:
         detailed_logic_analysis_response = json.load(f)
-    detailed_logic_analysis_dict[todo_file_name] = detailed_logic_analysis_response[0]['choices'][0]['message']['content']
+    if "choices" in detailed_logic_analysis_response[0]:
+    # legacy format
+        detailed_logic_analysis_dict[todo_file_name] = detailed_logic_analysis_response[0]['choices'][0]['message']['content']
+    elif "text" in detailed_logic_analysis_response[0]:
+    # updated analyzing.py format
+        detailed_logic_analysis_dict[todo_file_name] = detailed_logic_analysis_response[0]['text']
+    else:
+        raise ValueError(f"Unexpected format in {todo_file_name}_simple_analysis_response.json")
 
 artifact_output_dir=f'{output_dir}/coding_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
@@ -204,7 +211,7 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     total_accumulated_cost = temp_total_accumulated_cost
 
     # save artifacts
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w') as f:
+    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w', encoding='utf-8') as f:
         f.write(completion_json['choices'][0]['message']['content'])
 
 
@@ -218,7 +225,7 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
         todo_file_dir = '/'.join(todo_file_name.split("/")[:-1])
         os.makedirs(f"{output_repo_dir}/{todo_file_dir}", exist_ok=True)
 
-    with open(f"{output_repo_dir}/{todo_file_name}", 'w') as f:
+    with open(f"{output_repo_dir}/{todo_file_name}", 'w', encoding='utf-8') as f:
         f.write(code)
 
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)
