@@ -5,21 +5,50 @@ import sys
 import argparse
 from utils import read_python_files, extract_planning, content_to_json, \
         num_tokens_from_messages, read_all_files, extract_json_from_string, get_now_str, print_log_cost
+from pathlib import Path
+import re
+
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>  ALL THIS NEW STUFF I ADDED LATER (FOR MYSELF TO NOT GET CONFUSED)  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# ---------- Stage-classification regexes ----------
+_PLANNING_RX   = re.compile(r"(config|yaml|toml|ini|plan|prompt|hyper|dataset|args?)")
+_ANALYZING_RX  = re.compile(r"(model|module|layer|train|fit|loss|optimizer|forward|backward|criterion|mask|dataloader|preprocess)")
+_EVALUATING_RX = re.compile(r"(eval|validate|val_|metric|test|checkpoint|plot|visualize|inference)")
+
 def infer_stage(file_name: str, func_name: str, critique: str) -> str:
-    text = f"{file_name} {func_name} {critique}".lower()
-    if any(k in text for k in ('config', 'plan', 'prompt', 'hyper', 'dataset')):
-        return 'planning'
-    if any(k in text for k in ('forward', 'train', 'loss', 'optimizer',
-                               'preprocess', 'layer', 'mask')):
-        return 'analyzing'
-    if any(k in text for k in ('eval', 'metric', 'validate', 'test',
-                               'plot', 'checkpoint')):
-        return 'evaluating'
-    return 'unknown'
+    """
+    Heuristic classifier:
+        1) Checks directory / filename signals with regexes
+        2) Falls back to token search in func name + critique text
+    """
+    p = Path(file_name.lower())
+    parts = "/".join(p.parts)          # full path like src/train/fit_epoch.py
+    stem  = p.stem                     # filename without suffix
+
+    # ---------- 1) directory / filename cues ----------
+    if _PLANNING_RX.search(stem) or _PLANNING_RX.search(parts):
+        return "planning"
+    if _ANALYZING_RX.search(stem) or _ANALYZING_RX.search(parts):
+        return "analyzing"
+    if _EVALUATING_RX.search(stem) or _EVALUATING_RX.search(parts):
+        return "evaluating"
+
+    # ---------- 2) fallback: func name + critique text ----------
+    text = f"{func_name} {critique}".lower()
+
+    if any(k in text for k in ("config", "plan", "prompt", "hyper", "dataset", "yaml")):
+        return "planning"
+    if any(k in text for k in ("forward", "train", "fit", "loss", "optimizer",
+                               "backward", "preprocess", "layer", "mask", "dataloader", "criterion")):
+        return "analyzing"
+    if any(k in text for k in ("eval", "metric", "validate", "val_", "test",
+                               "plot", "checkpoint", "visualize", "inference")):
+        return "evaluating"
+
+    return "unknown"
+
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>  NEW STUFF ENDS HERE  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 def api_call(request_json):
