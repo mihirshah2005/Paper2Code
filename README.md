@@ -79,11 +79,6 @@ PaperCoder/
 
 ---
 
-## 📜 License
-[MIT License](LICENSE)
-
----
-
 ## 👤 Author
 **Mihir Shah**  
 📧 mihirsunilshah@gmail.com  
