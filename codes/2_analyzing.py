@@ -8,6 +8,8 @@ from pathlib import Path
 import openai
 import argparse
 
+MAX_FEEDBACK_ITERATIONS = 3
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--paper_name', type=str)
 parser.add_argument('--gpt_version',type=str, default="o3-mini")
@@ -25,7 +27,6 @@ pdf_latex_path = args.pdf_latex_path
 output_dir = args.output_dir
 
 gpt_version = "o3-mini"  # or o3-mini
-import openai
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def api_call(msg):
@@ -166,6 +167,13 @@ Output a list of critiques in JSON format like this:
     }}
   ]
 }}
+
+Assign “severity_level” as follows:
+- **High**: Missing or incorrect implementation of core methods, loss functions, or experimental components that break reproduction (e.g. main algorithm is wrong or absent).
+- **Medium**: Errors in training loops, data preprocessing, or key workflows that significantly affect results but do not fully block reproduction (e.g. bad augmentation, wrong loop structure).
+- **Low**: Minor deviations or non critical details (e.g. hyperparameter choices, logging, evaluation scripts) that do not alter core methodology.
+
+Respond only with the JSON.
 """}
     ]
     try:
@@ -180,47 +188,102 @@ Output a list of critiques in JSON format like this:
 artifact_output_dir = f'{output_dir}/analyzing_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
 
+# -------------------------------
+# Feedback loop per file
+# -------------------------------
+# -------------------------------
+# Feedback loop per file
+# -------------------------------
 for todo_file_name in tqdm(todo_file_lst):
     if todo_file_name == "config.yaml":
         continue
 
-    responses = []
-    trajectories = copy.deepcopy(analysis_msg)
+    print(f"[ANALYZING] {todo_file_name}")
 
-    if todo_file_name not in logic_analysis_dict:
-        logic_analysis_dict[todo_file_name] = ""
+    # ── 1. build a fresh message stack for this file ─────────────
+    file_msg = copy.deepcopy(analysis_msg)          # use the global template
+    file_msg.extend(get_write_msg(
+        todo_file_name,
+        logic_analysis_dict.get(todo_file_name, "")
+    ))
 
-    instruction_msg = get_write_msg(todo_file_name, logic_analysis_dict[todo_file_name])
-    trajectories.extend(instruction_msg)
+    # ── 2. make sure debug folder exists (first call only) ───────
+    debug_output_dir = Path(output_dir) / "analyzing_artifacts" / "debug_revisions"
+    debug_output_dir.mkdir(parents=True, exist_ok=True)
 
-    completion = api_call(trajectories)
-
-    eval_json = run_evaluation_on_analysis(todo_file_name, completion)
-    crit_path = Path(output_dir) / f"{todo_file_name}_critiques.json"
-    with open(crit_path, "w") as f:
-        json.dump(eval_json, f, indent=2)
-
-    actionable = [c for c in eval_json.get("critique_list", []) if c["severity_level"] in ("high", "medium")]
-    if actionable:
-        feedback_msg = [{"role": "user", "content": f"""The following critiques were raised for your analysis of `{todo_file_name}`:
-
-{json.dumps(actionable, indent=2)}
-
-Please revise the analysis to address the issues."""}]
-        trajectories.extend(feedback_msg)
-        completion = api_call(trajectories)
-
-    completion_json = {'text': completion}
-    print_response(completion_json, is_llm=True)
-    responses.append(completion_json)
-    trajectories.append({'role': 'assistant', 'content': completion})
-
-    with open(f'{artifact_output_dir}/{todo_file_name}_simple_analysis.txt', 'w', encoding='utf-8') as f:
-        f.write(completion)
-
-    done_file_lst.append(todo_file_name)
     safe_name = todo_file_name.replace("/", "_")
-    with open(f'{output_dir}/{safe_name}_simple_analysis_response.json', 'w', encoding='utf-8') as f:
-        json.dump(responses, f)
-    with open(f'{output_dir}/{safe_name}_simple_analysis_trajectories.json', 'w', encoding='utf-8') as f:
-        json.dump(trajectories, f)
+    max_iterations = MAX_FEEDBACK_ITERATIONS
+    for iteration in range(1, max_iterations + 1):
+        print(f"\n🔄 Iteration {iteration}: generating analysis...")
+        analysis_text = api_call(file_msg)
+
+        # save intermediate revision for inspection
+        (debug_output_dir / f"{safe_name}_rev{iteration}.txt").write_text(
+            analysis_text, encoding="utf-8"
+        )
+
+        # run critique pass
+                # ---------- run critique pass & log it -----------------
+        crit_json = run_evaluation_on_analysis(todo_file_name, analysis_text) or {}
+
+        # save the raw JSON for this revision
+        (debug_output_dir / f"{safe_name}_rev{iteration}_critiques.json").write_text(
+            json.dumps(crit_json, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        # robust parsing  (handles dict / string / list)
+        if isinstance(crit_json, str):
+            try:
+                crit_json = json.loads(crit_json)
+            except json.JSONDecodeError:
+                crit_json = {}
+
+        crit_list = []
+        if isinstance(crit_json, dict):
+            crit_list = crit_json.get("critique_list", [])
+        elif isinstance(crit_json, list):
+            crit_list = crit_json                   # already a list
+
+        # normalise severity and filter High / Medium
+        hi_med = [
+            c for c in crit_list
+            if isinstance(c, dict)
+            and c.get("severity_level", "").lower() in ("high", "medium")
+        ]
+
+        # ---------- console log for quick debugging ------------
+        print(f"   ↪︎ {len(crit_list)} total critiques, "
+              f"{len(hi_med)} High/Medium")
+
+        if not hi_med:
+            print("✅ No high or medium critiques. Stopping loop.")
+            break
+
+        if iteration == max_iterations:
+            print("⏹️ Max iterations reached. Using latest revision.")
+            break
+
+        # append feedback and re-prompt
+        file_msg.append({"role": "assistant", "content": analysis_text})
+        file_msg.append({
+            "role": "user",
+            "content": (
+                f"The following critiques were raised for `{todo_file_name}`:\n\n"
+                f"{json.dumps(hi_med, indent=2)}\n\n"
+                "Please revise the analysis to address these critiques."
+            )
+        })
+
+    # ── 3. save FINAL version (coding.py will consume this) ──────
+    artifact_path = Path(output_dir) / "analyzing_artifacts"
+    (artifact_path / f"{safe_name}_simple_analysis.txt").write_text(
+        analysis_text, encoding="utf-8"
+    )
+
+    # wrap in a list so coding.py's [0] access works
+    (Path(output_dir) / f"{safe_name}_simple_analysis_response.json").write_text(
+        json.dumps([{"text": analysis_text}], ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    print(f"✅ Final analysis for {todo_file_name} saved.")
