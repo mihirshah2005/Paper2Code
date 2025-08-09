@@ -191,9 +191,7 @@ os.makedirs(artifact_output_dir, exist_ok=True)
 # -------------------------------
 # Feedback loop per file
 # -------------------------------
-# -------------------------------
-# Feedback loop per file
-# -------------------------------
+
 for todo_file_name in tqdm(todo_file_lst):
     if todo_file_name == "config.yaml":
         continue
