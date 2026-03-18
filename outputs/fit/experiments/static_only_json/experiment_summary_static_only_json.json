@@ -1,0 +1,56 @@
+{
+  "paper_name": "fit",
+  "mode": "static_only",
+  "feedback_format": "json",
+  "max_iterations": 3,
+  "total_prompt_tokens": 94620,
+  "total_completion_tokens": 27459,
+  "total_tokens": 122079,
+  "per_file_iterations": {
+    "dataset_loader.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "model.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "trainer.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "evaluation.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "main.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ]
+  }
+}

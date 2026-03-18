@@ -1,0 +1,76 @@
+Below is the detailed logic analysis for main.py that explains how the application’s entry point will work. This analysis describes – step by step – what main.py must do in order to load the configuration, initialize the data and models, run training, and finally perform evaluation.
+
+─────────────────────────────  
+1. Load Configuration and Setup  
+ • Read the config.yaml file (using a YAML parser) to obtain a dictionary with all configuration parameters.  
+  – This includes training hyperparameters (optimizer parameters, learning rate schedule, warmup steps, total steps per model type), model configurations (for both “base” and “big” variants), data settings (dataset names and vocabulary sizes), inference settings (beam sizes, length penalties, max output offset), and checkpoint settings.  
+ • Initialize logging (e.g., set up a logger that prints informational messages about the configuration, progress, and results).  
+ • Optionally set random seeds and check for GPU (CUDA) availability.
+
+─────────────────────────────  
+2. Initialize DatasetLoader  
+ • Instantiate the DatasetLoader class using the relevant portion of the configuration (for example, by passing config["data"]).  
+ • Call the load_data() method to load and preprocess the datasets (WMT for translation and/or WSJ for parsing, as needed). The DatasetLoader should:  
+  – Use SentencePiece (or your chosen subword tokenizer) according to the config (e.g., vocabulary sizes: 37000 for English–German, 32000 for English–French, etc.).  
+  – Create appropriate DataLoader objects for training, validation, and test splits while batching sentences based on the approximate token count (batch_size_tokens from config).  
+ • Keep the returned loaders (train_loader, val_loader, test_loader) for further steps.
+
+─────────────────────────────  
+3. Create the Transformer Model  
+ • Based on the configuration (config["model"]), decide whether to build a “base” or “big” Transformer model. This decision could be based on a flag or command-line parameter passed through the config.  
+ • Instantiate the TransformerModel class (from model.py) with the parameters from the selected configuration (e.g., num_layers, d_model, d_ff, num_heads, d_k, d_v).  
+ • Within the TransformerModel, the architecture must include:  
+  – An encoder stack and a decoder stack, with residual connections and layer normalization.  
+  – Multi-head attention modules (with proper masking in the decoder self-attention to prevent future positions), a position-wise feed-forward network, and sinusoidal positional encodings.  
+  – Tying of the input embeddings and the output projection (which is used with the softmax layer).  
+ • Ensure that the model is moved to the appropriate device (e.g., GPU if available).
+
+─────────────────────────────  
+4. Initialize the Trainer  
+ • Instantiate the Trainer class (from trainer.py) with the following inputs:  
+  – The TransformerModel instance created above.  
+  – The train_loader and val_loader from the DatasetLoader.  
+  – The training portion of the configuration (including optimizer choice “Adam”, β1, β2, ε, dropout_rate, label_smoothing, learning rate schedule formula, warmup_steps, total_steps for base or big model).  
+ • The Trainer is responsible for:  
+  – Setting up the Adam optimizer with the provided hyperparameters.  
+  – Implementing the custom learning rate schedule (lrate = d_model^(–0.5) * min(step_num^(–0.5), step_num * warmup_steps^(–1.5))) as specified in config.  
+  – Running the main training loop for the specified total number of steps (100,000 for base models or 300,000 for big models).  
+  – Logging metrics such as training loss and perplexity during training.  
+  – Saving checkpoints at regular intervals (every checkpoint_interval_minutes according to config) and later averaging the last 5 or 20 checkpoints as required.
+
+─────────────────────────────  
+5. Start Training  
+ • Invoke the training loop by calling trainer.train().  
+ • Monitor progress via logging: print the current step, loss, and any other relevant metrics (such as learning rate values).  
+ • Ensure that checkpoints are saved correctly, and that the logic for checkpoint averaging is in place once training completes.
+
+─────────────────────────────  
+6. Evaluate the Trained Model  
+ • After training is complete, instantiate the Evaluation class (from evaluation.py) by passing:  
+  – The trained TransformerModel instance.  
+  – The test_loader from the DatasetLoader.  
+  – The inference configuration (for translation and/or parsing: beam_size, length_penalty, max_length_offset, etc.) from config.  
+ • Call evaluation.evaluate() to perform inference using beam search decoding.  
+  – For translation tasks, use beam search with beam_size (e.g., 4) and length_penalty (0.6) with a maximum output length computed as input length + max_length_offset (50 for translation).  
+  – For parsing tasks, use the corresponding settings (beam size of 21, length penalty 0.3, max_length_offset 300).  
+ • Capture and log the evaluation metrics (e.g., BLEU scores for translation, F1 scores for constituency parsing).
+
+─────────────────────────────  
+7. Wrap-Up and Logging  
+ • Output the final evaluation results via the logging system so that a user or researcher can easily compare the BLEU, perplexity, and F1 scores with the published results.  
+ • Optionally, if needed, handle additional tasks such as attention visualization or saving evaluation outputs, based on further configuration parameters.  
+ • The Main module should cleanly exit once training and evaluation are complete.
+
+─────────────────────────────  
+8. Overall Program Call Flow  
+ • main.py acts as a controller that “glues” together the following modules:  
+  – Loads configuration and prepares environment (device, seeds, etc.).  
+  – Calls DatasetLoader.load_data() to obtain data loaders for different dataset splits.  
+  – Instantiates the TransformerModel using model hyperparameters from config.  
+  – Sets up the Trainer with data loaders and training configurations, then starts the training process.  
+  – Once training is complete, instantiates Evaluation to perform inference and compute metrics.  
+ • Finally, the main.py module ensures that all modules interact correctly, that checkpointing and logging are managed properly, and that the entire workflow—from data loading to final evaluation—is reproducible and aligned with the experimental methodology described in the paper.
+
+─────────────────────────────  
+Conclusion  
+This logic analysis outlines the key responsibilities and sequential steps that main.py must perform. By connecting configuration management, dataset loading, model instantiation, training, checkpointing, and final evaluation under one controller, the main module ensures the reproducibility and integrity of the full experiment workflow as described in the Transformer paper.

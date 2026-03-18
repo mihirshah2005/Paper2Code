@@ -1,0 +1,108 @@
+Below is the detailed logic analysis for main.py. This file serves as the experiment entry point and must tie together configuration loading, data preparation, model instantiation, curriculum scheduling, training (with reproducibility across multiple seeds), and final evaluation. The analysis strictly follows the design and experimental protocol described in the paper, plan, and configuration file.
+
+────────────────────────────
+1. Load and Parse Configuration
+────────────────────────────
+• At the very start, import the Config class (from config.py) and invoke its load() method.
+• The output will be a dictionary (loaded from config.yaml) containing all experiment settings:
+ – training parameters (separate subkeys for CV, NLP, and Graph),
+ – curriculum learning hyperparameters (warmup_epochs, schedule_epochs, growth_rate, etc.),
+ – reproducibility information (a list of seeds: [42, 666, 777, 888, 999]),
+ – evaluation metrics and complexity recording flags.
+• The config dictionary is then passed to all subsequent modules to ensure consistency.
+
+────────────────────────────
+2. Iterate Over Multiple Seeds for Reproducibility
+────────────────────────────
+• Using the “seeds” array from the reproducibility section of the config, loop over each seed.
+ – For each seed, set the appropriate random number generators (e.g., numpy, torch, and any other libraries).
+ – This ensures that every run is reproducible and its metrics can later be aggregated (average and standard deviation).
+
+────────────────────────────
+3. Data Loading and Preprocessing
+────────────────────────────
+• Instantiate the DatasetLoader class (from dataset_loader.py) by passing in the configuration.
+ – Call its load_data() method. This method:
+  – Parses the dataset identifier (e.g., "cifar10", "cifar100-noise-0.4", or "tinyimagenet-imbalance-50") from config or command-line input.
+  – Downloads the data (using torchvision for CV, Hugging Face or torchtext for NLP, and torch-geometric for Graph).
+  – Performs train/validation/test splits; for some datasets (like Tiny-ImageNet), further splits the downloaded training set as specified.
+• If applicable, the methods apply_noise(data, p) and apply_imbalance(data, r) are invoked to modify the training data per experimental setting.
+• The returned “data” is a dictionary that includes separate loaders or datasets for training, validation, and testing.
+
+────────────────────────────
+4. Model Instantiation
+────────────────────────────
+• Instantiate the ModelManager (from model.py) with the loaded configuration.
+ – The ModelManager uses information from the config (e.g., the chosen model names for the selected domain) to build the correct model.
+ – For CV tasks, it may build LeNet, ResNet-18, or ViT; for NLP tasks, it may build the LSTM classifier, or load pretrained models such as BERT and GPT2; for graph tasks, it builds GCN, GAT, or GIN.
+ – The output model’s input layer and output layers are adjusted based on the dataset (e.g., number of classes).
+• The constructed model is then ready for training.
+
+────────────────────────────
+5. Curriculum Learning Scheduler Initialization
+────────────────────────────
+• Instantiate the CurriculumScheduler (from curriculum.py) using the same configuration.
+ – This scheduler is responsible for providing data selection or reweighting signals at training time.
+ – It has an update_schedule(loss: float, epoch: int) method that is invoked during the training loop.
+ – Although the exact hyperparameters for warmup epochs and growth_rate may be null or tunable, the design is in place to allow varied curriculum strategies.
+
+────────────────────────────
+6. Training Loop Orchestration (Objective Fitting)
+────────────────────────────
+• Instantiate the Trainer class (from trainer.py) with the following components:
+ – The model obtained from the ModelManager.
+ – The data dictionary from DatasetLoader.
+ – The CurriculumScheduler instance.
+ – The configuration dictionary.
+• The Trainer’s train() method carries out the following:
+ – Loops over the training epochs (and for sub-batches within each epoch) using the batch size and optimizer settings defined in the config.
+ – For each batch, the model’s forward() method is called to compute losses.
+ – After computing the loss, the Trainer calls curriculum_scheduler.update_schedule(loss, epoch) to adjust sample selection or weightings as needed.
+ – The training process is instrumented to record training time and maximum GPU memory usage (if record_complexity flags are set in config).
+ – Periodic logging of metrics (such as training loss, validation performance, etc.) is performed.
+• The Trainer completes a full training run for the current seed.
+
+────────────────────────────
+7. Evaluation and Metrics Calculation
+────────────────────────────
+• Once training is finished for a given seed, instantiate the Evaluation class (from evaluation.py) with:
+ – The trained model.
+ – The data dictionary (with validation and test splits).
+ – The configuration.
+• Call evaluate() on the Evaluation instance.
+ – This method runs forward passes over the test/validation data and computes performance metrics according to the target domain:
+  – CV: Accuracy.
+  – NLP: Accuracy as well as F1, Spearman, and Matthews correlations.
+  – Graph: AUC.
+ – It may also collect the complexity metrics (GPU training time and memory usage) recorded during training.
+• The evaluation returns a dictionary of metrics, which is then collected for the current seed.
+
+────────────────────────────
+8. Aggregation of Results Across Seeds
+────────────────────────────
+• As the loop over seeds completes, accumulate all seed-level results into a collection (for example, a list of dictionaries).
+• Compute statistical summaries (mean and standard deviation) for each metric (performance and complexity) across the five runs.
+• This aggregation is vital to match the reporting approach of the paper (average ± standard deviation).
+
+────────────────────────────
+9. Final Reporting and Logging
+────────────────────────────
+• Print or log the aggregated results in a clear tabular format.
+• Optionally, generate plots (using matplotlib) to display performance versus noise ratio or imbalance factor if those experimental variations are being conducted in the current run.
+• Save training checkpoints or evaluation logs if required.
+
+────────────────────────────
+10. Program Call Flow Recap
+────────────────────────────
+In summary, main.py performs the following steps:
+ 1. Loads the configuration via Config.load().
+ 2. Iterates over the predefined reproducibility seeds:
+  a. Sets the random seed for this run.
+  b. Initializes the DatasetLoader and loads the data.
+  c. Uses the ModelManager to build the appropriate model.
+  d. Instantiates the CurriculumScheduler.
+  e. Creates the Trainer, which runs through the training loop with curriculum integration.
+  f. After training, evaluates the model with the Evaluation class and gathers performance and complexity metrics.
+ 3. Aggregates the results from all seeds and reports the final outcome.
+
+This logic analysis ensures that main.py follows the experimental protocol from the paper precisely, uses the configuration settings from config.yaml (including domain-specific training hyperparameters), integrates all modules via the provided interfaces, and adheres to reproducibility by running multiple seeded experiments.

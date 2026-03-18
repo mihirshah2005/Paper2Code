@@ -1,0 +1,228 @@
+"""
+trainer.py
+
+This module implements the Trainer class which orchestrates the training loop for the synthetic graph distillation.
+It uses two separate Adam optimizers for updating the synthetic eigenbasis (U_syn) and synthetic node features (X_syn)
+alternately, according to a schedule defined by tau1 and tau2 from the configuration.
+Only the active parameter group (eigenbasis or features) is updated during each iteration by detaching the inactive group.
+After training, the Trainer calls the model to reconstruct the synthetic graph.
+
+It assumes the existence of Model (from model.py) and GraphData (from dataset_loader.py) classes.
+"""
+
+import logging
+import numpy as np
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+
+from model import Model
+from dataset_loader import GraphData
+
+
+class Trainer:
+    def __init__(self, model: Model, graph_data: GraphData, config: dict) -> None:
+        """
+        Initializes the Trainer with the given Model, GraphData, and configuration dictionary.
+
+        Expected configuration keys under "training":
+            - epochs (default: 1500)
+            - learning_rate_feat (default: 1e-05)
+            - learning_rate_eigenvecs (default: 0.01)
+            - tau1 (default: 0)
+            - tau2 (default: 5)
+
+        Args:
+            model (Model): The synthetic graph distillation model.
+            graph_data (GraphData): The real graph's structure and spectral information.
+            config (dict): Configuration dictionary.
+        """
+        self.model = model
+        self.graph_data = graph_data
+        self.config = config
+
+        # Retrieve training hyperparameters from config.
+        training_config = config.get("training", {})
+        self.epochs: int = int(training_config.get("epochs", 1500))
+        self.lr_feat: float = float(training_config.get("learning_rate_feat", 1e-05))
+        self.lr_eigen: float = float(training_config.get("learning_rate_eigenvecs", 0.01))
+        self.tau1: int = int(training_config.get("tau1", 0))
+        self.tau2: int = int(training_config.get("tau2", 5))
+        self.device: torch.device = self.model.device
+
+        # Initialize two separate Adam optimizers:
+        # One for the synthetic eigenbasis parameters (U_syn) and one for the synthetic node features (X_syn).
+        self.optimizer_eigen = optim.Adam([self.model.U_syn], lr=self.lr_eigen)
+        self.optimizer_feat = optim.Adam([self.model.X_syn], lr=self.lr_feat)
+
+        # Determine synthetic graph size from model.
+        self.synthetic_size: int = self.model.synthetic_size
+
+        # Generate synthetic labels for the synthetic graph.
+        # Sample with replacement from the real graph's labels to mimic the distribution.
+        np.random.seed(42)  # For reproducibility
+        self.synthetic_labels: np.ndarray = np.random.choice(
+            self.graph_data.labels, size=self.synthetic_size, replace=True
+        )
+
+        # Store real labels.
+        self.real_labels: np.ndarray = self.graph_data.labels
+
+        # Compute the category-level representation for the real graph using its node features.
+        real_features_tensor = torch.tensor(
+            self.graph_data.node_features, dtype=torch.float32, device=self.device
+        )
+        self.real_cat_repr = self.compute_category_representation(real_features_tensor, self.real_labels)
+
+        logging.info(f"Trainer initialized: epochs={self.epochs}, lr_feat={self.lr_feat}, "
+                     f"lr_eigen={self.lr_eigen}, tau1={self.tau1}, tau2={self.tau2}, "
+                     f"synthetic_size={self.synthetic_size}")
+
+    def compute_category_representation(self, features: torch.Tensor, labels: np.ndarray) -> torch.Tensor:
+        """
+        Computes category-level representations by averaging the features of nodes per unique class label.
+
+        Args:
+            features (torch.Tensor): Tensor of shape (N, d) where N is the number of real nodes.
+            labels (np.ndarray): Array of node labels with length N.
+
+        Returns:
+            torch.Tensor: Category-level representations of shape (num_classes, d) stacked in order of unique labels.
+        """
+        unique_labels = np.unique(labels)
+        reps = []
+        for ul in unique_labels:
+            mask = (labels == ul)
+            if np.sum(mask) == 0:
+                rep = torch.zeros(features.shape[1], device=self.device)
+            else:
+                indices = np.where(mask)[0]
+                rep = features[indices].mean(dim=0)
+            reps.append(rep)
+        return torch.stack(reps, dim=0)
+
+    def compute_synthetic_category_representation(self, features: torch.Tensor, labels: np.ndarray) -> torch.Tensor:
+        """
+        Computes category-level representations for the synthetic graph by averaging synthetic node features
+        grouped by label. Uses the same order of unique labels as in the real graph to ensure consistency.
+
+        Args:
+            features (torch.Tensor): Synthetic node features tensor of shape (synthetic_size, d).
+            labels (np.ndarray): Array of synthetic labels of length synthetic_size.
+
+        Returns:
+            torch.Tensor: Category-level representations tensor of shape (num_classes, d).
+        """
+        unique_labels = np.unique(self.real_labels)  # Use real graph classes to ensure same ordering.
+        reps = []
+        for ul in unique_labels:
+            mask = (labels == ul)
+            if np.sum(mask) == 0:
+                rep = torch.zeros(features.shape[1], device=self.device)
+            else:
+                indices = np.where(mask)[0]
+                rep = features[indices].mean(dim=0)
+            reps.append(rep)
+        return torch.stack(reps, dim=0)
+
+    def train(self) -> None:
+        """
+        Runs the training loop for synthetic graph distillation.
+        
+        Alternates updates between synthetic eigenbasis (U_syn) and synthetic node features (X_syn)
+        based on the alternating schedule defined by tau1 and tau2.
+        In each epoch, only the active parameter group is updated while the inactive group is detached.
+        After training, reconstructs the synthetic graph.
+        """
+        self.model.train()
+        total_steps: int = self.epochs
+        cycle_length: int = self.tau1 + self.tau2 if (self.tau1 + self.tau2) > 0 else 1  # Prevent zero-length cycle
+        logging.info("Starting training loop...")
+
+        for epoch in range(1, total_steps + 1):
+            # Zero out gradients for both optimizers.
+            self.optimizer_eigen.zero_grad()
+            self.optimizer_feat.zero_grad()
+
+            # Determine active update group based on the alternating schedule.
+            if (epoch % cycle_length) < self.tau1:
+                active_group: str = "eigenbasis"
+            else:
+                active_group = "features"
+            logging.info(f"Epoch {epoch}: Active update group: {active_group}")
+
+            # Prepare synthetic parameters: detach the inactive group so it does not contribute to gradients.
+            if active_group == "eigenbasis":
+                # When updating eigenbasis, detach synthetic node features.
+                X_syn_input = self.model.X_syn.detach()
+                # U_syn is active.
+            else:
+                # When updating features, detach the synthetic eigenbasis.
+                X_syn_input = self.model.X_syn  # active
+                # Note: In loss computation, U_syn will be used but its gradients will not flow (via detach).
+                self.model.U_syn = torch.nn.Parameter(self.model.U_syn.detach())
+
+            # Compute the projected real eigenbasis (U_r_proj) to compare with the synthetic one.
+            # The real eigenvectors, from graph_data.eigenvectors, are resized to match the synthetic graph size and K.
+            real_eigenvectors = self.graph_data.eigenvectors
+            required_K: int = self.model.K
+            if real_eigenvectors.shape[0] >= self.synthetic_size:
+                U_r_proj_np = real_eigenvectors[:self.synthetic_size, :required_K]
+            else:
+                pad_rows = self.synthetic_size - real_eigenvectors.shape[0]
+                U_r_proj_np = np.pad(real_eigenvectors, ((0, pad_rows), (0, 0)), 'constant')[:, :required_K]
+            U_r_proj = torch.tensor(U_r_proj_np, dtype=torch.float32, device=self.device)
+
+            # Compute synthetic category-level representations using the (active or detached) synthetic features.
+            synthetic_cat_repr = self.compute_synthetic_category_representation(X_syn_input, self.synthetic_labels)
+
+            # Compute the composite loss using the model's compute_loss interface.
+            loss_total = self.model.compute_loss(U_r_proj, self.real_cat_repr, synthetic_cat_repr)
+
+            # Additionally, compute individual loss components for monitoring.
+
+            # Eigenbasis Matching Loss L_e: ||P_syn - P_real||²_F, with P = U * U^T.
+            P_syn = self.model.U_syn @ self.model.U_syn.t()
+            P_real = U_r_proj @ U_r_proj.t()
+            loss_e = torch.norm(P_syn - P_real, p='fro') ** 2
+
+            # Discrimination Constraint Loss L_d: 1 - cosine_similarity(mean(real_cat_repr), mean(synthetic_cat_repr)).
+            if synthetic_cat_repr is not None and self.real_cat_repr is not None:
+                mean_real = torch.mean(self.real_cat_repr, dim=0)
+                mean_syn = torch.mean(synthetic_cat_repr, dim=0)
+                loss_d = 1.0 - F.cosine_similarity(mean_real.unsqueeze(0), mean_syn.unsqueeze(0), dim=1)[0]
+            else:
+                loss_d = torch.tensor(0.0, device=self.device)
+
+            # Orthogonality Regularization Loss L_o: ||(U_syn^T * U_syn) - I||²_F.
+            U_syn_TU_syn = self.model.U_syn.t() @ self.model.U_syn
+            I_K = torch.eye(self.model.K, device=self.device, dtype=torch.float32)
+            loss_o = torch.norm(U_syn_TU_syn - I_K, p='fro') ** 2
+
+            # Aggregate the loss components into a dictionary for logging.
+            loss_dict = {
+                "loss_total": loss_total,
+                "loss_e": loss_e,
+                "loss_d": loss_d,
+                "loss_o": loss_o
+            }
+
+            # Perform backpropagation over the active parameter group.
+            loss_total.backward()
+
+            if active_group == "eigenbasis":
+                self.optimizer_eigen.step()
+            else:
+                self.optimizer_feat.step()
+
+            # Log loss details at the first epoch and every 100 epochs.
+            if epoch == 1 or epoch % 100 == 0:
+                logging.info(
+                    f"Epoch {epoch}/{total_steps} | Total Loss: {loss_total.item():.6f} | "
+                    f"L_e: {loss_e.item():.6f} | L_d: {loss_d.item():.6f} | L_o: {loss_o.item():.6f}"
+                )
+
+        logging.info("Training complete. Reconstructing synthetic graph...")
+        A_prime, L_prime, X_syn_final = self.model.reconstruct_graph()
+        logging.info("Synthetic graph reconstruction complete.")
+        logging.info(f"Final synthetic node features mean: {X_syn_final.mean().item():.6f}")

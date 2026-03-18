@@ -1,0 +1,128 @@
+Below is the revised logic analysis for main.py. The analysis now explicitly details the integration of the curriculum scheduler update mode, full determinism in seed initialization, extraction and passing of noise/imbalance parameters from the configuration, and a clear statement of the expectations regarding the interface contracts and error handling for each module.
+
+────────────────────────────
+1. Load Configuration and Global Setup
+
+• Use the Config class (from config.py) to load all experiment settings from config.yaml. This configuration includes:  
+  – Training hyperparameters (batch size, learning rate, number of epochs for each domain).  
+  – Curriculum learning parameters (e.g., warmup_epochs, schedule_epochs, growth_rate, and crucially a parameter “update_mode” that can be set to either "minibatch" or "epoch").  
+  – Data-setup parameters such as noise probability and imbalance factor (e.g., keys like dataset.noise_prob and dataset.imbalance_ratio).  
+  – Reproducibility settings including an array of seeds.
+
+• Enforce full determinism for reproducibility:  
+  – Set the random seed for Python’s random module, NumPy, and PyTorch.  
+  – Additionally, configure torch.backends.cudnn such that:  
+   ○ torch.backends.cudnn.deterministic is set to True  
+   ○ torch.backends.cudnn.benchmark is set to False  
+  – Log these settings to ensure that any nondeterministic behavior is minimized.
+
+────────────────────────────
+2. Defining the Experiment Loop Structure with Nested Seed Handling
+
+• Establish an outer loop that iterates over the experiment configurations. Each configuration specifies a unique combination of:  
+  – Domain (CV, NLP, Graph)  
+  – Dataset variant (e.g., “cifar10”, “cifar10-noise-0.4”, “tinyimagenet-imbalance-50”)  
+  – Model type (such as “LeNet”, “ResNet-18”, “ViT” for CV; “LSTM”, “BERT”, “GPT2” for NLP; “GCN”, “GAT”, “GIN” for Graph)  
+  – Curriculum method selection, including the update mode parameter.
+
+• For each experiment configuration, implement an inner loop over seeds. Specifically:  
+  – For every seed in the list (e.g., [42, 666, 777, 888, 999]):  
+   ○ Set the seed for all required libraries (Python, NumPy, PyTorch) and enforce cudnn determinism as noted above.  
+   ○ Log the active seed.  
+   ○ Run the complete experiment sub-process (data loading, model building, training, evaluation).  
+  – After all seeds are processed for a configuration, aggregate the results (mean and standard deviation) and store or log them.
+
+────────────────────────────
+3. Data Loading and Preprocessing
+
+• Instantiate the DatasetLoader with the configuration and the current experiment’s parameters. The DatasetLoader is responsible for:  
+  – Downloading or retrieving the dataset (using torchvision for CV, Hugging Face datasets for NLP, torch-geometric for Graph domains).  
+  – Splitting the dataset into training, validation, and test sets.
+
+• Extraction of noise and imbalance parameters:  
+  – Retrieve the noise probability (for example, config.dataset.noise_prob) and imbalance factor (e.g., config.dataset.imbalance_ratio) from the configuration.  
+  – Pass these values to DatasetLoader’s apply_noise() and apply_imbalance() functions as needed so that the experimental setups (like “noise-0.4” or “imbalance-50”) exactly reflect the paper’s protocols.
+
+• Document and log the parameters that are applied to ensure that any deviation from expected values is noticed immediately.
+
+────────────────────────────
+4. Model Building
+
+• Instantiate the ModelManager (or ModelManager class in model.py) with the configuration. Based on the current experiment parameters (domain and selected model), call build_model() which:
+  – Constructs the proper backbone model and adjusts its input/output layers based on the properties of the dataset.
+  – Loads pretrained weights when required (for transformer models such as BERT or GPT2) or initializes models from scratch otherwise.
+
+• Validate that the model architecture meets expectations (e.g., confirming parameter counts) and log any inconsistencies.
+
+────────────────────────────
+5. Curriculum Scheduler Integration with Clear Update Modes
+
+• Instantiate the CurriculumScheduler using the configuration. This object is responsible for implementing the curriculum learning strategy.  
+  – Check for an “update_mode” parameter in the curriculum section of the config.  
+  – If update_mode is set to "minibatch":  
+   ○ The scheduler’s update_schedule(loss, epoch) will be called on every mini‐batch during training.  
+  – If update_mode is set to "epoch":  
+   ○ The scheduler’s update_schedule(loss, epoch) will only be invoked once per epoch (for example, after processing all mini‐batches) to adjust the curriculum scheduling.  
+  – This parameter must be explicitly logged; if it is missing, default to “minibatch” with an appropriate warning.
+
+• Document the intended behavior and error-check input to ensure that the integration strictly adheres to the mechanism described in the original paper.
+
+────────────────────────────
+6. Training Loop Integration
+
+• Instantiate the Trainer with:  
+  – The built model.  
+  – The data dictionary (including training, validation, test splits).  
+  – The curriculum scheduler instance.  
+  – The configuration.
+
+• In Trainer.train(), explicitly integrate the curriculum scheduler according to the selected update_mode:
+  – If in “minibatch” mode, after each mini-batch’s forward pass and loss computation, call CurriculumScheduler.update_schedule(loss, current_epoch) so that the scheduler can adjust sample weights or selection criteria immediately.
+  – If in “epoch” mode, accumulate losses for the epoch and call update_schedule once at the end of the epoch to update the schedule based on the aggregate behavior.
+  – Ensure that this integration is consistent with the curriculum learning mechanism intended in the paper.
+  – Include robust error-handling: if update_schedule returns values or if there is any inconsistency (e.g., an unsupported update frequency), log and raise an error.
+
+• Additionally, during training, log complexity metrics (time and GPU memory usage) as specified in the configuration.
+
+────────────────────────────
+7. Evaluation
+
+• After training completion, instantiate the Evaluation module with:  
+  – The trained model.  
+  – The same data dictionary (training, validation, test).  
+  – The configuration.
+
+• Call Evaluation.evaluate() to perform inference on the test set and compute domain-specific metrics:
+  – For CV: compute accuracy.
+  – For NLP: compute accuracy, F1 score, Spearman correlation, and Matthews correlation.
+  – For Graph tasks: compute AUC.
+
+• Log or output any additional complexity metrics as required by the config.
+
+────────────────────────────
+8. Aggregation, Logging, and Error Handling Across Module Interfaces
+
+• For each experiment configuration, aggregate the results from all seed iterations into mean and standard deviation values.  
+  – Log comprehensive summaries resembling the paper’s result tables.
+  – Ensure that any errors (e.g., configuration mismatches, unexpected output from any module) are caught and reported.  
+  – Each module (Config, DatasetLoader, ModelManager, CurriculumScheduler, Trainer, Evaluation) should implement well-documented interfaces that:  
+   ○ Validate inputs and configuration parameters.  
+   ○ Provide clear error messages if required parameters are missing or if the input format is unexpected.  
+   ○ Follow the standard PyTorch module design to ensure ease of integration.
+
+────────────────────────────
+9. Final Notes on the Main Workflow
+
+• The overall flow in main.py must follow the nested loop structure:  
+  – Outer loop over experiment configurations (domain, dataset variant, model type, curriculum method selection).  
+  – Inner loop over seeds to ensure reproducibility and aggregation of metrics.
+
+• Log the experiment details at each step: configuration parameters, seed initialization (including full determinism settings), curriculum update mode, data preprocessing choices, training progress, and evaluation metrics.
+
+• This structured integration ensures that:  
+  – The curriculum learning mechanism (per mini‐batch vs. per epoch) is unambiguously controlled by the configuration.  
+  – Full determinism is enforced to adhere to the reproducibility guarantees of the paper.  
+  – Noise probabilities and imbalance factors are explicitly extracted from and applied via the DatasetLoader methods.  
+  – All module interfaces are clearly defined with appropriate error-handling and logging for smooth integration.
+
+This revised logic analysis addresses the critiques by clearly differentiating curriculum update modes, enforcing robust seed initialization to guarantee determinism, detailing the flow of noise/imbalance parameters from configuration to data preprocessing, and stating explicit interface norms and error-checking measures for the involved modules.

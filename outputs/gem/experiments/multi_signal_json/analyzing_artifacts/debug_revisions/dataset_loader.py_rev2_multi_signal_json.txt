@@ -1,0 +1,83 @@
+Below is the revised logic analysis for dataset_loader.py that addresses the critiques raised:
+
+──────────────────────────────
+1. Data Loading and Configuration Interpretation
+
+• In the DatasetLoader class’s constructor, the configuration dictionary is accepted. In particular, the configuration key "compression_ratio" is read from config.yaml.  
+• IMPORTANT CLARIFICATION: Although the value in config.yaml is set to 0.15 with the comment “0.15% compression ratio,” we explicitly interpret this as a percentage value. That is, the value 0.15 should be divided by 100 to yield the fraction (0.0015) representing 0.15% of the total node count. (Alternatively, if one prefers using a fractional ratio directly, this behavior must be clearly documented so that the config is adjusted accordingly.)  
+• The dataset name (e.g., "Pubmed") and other split details are also extracted from the configuration so that the appropriate data source is chosen.
+
+──────────────────────────────
+2. Loading the Raw Graph
+
+• The load_data() method will load:
+  – The adjacency matrix (A), possibly by reading an edge list using NetworkX, and then converting to a NumPy array or a sparse matrix.
+  – Node features (X) as a numerical matrix.
+  – Labels (Y) representing the node classification targets.  
+• Once loaded, these objects are stored for further processing.
+
+──────────────────────────────
+3. Computing the Normalized Laplacian
+
+• First, compute the degree of each node using the adjacency matrix A.
+• Construct a degree matrix D and then compute D^(-1/2) as follows:
+  – For each node with degree d, if d > 0, its D^(-1/2) entry is computed as 1/sqrt(d);  
+  – For nodes with degree zero (to avoid division-by-zero errors), explicitly set the corresponding value to 0. This safeguarded division ensures that the subsequent multiplication does not crash.
+• With D^(-1/2) computed, form the normalized Laplacian L according to the formula:  
+      L = I – D^(-1/2) * A * D^(-1/2)
+  where I is the identity matrix.  
+• This computed L (either as a dense or sparse matrix, depending on implementation) is stored for later use.
+
+──────────────────────────────
+4. Determining the Number of Synthetic Nodes and Eigenvector Count
+
+• Calculate the total number of real nodes, N.  
+• Using the "compression_ratio" from the configuration:
+  – Clarify that the configuration value is in percentage form (e.g., 0.15 means 0.15%, so you must compute the fraction as compression_ratio/100).  
+  – Compute the number of synthetic nodes, N′, as:
+        N′ = ceil( N * (compression_ratio / 100) )
+• Next, set the total number of eigenvectors K to be equal to N′.  
+• Use the configuration value r_k (e.g., 0.9) to define:
+  – K1 = ceil(r_k * N′): the number of smallest eigenvectors which capture low-frequency (global) structure.
+  – K2 = N′ – K1: the number of largest eigenvectors (high-frequency), ensuring that K1 + K2 = K.
+
+──────────────────────────────
+5. Performing the Truncated Eigen-Decomposition
+
+• Leverage SciPy’s sparse eigenvalue solver (scipy.sparse.linalg.eigsh) to compute the required eigenpairs from L:
+  - For the K1 smallest eigenvalues/vectors, use:
+         eigsh(L, k=K1, which='SM')
+    • Since eigsh does not guarantee sorted output, immediately sort the result:
+       – Sort the returned eigenvalues in ascending order.
+       – Rearrange the eigenvectors correspondingly.
+  - For the K2 largest eigenvalues/vectors, use:
+         eigsh(L, k=K2, which='LA')
+    • Similarly, sort these eigenpairs explicitly. For consistency with the paper’s requirements, sort:
+       – The largest eigenvalues in descending order, so that they truly represent the high-frequency components.
+       – Rearrange the eigenvectors accordingly.
+• After sorting, combine the two sets of eigenpairs into one:
+  – Construct the combined eigenvector matrix U_K as:  
+        U_K = [u₁, …, u_K₁, u_{last-K2+1}, …, u_last]
+    – Similarly, combine the eigenvalues in the same order.
+• This ensures that the final order conforms to the paper’s specification (i.e., the first part covers the K1 “smallest” eigenpairs and the second part the K2 “largest” eigenpairs).
+
+──────────────────────────────
+6. Packaging into GraphData
+
+• Define a GraphData structure (or class) that contains:
+  – adjacency: the loaded adjacency matrix (A)
+  – node_features: the feature matrix (X)
+  – labels: the class labels (Y)
+  – laplacian: the normalized Laplacian L computed earlier
+  – eigenvalues: the combined sorted eigenvalues array (length K)
+  – eigenvectors: the combined sorted eigenvectors matrix (shape = [N, K])
+• Package and return this GraphData object in the load_data() method so that it is available for model training and evaluation.
+
+──────────────────────────────
+Summary of Revisions
+
+1. In load_data(), clearly state that the "compression_ratio" from the configuration is a percentage (e.g., 0.15 implies 0.15% of nodes), thereby requiring division by 100 when computing the synthetic node count.
+2. In computing the normalized Laplacian, add safe handling for nodes with zero degree by setting the corresponding D^(-1/2) entries to 0, avoiding division-by-zero errors.
+3. In the eigen-decomposition procedure, include explicit sorting steps after calling eigsh for both the smallest (SM) and largest (LA) eigenpairs to ensure that the eigenvalues and eigenvectors are in the correct order before combining them.
+
+This revised logic ensures that the dataset loading step is robust, unambiguous, and consistent with the experimental design specified in the paper.

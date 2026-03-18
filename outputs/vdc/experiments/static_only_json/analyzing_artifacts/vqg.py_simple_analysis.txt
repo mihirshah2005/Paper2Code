@@ -1,0 +1,79 @@
+Below is a detailed logic analysis for the VQG module (vqg.py). This module is responsible for generating visual questions for each input image-label pair. It produces two types of questions—a fixed set of general questions and a label‐specific set generated via ChatGPT. The module also leverages caching (provided by our utils functions) to avoid redundant API calls.
+
+──────────────────────────────
+1. Initialization and Configuration Loading
+
+• The VQG class’s constructor (__init__) should accept at least two inputs:
+ – A list of general question templates (if not provided, these may be hard-coded with standard phrases such as “Describe the image briefly” and “Provide an overall summary of the image”).
+ – A configuration dictionary (or relevant parameters extracted from config.yaml) including:
+  – The number of general questions to output (from detection.general_questions_count, which is set to 2 in config).
+  – The number of label-specific questions (this is dataset dependent: 4 for CIFAR-10 and ImageNet-Dog, 6 for ImageNet-100). In order to determine this value, the VQG initialization should also receive a dataset identifier (e.g., "CIFAR-10", "ImageNet-100", or "ImageNet-Dog").
+ – A label-specific prompt template that will be used to instruct ChatGPT. This template should include placeholders for the label and for the required number of questions. For example, the prompt may read:  
+  "Please generate {n} visual questions that are specific for verifying if the image truly represents the label '{label}'. The questions should be clear and, if the label is correct, would naturally yield a 'yes' answer."
+ – In addition, the __init__ method should initialize any local state (for example, an internal cache mapping from label to its generated questions) so that if the same label is encountered more than once during the experiment, a fresh API call is not required.
+
+──────────────────────────────
+2. Generating General Questions
+
+Method: generate_general_questions(label: str) -> List[str]
+
+• Since general questions are entirely template based and do not depend on the actual label (as per the paper, they remain consistent across labels), the logic is as follows:
+ – Retrieve the fixed list of general question templates. (For example, if we have a list with “Describe the image briefly.” and “Describe the image in detail.”, these will be our outputs.)
+ – Confirm that the number of templates provided meets the count specified in the configuration (detection.general_questions_count = 2). If more templates exist, you might either choose the first N or randomly select N templates.
+ – Return this list as the general questions for the sample.
+ – Note: Although the function receives the label as input (to match the interface), it does not modify the fixed general questions based on the label.
+
+──────────────────────────────
+3. Generating Label-Specific Questions
+
+Method: generate_label_specific_questions(label: str) -> List[str]
+
+• The purpose here is to automatically generate a set of questions tailored to the given label so that they target subtle, label-specific attributes of the image.
+ – First, determine how many label-specific questions should be generated. This number is extracted from the configuration under detection.label_specific_questions using the dataset name (e.g., 4 for CIFAR-10, 6 for ImageNet-100, 4 for ImageNet-Dog).
+ – Construct the prompt for ChatGPT by inserting:
+  • The target label (the value of the "label" parameter).
+  • The expected number count for questions (from the configuration).
+ – An example prompt might be:  
+  "Please generate 6 label-specific visual questions to verify if an image indeed represents the label 'airplane'. The questions should be succinct, target specific attributes (such as usage, appearance, function, etc.), and are expected to be answered by a multimodal model with a 'yes' if the label is correct."
+ – Use a caching utility from utils (or check an internal cache) prior to calling the ChatGPT API to see if we have already generated questions before for this particular label. This prevents redundant API calls.
+ – If not cached, call the ChatGPT API (using the configured model, e.g., gpt-3.5-turbo) with the constructed prompt.
+ – Parse the response from ChatGPT. This will likely be in a text form that may contain numbered or separated questions. Split and clean the response (for example, by stripping extra whitespace, removing numbering if present, etc.) so that you obtain a clean list of questions.
+ – Ensure that exactly the configured number of label-specific questions are obtained. If the response returns more or fewer questions, truncate or log a warning and adjust accordingly.
+ – Cache the result (mapping from the label to the generated list) for future calls.
+ – Return the list of label-specific questions.
+ 
+• Note: In some implementations, you might allow slight variability in question phrasing. However, for experimental consistency and reproducibility, it is important to store the generated questions (ideally in a file or internal dictionary) so that repeated runs use the same questions.
+
+──────────────────────────────
+4. Dependencies and External Calls
+
+• The VQG class must interface with external APIs:
+ – It calls ChatGPT API for generating label-specific questions. Thus it will use the openai package (with the model specified in the configuration: “gpt-3.5-turbo”).
+ – It should handle possible API rate limits and errors. This can be done by using utility functions (from utils.py) that provide caching and require minimal re-calls.
+• For general questions, no external API call is needed; use the internal list of templates.
+• The module must import caching and logging functions from utils.py to record responses and check the cache before making an API call. This ensures reproducibility and efficiency.
+
+──────────────────────────────
+5. Summary of Methods and Data Flow
+
+• __init__(…) :
+ – Load and store configuration details: number of general questions, number of label-specific questions (dependent on dataset), and the prompt template for label-specific questions.
+ – Initialize internal state (cache, predefined general question templates).
+
+• generate_general_questions(label) :
+ – Simply return a list of fixed general questions as defined by the stored templates (the label parameter may be ignored for template generation).
+
+• generate_label_specific_questions(label) :
+ – Determine the required count (from config).
+ – Construct and format a detailed prompt incorporating the label and count.
+ – Check if there is a cached response for this label.
+ – If not, call the ChatGPT API using the prompt and parse its returned text into a list of questions.
+ – Cache and return this list.
+
+──────────────────────────────
+6. Conclusion
+
+This VQG module acts as the starting point of the VDC detection pipeline by providing both a constant set of general questions (which capture holistic semantics) and a dynamic set of label-specific questions (which capture fine-grained cues). The integration of API caching and configuration-driven parameters ensures that the module remains both efficient and reproducible. This logic precisely aligns with the paper’s methodology and the experimental settings defined in config.yaml.
+
+By following the outlined steps, the module will generate the questions needed for the next steps (VQA and VAE) in the pipeline, thereby playing a critical role in the overall detection process.
+

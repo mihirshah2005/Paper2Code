@@ -1,0 +1,61 @@
+## config.yaml
+training:
+  optimizer: "Adam"
+  beta1: 0.9
+  beta2: 0.98
+  epsilon: 1e-9
+  learning_rate_schedule: "d_model^(-0.5) * min(step_num^(-0.5), step_num * warmup_steps^(-1.5))"
+  warmup_steps: 4000
+  total_steps:
+    base_model: 100000
+    big_model: 300000
+  batch_size_tokens: 25000  # Approximate token count per source and target per batch
+  dropout_rate: 0.1
+  label_smoothing: 0.1
+
+model:
+  base:
+    num_layers: 6
+    d_model: 512
+    d_ff: 2048
+    num_heads: 8
+    d_k: 64
+    d_v: 64
+  big:
+    num_layers: 6
+    d_model: 1024
+    d_ff: 4096
+    num_heads: 16
+    d_k: 64
+    d_v: 64
+    # Note: For English-to-French, the paper uses a dropout rate of 0.1 instead of 0.3.
+
+data:
+  translation:
+    datasets:
+      english_german: "WMT14_en_de"
+      english_french: "WMT14_en_fr"
+    vocabulary:
+      english_german: 37000
+      english_french: 32000
+  parsing:
+    dataset: "WSJ_Penn_Treebank"
+    vocabulary:
+      wsj_only: 16000
+      semi_supervised: 32000
+
+inference:
+  translation:
+    beam_size: 4
+    length_penalty: 0.6
+    max_length_offset: 50  # Maximum output length = input length + 50
+  parsing:
+    beam_size: 21
+    length_penalty: 0.3
+    max_length_offset: 300  # Maximum output length = input length + 300
+
+checkpoint:
+  checkpoint_interval_minutes: 10
+  average_checkpoints:
+    base: 5
+    big: 20

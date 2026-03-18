@@ -1,0 +1,119 @@
+Below is a detailed logic analysis for the dataset_loader.py module. This file will implement the DatasetLoader class, which is responsible for loading the three datasets (CIFAR-10, ImageNet-100, and ImageNet-Dog) using torchvision, applying standard image preprocessing, splitting the data into train and test sets, and then injecting “dirty” samples (either poisoned samples or noisy labels) according to the parameters specified in the configuration file (config.yaml). The module will also leverage several utility functions (from utils.py) for data augmentation and trigger injection.
+
+──────────────────────────────
+1. Class Initialization and Configuration
+
+• The DatasetLoader class will be initialized with a configuration dictionary (and possibly a dataset identifier). This config object is derived from the YAML file and contains:
+  – Training-specific parameters (batch sizes, learning rate, etc., though those are more relevant during training).
+  – Dirty sample generation settings: the noisy_ratio and the poisoning settings (samples_per_class) for each dataset.
+  – Dataset-specific parameters (e.g., identify whether the dataset is "CIFAR-10", "ImageNet-100", or "ImageNet-Dog").
+  
+• In the __init__ method, the DatasetLoader will:
+  – Store the configuration.
+  – Determine which dataset will be loaded.
+  – Set up any necessary image transforms (using torchvision.transforms). For example, for CIFAR-10 one might use standard normalization and possibly random cropping or flipping for training, while for ImageNet variants, resizing and normalization will be applied. These transforms ensure the images are preprocessed properly before feeding into the detection and later training modules.
+
+──────────────────────────────
+2. Loading Data via load_data method
+
+• The load_data() method will:
+  – Based on the dataset name selected (e.g., as part of the config or passed as an argument), use torchvision’s built‐in datasets:
+    ▪ For CIFAR-10: call torchvision.datasets.CIFAR10 with download=True. Create separate instances for training and testing with their corresponding transforms.
+    ▪ For ImageNet-100: (while full ImageNet might not be available directly) use a custom subset using torchvision.datasets.ImageFolder. You will have to randomly select 100 classes from the full dataset directory and then further select 500 images per class for training and 100 per class for test—as specified in the paper.
+    ▪ For ImageNet-Dog: similarly, load the subset, but restrict the classes to a predetermined list (10 dog classes) and then sample 800 images per class for training and 200 per class for testing.
+  
+• After loading, the method returns a dictionary containing:
+  – "train_data": the training dataset (or a list/tuple of images and labels).
+  – "test_data": the test dataset.
+  
+• Preprocessing Steps:
+  – Ensure all images pass through the transformation pipeline.
+  – Use appropriate image normalization and resizing that matches the later use in the VQA module (and potential API calls).
+  – The data structure must be consistent with what downstream modules expect (for example, each sample can be a tuple (image, label)).
+
+──────────────────────────────
+3. Injecting Dirty Samples via inject_dirty_samples method
+
+• The inject_dirty_samples(data: dict) method will take the training portion of the loaded data as input and return a modified training set with injected dirty samples. This process includes:
+  
+  A. Noisy Label Injection:
+    – Use the "noisy_ratio" parameter (e.g., 0.4 from config.yaml) to determine the fraction of training samples to corrupt.
+    – For each selected sample:
+         ▪ For symmetric noise: Randomly choose a new label from the set of possible labels excluding the original.
+         ▪ For asymmetric noise: Follow a rule such as (current_label mod K) + 1 as defined.
+    – This may use helper functions from utils.py for label flipping and text processing.
+
+  B. Poisoned Sample Injection:
+    – For backdoor attacks, the config specifies different numbers of poisoned samples per class (different for CIFAR-10, ImageNet-100, and ImageNet-Dog).
+    – For each class in the training dataset:
+         ▪ Randomly select a specified number of sample instances.
+         ▪ For each selected sample, apply a prescribed backdoor trigger:
+               • For example, for BadNets (a 3×3 white square in CIFAR-10’s lower right corner), call a utility function (e.g., trigger_inject_badnets) from utils.py.
+               • For Blended, SIG, TrojanNN, SSBA, or WaNet attacks, similarly delegate to corresponding utility functions (note that some implementations might be simplified versions of the full attack described in the paper).
+         ▪ Change the label of the poisoned sample to the target label (the paper specifies target label as class 0).
+    – The method should allow for different poison injection scenarios (e.g., 50 or 500 per class for CIFAR-10), which the configuration file provides as a list. You may decide to run experiments with one of the settings.
+
+• After the injection process, the modified training dataset (with both noisy labels and poisoned samples, or a hybrid setting) is returned as part of the dictionary.
+  
+• Note:
+  – The injection of dirty samples is only applied to the training data. The test set remains clean.
+  – The function must iterate over each class separately to balance the poisoning process.
+  – It should call the proper utility/triggers functions (from utils.py) that apply the actual image modifications (overlay triggers, blend in images, etc.).
+
+──────────────────────────────
+4. Data Augmentation and Preprocessing (Using TorchVision Transforms)
+
+• Define transformation pipelines:
+  – For training: include random augmentations (if desired) such as random crops, flips, and normalization.
+  – For testing: use deterministic transforms (resize, center crop, normalization).
+  – The chosen normalization values (mean, std) should be consistent with standard practice for the given dataset.
+  
+• Pass these transformation pipelines as part of the dataset objects provided by torchvision.
+
+──────────────────────────────
+5. Summary of the Workflow in DatasetLoader
+
+• During initialization (__init__):
+  – Store the configuration and the dataset type.
+  – Set up image transforms.
+  
+• load_data():
+  – Based on dataset type, call the appropriate torchvision dataset loader.
+  – For ImageNet-100 and ImageNet-Dog, perform any necessary filtering or random subset selection.
+  – Return a dictionary containing both train and test sets.
+  
+• inject_dirty_samples():
+  – For the training set only, iterate over all samples (or per-class) and:
+      ▪ Determine which samples to corrupt based on the noisy_ratio.
+      ▪ Call utility functions to change labels for noisy data.
+      ▪ Randomly select samples for poisoning according to the samples_per_class config.
+      ▪ Modify the images (via trigger injection functions from utils) and update labels to the target label.
+  – Return the modified training dataset.
+
+──────────────────────────────
+6. Interactions with Other Modules and Configurations
+
+• The DatasetLoader’s output feeds directly into the later stages:
+  – The purification/detection pipeline will use the (potentially dirty) training data to run the VDCDetector.
+  – The Trainer module will later use the purified dataset (after removing dirty samples) for training a classifier.
+  
+• Configuration:
+  – All parameters such as poison ratio, noisy ratio, and sample counts are read directly from config.yaml.
+  – Batch sizes or image transformations that might impact downstream modules will be set consistently using this configuration.
+  
+• Dependencies:
+  – Import torch and torchvision for dataset handling.
+  – Import numpy for any randomness/seeding operations.
+  – Use helper and trigger injection functions from utils.py to perform the actual modifications.
+  
+──────────────────────────────
+7. Error Handling and Edge Cases
+
+• The loader should verify that the dataset provided exists and that the directory paths for ImageNet subsets are valid.
+• When injecting dirty samples, ensure that the modifications do not exceed the total number of samples in any class.
+• Log the number or proportion of samples that have been modified so that later evaluation of TPR/FPR can be appropriately determined.
+
+──────────────────────────────
+Conclusion
+
+This logic analysis outlines the intended operations for dataset_loader.py. The DatasetLoader class will first load the appropriate dataset using torchvision with the correct transformations, then split the data into training and test sets, and finally perform dirty sample injection (noisy labels and poisoned samples) according to the experimental settings. Consistent use of configuration values (from config.yaml) and utility functions for trigger injection ensures that the experimental setup can be reproduced accurately according to the paper’s methodology.

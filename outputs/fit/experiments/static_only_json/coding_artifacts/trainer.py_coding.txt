@@ -1,0 +1,320 @@
+```python
+"""trainer.py
+
+This module implements the Trainer class responsible for the training loop of the FiT diffusion model.
+It orchestrates the training steps:
+  - Iterates over batches from the DataLoader.
+  - Injects diffusion noise into the latent tokens generated from images via a pretrained VAE.
+  - Computes the MSE loss over valid (non-padding) tokens.
+  - Backpropagates using the AdamW optimizer.
+  - Updates an exponential moving average (EMA) of model weights.
+  - Saves checkpoints periodically.
+
+All training hyperparameters and settings are read from the configuration dictionary (loaded from config.yaml).
+
+Author: Your Name
+Date: YYYY-MM-DD
+"""
+
+import os
+import math
+import time
+import copy
+import logging
+from typing import Any, Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# Import model and dataset modules if needed (avoid circular import).
+# from model import Model  # Assumed to be imported in the main entry point.
+# from dataset_loader import DatasetLoader  # Not used directly here.
+
+# Setup module-level logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+def pad_images(images: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Pads a list of image tensors (of shape (C, H, W)) to the same spatial size (max_height, max_width)
+    and stacks them into a batch tensor.
+    
+    Args:
+        images (List[torch.Tensor]): List of image tensors.
+        
+    Returns:
+        torch.Tensor: Batched image tensor of shape (B, C, max_height, max_width)
+    """
+    if not images:
+        raise ValueError("No images to pad.")
+    # Determine maximum height and width in the batch.
+    max_height = max(image.shape[1] for image in images)
+    max_width = max(image.shape[2] for image in images)
+    
+    padded_images = []
+    for image in images:
+        _, h, w = image.shape
+        pad_bottom = max_height - h
+        pad_right = max_width - w
+        # Padding format: (pad_left, pad_right, pad_top, pad_bottom)
+        padded_image = nn.functional.pad(image, (0, pad_right, 0, pad_bottom), mode='constant', value=0)
+        padded_images.append(padded_image)
+    batch_tensor = torch.stack(padded_images)
+    return batch_tensor
+
+
+class Trainer:
+    """
+    Trainer class for the FiT diffusion model.
+    
+    Responsibilities:
+      - Orchestrate the training loop over batches.
+      - Inject diffusion noise into latent tokens and compute diffusion loss over non-padding tokens.
+      - Update model parameters through backpropagation using AdamW optimizer.
+      - Update an exponential moving average (EMA) of model weights.
+      - Log training metrics and save checkpoints periodically.
+      
+    Attributes:
+        model (nn.Module): The FiT model.
+        dataloader (DataLoader): DataLoader providing training batches.
+        config (Dict[str, Any]): Configuration dictionary.
+        optimizer (optim.Optimizer): Optimizer for training.
+        device (torch.device): Device on which training is run.
+        training_steps (int): Total number of training steps.
+        ema_decay (float): EMA decay rate.
+        ema_params (Dict[str, torch.Tensor]): A dictionary storing EMA of model parameters.
+        T (int): Number of diffusion timesteps.
+        beta (torch.Tensor): Diffusion beta schedule, shape (T,).
+        alpha (torch.Tensor): Diffusion alpha rates, shape (T,).
+        alpha_bar (torch.Tensor): Cumulative product of alphas, shape (T,).
+    """
+    def __init__(self, model: nn.Module, dataloader: DataLoader, config: Dict[str, Any]) -> None:
+        """
+        Initialize the Trainer with the FiT model, DataLoader and configuration.
+        
+        Args:
+            model (nn.Module): The FiT model.
+            dataloader (DataLoader): DataLoader for training data.
+            config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        """
+        self.model: nn.Module = model
+        self.dataloader: DataLoader = dataloader
+        self.config: Dict[str, Any] = config
+
+        # Training configurations
+        training_config: Dict[str, Any] = config.get("training", {})
+        self.learning_rate: float = float(training_config.get("learning_rate", 1e-4))
+        self.batch_size: int = int(training_config.get("batch_size", 256))
+        # Use training_steps_fit_b2 as default; if FiT-XL/2 should be run, it can be overridden externally.
+        self.training_steps: int = int(training_config.get("training_steps_fit_b2", 400000))
+        self.optimizer_type: str = training_config.get("optimizer", "AdamW")
+        self.weight_decay: float = float(training_config.get("weight_decay", 0.0))
+        self.ema_decay: float = float(training_config.get("ema_decay", 0.9999))
+
+        # Diffusion parameters (using DDPM noise schedule)
+        diffusion_config: Dict[str, Any] = config.get("diffusion", {})
+        # We use DDPM schedule; number of timesteps T is set to 1000 by default.
+        self.T: int = 1000  
+        beta_start: float = 0.0001
+        beta_end: float = 0.02
+        self.beta: torch.Tensor = torch.linspace(beta_start, beta_end, self.T)
+        self.alpha: torch.Tensor = 1.0 - self.beta
+        # Cumulative product of alphas: alpha_bar[t] = prod_{s=0}^{t} alpha_s.
+        self.alpha_bar: torch.Tensor = torch.cumprod(self.alpha, dim=0)
+
+        # Set device
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Initialize the optimizer (using AdamW)
+        self.optimizer: optim.Optimizer = optim.AdamW(
+            self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+        )
+
+        # Initialize EMA parameters as a deep copy of the model's state_dict (without gradients)
+        self.ema_params: Dict[str, torch.Tensor] = {
+            key: value.detach().clone().to(self.device) for key, value in self.model.state_dict().items()
+        }
+
+        # Internal training step counter
+        self.global_step: int = 0
+
+        # Directory for checkpointing
+        self.checkpoint_dir: str = config.get("checkpoint_dir", "./checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        logger.info("Trainer initialized with %d training steps and batch size %d on device %s.",
+                    self.training_steps, self.batch_size, self.device)
+
+    def update_ema(self) -> None:
+        """
+        Update the EMA (Exponential Moving Average) of model parameters.
+        ema_param = ema_decay * ema_param + (1 - ema_decay) * current_param
+        """
+        model_state = self.model.state_dict()
+        for key in model_state.keys():
+            self.ema_params[key] = (
+                self.ema_decay * self.ema_params[key] + (1.0 - self.ema_decay) * model_state[key].detach()
+            )
+
+    def save_checkpoint(self, step: int) -> None:
+        """
+        Save a checkpoint of the model, optimizer, EMA state, and current training step.
+        
+        Args:
+            step (int): Current training step.
+        """
+        checkpoint: Dict[str, Any] = {
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "ema_state": self.ema_params,
+            "global_step": step,
+            "config": self.config
+        }
+        checkpoint_path: str = os.path.join(self.checkpoint_dir, f"checkpoint_step_{step}.pt")
+        torch.save(checkpoint, checkpoint_path)
+        logger.info("Checkpoint saved at step %d to %s", step, checkpoint_path)
+
+    def train(self) -> None:
+        """
+        Run the training loop for the diffusion model using the provided DataLoader.
+        For each batch:
+          - Images are padded and moved to the device.
+          - The pretrained VAE encodes images to latent tokens.
+          - Diffusion noise is injected according to a sampled timestep.
+          - The model (transformer backbone) processes the noisy tokens.
+          - Loss is computed only over valid tokens (using the token mask).
+          - The optimizer step & EMA update are performed.
+        """
+        self.model.train()
+        # Create an iterator for the dataloader.
+        data_iterator = iter(self.dataloader)
+        pbar = tqdm(total=self.training_steps, desc="Training", unit="step")
+        
+        while self.global_step < self.training_steps:
+            try:
+                batch: Dict[str, Any] = next(data_iterator)
+            except StopIteration:
+                data_iterator = iter(self.dataloader)
+                batch = next(data_iterator)
+            
+            # The batch is a dictionary with:
+            # "images": List[Tensor] of shape (C, H, W)
+            # "token_counts": Tensor of shape (B,)
+            # "token_masks": Tensor of shape (B, max_token_length)
+            # "original_sizes": List[Tuple[int, int]]
+            images_list: List[torch.Tensor] = batch["images"]
+            # Pad images to form a batch tensor.
+            images: torch.Tensor = pad_images(images_list).to(self.device)  # shape: (B, C, H, W)
+            token_mask: torch.Tensor = batch["token_masks"].to(self.device)  # shape: (B, max_token_length)
+            
+            B = images.shape[0]
+            
+            # ---------- Diffusion Process: Noise Injection ----------
+            # Use the pretrained VAE to encode images into latent representations;
+            # this is done with no_grad since VAE is fixed.
+            with torch.no_grad():
+                latent_dist = self.model.vae.encode(images).latent_dist
+                clean_latents: torch.Tensor = latent_dist.sample()  # shape: (B, C_lat, H_lat, W_lat)
+            
+            # Patchify and pad latent representations to obtain token sequences.
+            # tokens shape: (B, L, token_dim)
+            tokens, token_mask_generated, grid_dims = self.model.patchify_and_pad(clean_latents)
+            # Note: token_mask_generated should be equivalent to token_mask from the dataset,
+            # but we use the one computed from patchify_and_pad for loss masking.
+            token_mask = token_mask_generated.to(self.device)
+
+            # Sample Gaussian noise of the same shape as tokens.
+            noise: torch.Tensor = torch.randn_like(tokens)
+
+            # Sample a random diffusion timestep for each sample.
+            t_indices: torch.Tensor = torch.randint(0, self.T, (B,), device=self.device)
+            # Gather the corresponding alpha_bar values and reshape to (B, 1, 1) for broadcasting.
+            alpha_bar_batch: torch.Tensor = self.alpha_bar[t_indices].reshape(B, 1, 1).to(self.device)
+            sqrt_alpha_bar: torch.Tensor = torch.sqrt(alpha_bar_batch)
+            sqrt_one_minus_alpha_bar: torch.Tensor = torch.sqrt(1.0 - alpha_bar_batch)
+            
+            # Generate noisy tokens using the diffusion process:
+            # x_noisy = sqrt(alpha_bar) * x_clean + sqrt(1 - alpha_bar) * noise.
+            noisy_tokens: torch.Tensor = sqrt_alpha_bar * tokens + sqrt_one_minus_alpha_bar * noise
+
+            # ---------- Forward Pass Through Transformer ----------
+            # Instead of calling model.forward(), we replicate the forward pass from after VAE encoding.
+            # 1. Project the noisy tokens into the transformer embedding space.
+            token_embeddings: torch.Tensor = self.model.token_proj(noisy_tokens)
+            
+            # 2. Compute positional embeddings from the original grid dimensions.
+            pos_embeddings: torch.Tensor = self.model.compute_positional_embeddings(grid_dims)
+            orig_token_count: int = grid_dims[0] * grid_dims[1]
+            max_token_length: int = self.model.max_token_length
+            if orig_token_count > max_token_length:
+                pos_embeddings = pos_embeddings[:max_token_length, :]
+            elif orig_token_count < max_token_length:
+                pad_len: int = max_token_length - orig_token_count
+                pad_tensor: torch.Tensor = torch.zeros(pad_len, pos_embeddings.size(1), 
+                                                         device=pos_embeddings.device, dtype=pos_embeddings.dtype)
+                pos_embeddings = torch.cat([pos_embeddings, pad_tensor], dim=0)
+            # Expand positional embeddings to batch and add to token embeddings.
+            token_embeddings = token_embeddings + pos_embeddings.unsqueeze(0)
+
+            # 3. Compute the attention mask from the token mask.
+            attn_mask: torch.Tensor = None
+            # Import compute_attention_mask from model.py; here we assume it is available.
+            # Since it is defined in this file's dependencies, we call it directly.
+            try:
+                from model import compute_attention_mask
+            except ImportError:
+                raise ImportError("Failed to import compute_attention_mask from model.py.")
+            attn_mask = compute_attention_mask(token_mask)
+
+            # 4. Pass embeddings through each transformer block.
+            x_trans: torch.Tensor = token_embeddings
+            for block in self.model.transformer_blocks:
+                x_trans = block(x_trans, attn_mask)
+
+            # 5. Project the transformer outputs back to the token (latent) space.
+            pred_tokens: torch.Tensor = self.model.output_proj(x_trans)  # (B, L, token_dim)
+
+            # ---------- Loss Computation ----------
+            # Loss: MSE between predicted noise and the actual noise.
+            # Only compute loss on valid tokens (where token_mask == 1).
+            mse_error: torch.Tensor = (pred_tokens - noise) ** 2  # shape: (B, L, token_dim)
+            # Expand token_mask to match dimensions (B, L, 1)
+            token_mask_expanded: torch.Tensor = token_mask.unsqueeze(-1).float()
+            masked_error: torch.Tensor = mse_error * token_mask_expanded
+            # Normalize by number of valid elements.
+            valid_elements: float = token_mask_expanded.sum().item()
+            if valid_elements == 0:
+                logger.warning("No valid tokens found in the batch, skipping loss computation.")
+                continue
+            loss: torch.Tensor = masked_error.sum() / valid_elements
+
+            # ---------- Backpropagation and Parameter Update ----------
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            self.update_ema()
+
+            # ---------- Logging ----------
+            # Calculate average token utilization (ratio of valid tokens).
+            token_utilization: float = token_mask_expanded.mean().item()
+            pbar.set_postfix({"loss": loss.item(), "token_util": f"{token_utilization:.3f}"})
+            pbar.update(1)
+            self.global_step += 1
+
+            # Save a checkpoint periodically (e.g., every 1000 steps)
+            if self.global_step % 1000 == 0:
+                self.save_checkpoint(self.global_step)
+
+            # Break if we reached the training steps.
+            if self.global_step >= self.training_steps:
+                break
+
+        pbar.close()
+        self.save_checkpoint(self.global_step)
+        logger.info("Training completed at global step %d.", self.global_step)
+```

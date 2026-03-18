@@ -1,0 +1,130 @@
+Below is a detailed logic analysis for evaluation.py that outlines the evaluation procedure and how it connects to the rest of the system. This analysis is written in plain text and is meant to guide you in implementing the Evaluation class in accordance with the FiT paper, the reproduction plan, the design specifications, and the provided configuration (config.yaml). 
+
+──────────────────────────────
+1. Overall Role of evaluation.py
+
+• The Evaluation class is responsible for:
+  – Loading the model with the EMA weights (as saved by the Trainer).
+  – Running the diffusion-based sampling procedure (using 250 denoising iterations as per config) to generate latent tokens.
+  – Applying resolution extrapolation techniques via positional interpolation methods (from the list: PI, EI, NTK, YaRN, VisionNTK, VisionYaRN) when generating images, in order to handle both in-distribution and out-of-distribution resolutions.
+  – Taking the denoised latent tokens, “unpatchifying” them (i.e. reshaping to the VAE latent spatial dimensions), and using the pretrained VAE decoder to reconstruct the final images.
+  – Collecting generated images and then computing evaluation metrics (FID, sFID, IS, Precision, and Recall) using the appropriate evaluation code.
+
+──────────────────────────────
+2. Input Data and Configuration
+
+• The Evaluation class will be initialized with:
+  – The Model instance (which already encapsulates the FiT transformer with integrated VAE, tokenization, and built-in support for 2D RoPE, Masked MHSA, and SwiGLU).
+  – A DataLoader (from DatasetLoader) that provides pre-processed data (if needed—for example, for comparing conditioned vs. unconditioned generation).
+  – A config dictionary that includes:
+     - Diffusion settings (e.g., "diffusion.num_sampling_steps": 250).
+     - Extrapolation settings (the list of methods and the scale factor formula).
+     - Evaluation metrics and possibly test resolution configurations.
+     
+• The Evaluation process must use the EMA (exponential moving average) version of the model, which will be assumed to have been loaded by the Model class during setup.
+
+──────────────────────────────
+3. Diffusion Sampling Procedure
+
+• The evaluation routine follows the DDPM/DDIM style procedure:
+  – For each evaluation run (or for each target resolution), the Evaluation class needs to generate a batch of latent tokens.
+    ▸ Determine the desired output resolution (H_test, W_test) from a preset list. For example, in-distribution resolutions may be 256×256, 160×320, 128×384; out-of-distribution ones may be 320×320, 224×448, 160×480.
+    ▸ Compute the corresponding “latent” resolution based on the patchification (with patch size p = 2). For example, if the original image is H×W, the latent map shape will be (H/2, W/2). 
+  – For each target resolution:
+    ▸ Create an initial latent tensor by sampling from a Gaussian distribution. This represents the starting noisy tokens.
+    ▸ If the number of latent tokens (i.e. the length of the token sequence) is smaller than or equal to the fixed maximum token length L_max (set to 256) the process follows the conventional path. Otherwise, for resolutions out-of-distribution (where the token count is larger than 256), the appropriate extrapolation method should be applied.
+ 
+• The iterative sampling loop:
+  – Set the model to evaluation mode and disable gradient calculations.
+  – Run a loop for the predetermined number of sampling steps (taken from config: 250 DDPM sampling steps).
+  – In each iteration call the model’s forward(x) function (the model is expected to internally handle the forward pass including masking and 2D RoPE application).
+  – The procedure should update the latent tokens gradually, thereby “denoising” them over iterations.
+  – Critically, before starting the iterations or during the iterations, modify (if needed) the positional embeddings using the resolution extrapolation technique based on the chosen method:
+       • The config provides the list of methods (e.g., "VisionNTK", "VisionYaRN", etc.).
+       • Compute the scale factor as s = max(max(H_test, W_test) / L_train, 1.0) where L_train = √(L_max) (as specified in the paper). 
+       • This step may be implemented as a helper function (either inside Evaluation or called via the Model) that adjusts the positional embeddings before or during the forward pass.
+       
+• After the final iteration, the output latent tokens represent the denoised latent codes ready for reconstruction.
+
+──────────────────────────────
+4. Unpatchification and Decoding
+
+• Once the diffusion loop completes:
+  – The latent tokens (which are still in “patchified” form) must be reshaped (unpatchified) into the spatial layout expected by the VAE decoder.
+  – The Evaluation class should call the VAE decoder (which is loaded as part of the Model) to convert the latent representation back into an image.
+  – Optionally, perform any required post-processing (e.g., clamping, scaling pixel values) before computing evaluation metrics.
+
+──────────────────────────────
+5. Resolution Extrapolation Integration
+
+• For each target resolution, decide whether to apply an in-distribution or extrapolation pipeline:
+  – In-distribution cases: The latent token count is less than or equal to 256; then the normal processing is used.
+  – Out-of-distribution cases: The latent token count exceeds 256.
+     ▸ In these cases, use the provided extrapolation methods (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN). 
+     ▸ The Evaluation class should select a method (or iterate over several, if comparing) and apply the interpolation to the positional embeddings.
+     ▸ The precise mathematics (using the rotary base b = 10000, computing separate scaling for height and width for VisionNTK/VisionYaRN, etc.) should be encapsulated in helper functions—either within Evaluation or as part of the Model’s interface (keeping in mind that the design forbids adding public functions beyond those specified).
+  – The proper adjustment of the positional embeddings ensures that the transformer can “extrapolate” to resolutions larger than those seen during training.
+
+──────────────────────────────
+6. Metric Computation
+
+• Once a batch (or multiple batches) of images is generated, the Evaluation process should compute:
+  – Primary Metric: Fre’chet Inception Distance (FID) using 250 DDPM sampling steps (or a fixed evaluation sample size, as per ADM’s TensorFlow evaluation guidelines).
+  – Additional Metrics: sFID, Inception Score (IS), Improved Precision, and Recall.
+  
+• The Evaluation class should either call existing utility functions/libraries for these metric calculations or include helper functions to compute them.
+  – The results should be collected into a dictionary (or a similar data structure) in which each metric is reported.
+  – Log or print the evaluation metrics so that they can be compared with the baselines reported in the paper (e.g., DiT-B/2, U-ViT, etc.).
+  
+• The Evaluation phase should run for the different resolution settings (both in-distribution and out-of-distribution) and possibly for each extrapolation method if comparing their performance. The final output is a comprehensive report (as a dictionary) that maps each test configuration (resolution and method) to its computed metrics.
+
+──────────────────────────────
+7. Program Flow Recap (from evaluation.py Perspective)
+
+a. Initialization:
+   – Instantiate Evaluation(model, dataloader, config).
+   – Load the EMA checkpoint into the model (the Model class is responsible for that, so Evaluation assumes it is already loaded).
+
+b. For each target resolution (e.g., 256×256, 160×320, …):
+   – Determine the latent map shape based on the patch size.
+   – Decide whether the resolution is within training distribution or not.
+   – If out-of-distribution, calculate the scale factor and set the extrapolation method as required.
+   
+c. Sampling:
+   – For each batch (using torch.no_grad() and model.eval()):
+         • Initialize a latent noise tensor sampled from a Gaussian distribution.
+         • Run the fixed number of denoising iterations (250 steps), each time using model.forward(noisy_latents). The model internally applies the diffusion step and (if required) uses the positional interpolation.
+         • End with a denoised latent representation.
+   
+d. Reconstruction:
+   – Unpatchify the latent tokens to reconstruct the latent image.
+   – Use the pretrained VAE decoder to generate the final image.
+   – Accumulate generated images.
+
+e. Metric Computation:
+   – Once a set of images is generated, compute FID, sFID, IS, Precision, and Recall.
+   – Report results in a dictionary format.
+
+f. Return:
+   – The evaluate() function returns the computed metrics for each configuration.
+
+──────────────────────────────
+8. Additional Considerations
+
+• Make sure all sampling operations are wrapped in torch.no_grad() to avoid unnecessary gradient computations.
+• Use tqdm (as specified in the required packages) to provide progress feedback during the iterative diffusion steps.
+• It is assumed that helper utilities for “unpatchification”, positional interpolation (for the chosen extrapolation methods), and metric calculations either exist or will be implemented in concert with this module.
+• The Evaluation class should strictly follow the interfaces from the design: __init__(model: Model, dataloader: DataLoader, config: dict) and evaluate() -> dict.
+• Do not introduce extra public member functions in Evaluation that are not specified.
+
+──────────────────────────────
+Summary
+
+In summary, evaluation.py must perform the following:
+  – Load the EMA-checkpointed FiT model.
+  – For each selected resolution (in-distribution and out-of-distribution), initialize a latent noise tensor.
+  – Run the diffusion denoising loop for 250 iterations, updating latent codes through model.forward() while potentially adjusting positional embeddings using the chosen extrapolation method.
+  – After sampling, unpatchify the latent tokens and decode them into images via the pretrained VAE decoder.
+  – Compute and return evaluation metrics (FID, sFID, IS, Precision, Recall) for each tested resolution.
+  
+This logic analysis lays out a clear, modular roadmap to implement evaluation.py that respects the design, configuration, and reproduction objectives described in the FiT paper and accompanying plan.

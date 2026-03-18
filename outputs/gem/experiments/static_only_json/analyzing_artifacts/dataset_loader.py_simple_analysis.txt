@@ -1,0 +1,110 @@
+Below is the detailed logic analysis for the dataset_loader.py module. This analysis explains step‐by‐step how the DatasetLoader class should work, what computations it must perform, and how it packages the results into a GraphData structure.
+
+──────────────────────────────
+1. OVERALL OBJECTIVE
+
+• The DatasetLoader will load a graph dataset (e.g., Pubmed as specified in config.yaml), compute its key components, and package these into a GraphData object.
+• The key items to compute include:
+ – The adjacency matrix (A) from the graph.
+ – Node features (X) and labels (Y) for the node classification task.
+ – The normalized Laplacian (L) computed by L = I – D^(–½) A D^(–½).
+ – A (truncated) eigen-decomposition of the Laplacian that yields a set of eigenvalues and eigenvectors.
+• These results are then stored in GraphData as attributes used later by the synthetic graph distillation module.
+
+──────────────────────────────
+2. LOADING THE DATA
+
+• Based on the configuration (config.yaml: dataset.name = "Pubmed" and split_method = "public"), the loader must locate the Pubmed dataset.
+ – This will typically involve reading from files or an online source.
+ – The loader should extract:
+  – The node feature matrix X (as a NumPy array of size [N, d]).
+  – The edge list to build the graph.
+  – The labels Y for each node.
+• Use NetworkX to build a graph from the edge list and any associated node information.
+
+──────────────────────────────
+3. COMPUTING THE ADJACENCY MATRIX
+
+• Once the NetworkX graph is built, convert it to an adjacency matrix.
+ – Use NetworkX functions (such as nx.adjacency_matrix) to obtain A as either a sparse or dense NumPy array.
+ – Since the graph is undirected (and assumed connected), A will be symmetric.
+
+──────────────────────────────
+4. COMPUTING THE NORMALIZED LAPLACIAN
+
+• Calculate the degree for each node: for node i, degree d_i = sum(A[i, :]).
+ – Ensure that all nodes have nonzero degree (the connected graph assumption should hold).
+• Compute the inverse square root of the degree for each node.
+• Form the normalized Laplacian using the formula:
+  L = I – D^(–½) A D^(–½)
+ – Here, I is the identity matrix.
+• Use NumPy for matrix operations (or use sparse operations if A is stored sparsely).
+
+──────────────────────────────
+5. SETTING UP FOR TRUNCATED EIGEN-DECOMPOSITION
+
+• The paper only requires a truncated number of eigenpairs for matching the eigenbasis:
+ – According to the configuration “synth_graph.compression_ratio” (0.15) and “synth_graph.r_k” (0.9), compute the synthetic graph size N′.
+  – Determine N′ = int(N * (compression_ratio / 100)) if the value is given as a percentage—in our case, the comment “0.15%” indicates that compression_ratio should be interpreted as a percent.
+  – For example, if N is 19,717 (as in Pubmed), then N′ ≈ int(19717 * 0.0015) ≈ 30.
+ – Since the paper requires matching K = K₁ + K₂ eigenvectors (with K = N′), let:
+  – K₁ = int(N′ * r_k)     (e.g., 90% of 30 ≈ 27)
+  – K₂ = N′ – K₁        (e.g., remainder, ≈ 3)
+• These computed values (K₁ and K₂) define how many eigenpairs to extract from the Laplacian.
+
+──────────────────────────────
+6. PERFORMING TRUNCATED EIGEN-DECOMPOSITION
+
+• Use the SciPy sparse linear algebra routines (scipy.sparse.linalg.eigsh) to compute the eigenpairs of L:
+ – For the K₁ smallest eigenpairs, call eigsh with parameter k = K₁ and which='SM' (smallest magnitude).
+ – For the K₂ largest eigenpairs, call eigsh with parameter k = K₂ and which='LA' (largest algebraic).
+• Concatenate the eigenvalues and eigenvectors appropriately:
+ – Order them as the K₁ smallest first and then the K₂ largest.
+ – The resulting eigenvectors matrix should have shape [N, (K₁+K₂)].
+• Note any caveats:
+ – Ensure that L is symmetric and real.
+ – If the matrix is large, using the sparse eigendecomposition is essential for efficiency.
+
+──────────────────────────────
+7. PACKAGING INTO GRAPHDATA STRUCTURE
+
+• Create a GraphData class instance (a simple container) that has the following attributes:
+ – adjacency: the computed adjacency matrix (np.ndarray)
+ – node_features: X (np.ndarray)
+ – labels: Y (np.ndarray)
+ – laplacian: L (np.ndarray)
+ – eigenvalues: the concatenated eigenvalues from the two groups (np.ndarray with shape [K₁+K₂])
+ – eigenvectors: the concatenated eigenvectors (np.ndarray with shape [N, K₁+K₂])
+• Also include any additional relevant data such as the synthetic graph size N′. This may be used later in the model initialization.
+
+──────────────────────────────
+8. ERROR HANDLING & LOGGING
+
+• Include error checking for:
+ – File/data not found errors when loading the dataset.
+ – Inconsistencies in node degrees (if any node has zero degree).
+ – Potential issues during eigen-decomposition.
+• Log key shapes and values (e.g., number of nodes N, shape of adjacency, laplacian, and the truncated eigenvector matrix) for debugging purposes.
+
+──────────────────────────────
+9. DEPENDENCIES
+
+• This module will import:
+ – numpy for general array operations.
+ – scipy (particularly scipy.sparse.linalg.eigsh) for eigen-decomposition.
+ – networkx for graph loading and conversion into an adjacency matrix.
+
+──────────────────────────────
+10. SUMMARY OF THE DATAFLOW
+
+a) The DatasetLoader is initialized with a configuration dictionary.
+ – It reads the dataset name and parameters (e.g., compression_ratio) from config.
+b) It loads the graph (in our case, “Pubmed”) and extracts node features, labels, and constructs the networkx graph.
+c) The adjacency matrix A is computed, and from it, the normalized Laplacian L is derived.
+d) Based on the compression_ratio and r_k from config, it calculates the number of eigenpairs to extract (K₁ smallest and K₂ largest).
+e) It performs the truncated eigen-decomposition using eigsh.
+f) All computed components (A, X, Y, L, eigenvalues, eigenvectors) are stored in an instance of GraphData.
+g) Finally, the GraphData object is returned to be used by the training and evaluation modules.
+
+──────────────────────────────
+This logic analysis outlines the step‐by‐step processing in dataset_loader.py and ensures that each key component of the graph data is correctly computed and made available in a structured way for downstream synthetic graph distillation tasks.

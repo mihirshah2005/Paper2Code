@@ -1,0 +1,186 @@
+"""
+main.py
+
+This is the entry-point for reproducing the experiments described in the VDC paper. It orchestrates the
+data loading, dirty sample injection, detection using the VDC pipeline (VQG, VQA, VAE), data purification,
+classifier training (using ResNet-18), and final evaluation (computing ACC, ASR, TPR, and FPR).
+
+The pipeline adheres strictly to the configuration provided in config.yaml.
+
+Usage:
+    python main.py
+"""
+
+import os
+import copy
+import logging
+from typing import Any, Dict, List
+
+import torch
+from torch.utils.data import DataLoader
+
+# Import utilities and modules from the project
+from utils import load_config, init_seed, preprocess_image
+from dataset_loader import DatasetLoader, inject_poison_badnets
+from vqg import VQG
+from vqa import VQA
+from vae import VAE
+from detection import VDCDetector
+from evaluation import Evaluation, EvaluationDataset
+from trainer import Trainer
+from torchvision.models import resnet18
+
+# Setup logging for main.py
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def main() -> None:
+    # 1. Load configuration from config.yaml and set global seed.
+    config: Dict[str, Any] = load_config("config.yaml")
+    seed_value: int = config.get("seed", 42)
+    init_seed(seed_value)
+    logger.info(f"Configuration loaded. Global seed set to {seed_value}.")
+
+    # Determine dataset name from config; default to "CIFAR-10"
+    training_config: Dict[str, Any] = config.get("training", {})
+    dataset_name: str = training_config.get("dataset_name", "CIFAR-10")
+    logger.info(f"Using dataset: {dataset_name}")
+
+    # 2. Data Loading and Dirty Sample Injection
+    loader: DatasetLoader = DatasetLoader(config, dataset_name)
+    data: Dict[str, List[Dict[str, Any]]] = loader.load_data()
+    logger.info(f"Data loaded: {len(data.get('train_data', []))} training samples, "
+                f"{len(data.get('test_data', []))} test samples.")
+    # Inject dirty samples (poisoned samples + noisy labels) into training data.
+    injected_data: Dict[str, List[Dict[str, Any]]] = loader.inject_dirty_samples(data)
+    logger.info("Dirty sample injection completed for training data.")
+
+    # 3. Initialize VDC Detector components: VQG, VQA, and VAE.
+    vqg_instance: VQG = VQG(config=config)
+    vqa_instance: VQA = VQA(model_config=config)
+    vae_instance: VAE = VAE(config=config)
+    detection_threshold: float = config.get("detection", {}).get("threshold", 0.5)
+    detector: VDCDetector = VDCDetector(
+        vqg=vqg_instance,
+        vqa=vqa_instance,
+        vae=vae_instance,
+        threshold=detection_threshold,
+        dataset_id=dataset_name,
+        config=config
+    )
+    logger.info("VDCDetector initialized.")
+
+    # 4. Run Dirty Sample Detection on each training sample and purify training set.
+    purified_train_samples: List[Dict[str, Any]] = []
+    num_total_train: int = len(injected_data.get("train_data", []))
+    logger.info("Starting detection on training samples...")
+    for sample in injected_data.get("train_data", []):
+        image_sample = sample.get("image")
+        # Convert label to string for question generation (as expected by VQG)
+        label_str: str = str(sample.get("label"))
+        detection_result: Dict[str, Any] = detector.detect_sample(image_sample, label_str)
+        # Store detection results in sample dictionary.
+        sample["detected_dirty"] = detection_result.get("is_dirty", False)
+        sample["detection_score"] = detection_result.get("score", 0.0)
+        sample["detection_details"] = detection_result.get("details", [])
+        if not sample["detected_dirty"]:
+            purified_train_samples.append(sample)
+    num_purified: int = len(purified_train_samples)
+    logger.info(f"Detection completed: Purified {num_purified} out of {num_total_train} training samples.")
+
+    # 5. Prepare DataLoaders for Trainer
+    # For training data, use purified samples.
+    # Use the training transform from the DatasetLoader.
+    train_transform = loader.transform_train
+    purified_train_dataset: EvaluationDataset = EvaluationDataset(
+        samples=purified_train_samples,
+        dataset_name=dataset_name,
+        transform=train_transform
+    )
+
+    # Prepare Test Data for Evaluation
+    # (a) Clean test set: use data["test_data"] as is, mark as clean.
+    test_clean_samples: List[Dict[str, Any]] = []
+    for sample in data.get("test_data", []):
+        sample_copy = sample.copy()
+        sample_copy["is_dirty"] = False  # ground truth clean
+        sample_copy["detected_dirty"] = False
+        test_clean_samples.append(sample_copy)
+    test_clean_dataset: EvaluationDataset = EvaluationDataset(
+        samples=test_clean_samples,
+        dataset_name=dataset_name,
+        transform=loader.transform_test
+    )
+
+    # (b) Triggered test set: simulate poisoned samples by applying a backdoor trigger.
+    # For each test sample, copy and inject a poison trigger using BadNets design.
+    test_triggered_samples: List[Dict[str, Any]] = []
+    # Get attacker's target label from dirty sample generation config; default to 0.
+    target_label: int = int(config.get("dirty_sample_generation", {}).get("target_label", 0))
+    for sample in data.get("test_data", []):
+        sample_copy = sample.copy()
+        # Make a copy of the image and apply the trigger injection
+        image_copy = sample_copy.get("image").copy()
+        triggered_image = inject_poison_badnets(image_copy, dataset_name)
+        sample_copy["image"] = triggered_image
+        sample_copy["label"] = target_label  # set label to target label for ASR evaluation
+        sample_copy["is_dirty"] = True
+        sample_copy["detected_dirty"] = True  # Assume triggered samples are detected as dirty
+        test_triggered_samples.append(sample_copy)
+    test_triggered_dataset: EvaluationDataset = EvaluationDataset(
+        samples=test_triggered_samples,
+        dataset_name=dataset_name,
+        transform=loader.transform_test
+    )
+
+    # Create DataLoaders with batch size from config.
+    batch_size_dict: Dict[str, Any] = training_config.get("batch_size", {})
+    batch_size: int = int(batch_size_dict.get(dataset_name, 128))
+    # Use worker_init_fn from DatasetLoader for reproducibility.
+    train_loader: DataLoader = DataLoader(
+        purified_train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        worker_init_fn=lambda worker_id: DatasetLoader.worker_init_fn(worker_id, base_seed=seed_value)
+    )
+    test_clean_loader: DataLoader = DataLoader(test_clean_dataset, batch_size=batch_size, shuffle=False)
+    test_triggered_loader: DataLoader = DataLoader(test_triggered_dataset, batch_size=batch_size, shuffle=False)
+    logger.info("DataLoaders for training and testing are prepared.")
+
+    # 6. Train the Classifier on the Purified Dataset
+    # Use classifier model from config.models.classifier; default is "ResNet-18"
+    classifier_model_name: str = config.get("models", {}).get("classifier", "ResNet-18")
+    if classifier_model_name != "ResNet-18":
+        logger.warning("Configuration specifies a classifier other than ResNet-18. Defaulting to ResNet-18.")
+    # Set the number of classes as specified in the DatasetLoader.
+    num_classes: int = loader.num_classes
+    classifier_model = resnet18(pretrained=False, num_classes=num_classes)
+    # Create a dictionary of DataLoaders expected by Trainer.
+    trainer_data_loaders: Dict[str, DataLoader] = {
+        "train": train_loader,
+        "test_clean": test_clean_loader,
+        "test_triggered": test_triggered_loader
+    }
+    trainer_hyperparams: Dict[str, Any] = training_config.copy()
+    trainer_hyperparams["dataset_name"] = dataset_name
+    trainer_instance: Trainer = Trainer(classifier_model, trainer_data_loaders, trainer_hyperparams)
+    logger.info("Starting classifier training...")
+    trainer_instance.train()
+
+    # 7. Evaluate the Trained Model
+    # Combine both clean and triggered test samples for evaluation.
+    combined_test_samples: List[Dict[str, Any]] = test_clean_samples + test_triggered_samples
+    evaluation_instance: Evaluation = Evaluation(classifier_model, combined_test_samples, config)
+    metrics: Dict[str, float] = evaluation_instance.evaluate()
+    logger.info("Final Evaluation Metrics:")
+    for metric, value in metrics.items():
+        logger.info(f"{metric}: {value:.4f}")
+    print("Final Evaluation Metrics:")
+    for metric, value in metrics.items():
+        print(f"{metric}: {value:.4f}")
+
+
+if __name__ == "__main__":
+    main()

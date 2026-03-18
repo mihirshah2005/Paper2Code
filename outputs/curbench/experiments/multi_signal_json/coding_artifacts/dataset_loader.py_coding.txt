@@ -1,0 +1,403 @@
+## Code: dataset_loader.py
+```python
+"""
+dataset_loader.py
+
+This module implements the DatasetLoader class which is responsible for loading and
+preprocessing datasets for CV, NLP, and Graph domains based on the experiment configuration.
+It provides methods to load data (load_data), inject noise into training labels (apply_noise),
+and create a long-tailed (imbalanced) version of the training data (apply_imbalance).
+
+The DatasetLoader class parses the dataset identifier from the configuration, detects any
+modifiers ("noise" and "imbalance"), loads the raw dataset using domain‑appropriate libraries,
+applies the preprocessing modifiers (with imbalance applied first for CV datasets),
+and returns a uniform dictionary with keys "train", "val", and "test".
+
+For non-CV domains (NLP and Graph), the imbalance modifier is ignored (with a warning).
+All random operations are performed with a fixed seed for reproducibility.
+"""
+
+import os
+import logging
+import math
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+import torch
+from torch.utils.data import random_split, Subset
+
+# Import torchvision modules for CV datasets
+import torchvision.datasets as tv_datasets
+import torchvision.transforms as transforms
+
+# Import Hugging Face datasets for NLP (assumed to be installed)
+try:
+    from datasets import load_dataset
+except ImportError:
+    logging.error("Hugging Face 'datasets' package is required for NLP dataset loading.")
+    raise
+
+# Import torch_geometric datasets for graph data
+try:
+    from torch_geometric.datasets import TUDataset
+except ImportError:
+    logging.error("torch_geometric.datasets.TUDataset is required for Graph dataset loading.")
+    raise
+
+# Import OGB dataset for graph domain if available
+try:
+    from ogb.graphproppred import PygGraphPropPredDataset
+    HAS_OGB = True
+except ImportError:
+    HAS_OGB = False
+    logging.warning("OGB package not found. ogbg-molhiv dataset will not be available.")
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+class DatasetLoader:
+    """
+    DatasetLoader loads and preprocesses datasets for different domains (CV, NLP, Graph)
+    based on a configuration dictionary. It supports applying label noise and creating
+    imbalanced distributions for CV datasets.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initializes the DatasetLoader instance with experiment configuration.
+        Extracts the dataset identifier, data root, and fixed reproducibility seed.
+
+        Args:
+            config (Dict[str, Any]): Experiment configuration loaded from config.yaml.
+        """
+        self.config: Dict[str, Any] = config
+        # Use dataset identifier from config; default to "cifar10" if not provided.
+        self.dataset_name: str = str(self.config.get("dataset", "cifar10")).lower()
+        # Data root directory; default value set to "./data"
+        self.data_root: str = str(self.config.get("data_root", "./data"))
+        # Select a fixed seed from reproducibility settings (use the first one)
+        reproducibility: Dict[str, Any] = self.config.get("reproducibility", {})
+        seeds: List[int] = reproducibility.get("seeds", [42])
+        self.seed: int = seeds[0]
+
+        # Set the random seed for numpy and torch for reproducibility in this module.
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+
+    def load_data(self) -> Dict[str, Any]:
+        """
+        Loads the raw dataset corresponding to the dataset identifier and applies
+        any required preprocessing modifiers (noise and imbalance).
+
+        Returns:
+            Dict[str, Any]: A dictionary with keys "train", "val", and "test" containing
+            the respective datasets.
+        """
+        # Parse the dataset identifier and any modifiers
+        base_dataset, modifiers = self._parse_dataset_identifier(self.dataset_name)
+        logger.info(f"Base dataset: {base_dataset}, Modifiers: {modifiers}")
+
+        domain: str = self._determine_domain(base_dataset)
+        logger.info(f"Inferred domain: {domain}")
+
+        # Depending on domain, load the raw dataset.
+        if domain == "cv":
+            train_set, val_set, test_set = self._load_cv_dataset(base_dataset)
+            # For CV datasets, first apply imbalance (if specified), then noise.
+            if "imbalance" in modifiers:
+                imbalance_factor: int = modifiers["imbalance"]
+                train_set = self.apply_imbalance(train_set, imbalance_factor)
+            if "noise" in modifiers:
+                noise_probability: float = modifiers["noise"]
+                train_set = self.apply_noise(train_set, noise_probability)
+        elif domain == "nlp":
+            train_set, val_set, test_set = self._load_nlp_dataset(base_dataset)
+            if "imbalance" in modifiers:
+                logger.warning("Imbalance modifier detected for NLP dataset; ignoring imbalance processing.")
+            if "noise" in modifiers:
+                noise_probability = modifiers["noise"]
+                train_set = self.apply_noise(train_set, noise_probability)
+        elif domain == "graph":
+            train_set, val_set, test_set = self._load_graph_dataset(base_dataset)
+            if "imbalance" in modifiers:
+                logger.warning("Imbalance modifier detected for Graph dataset; ignoring imbalance processing.")
+            if "noise" in modifiers:
+                noise_probability = modifiers["noise"]
+                train_set = self.apply_noise(train_set, noise_probability)
+        else:
+            logger.error(f"Unknown domain for dataset: {base_dataset}")
+            raise ValueError(f"Unsupported domain for dataset: {base_dataset}")
+
+        return {"train": train_set, "val": val_set, "test": test_set}
+
+    def apply_noise(self, dataset: Any, probability: float) -> Any:
+        """
+        Applies uniform random noise to the training labels of the dataset.
+        For each sample, with probability 'probability', the label is replaced with a random label
+        (different from the original) chosen from the set of available classes.
+
+        Args:
+            dataset (Any): The training dataset (must have a mutable 'targets' attribute).
+            probability (float): The probability (between 0 and 1) of flipping a label.
+
+        Returns:
+            Any: The dataset with noise injected into the labels.
+        """
+        if probability <= 0.0:
+            logger.info("Noise probability <= 0; skipping noise injection.")
+            return dataset
+
+        if not hasattr(dataset, "targets"):
+            logger.warning("Dataset does not support 'targets' attribute; cannot inject noise.")
+            return dataset
+
+        original_labels: List[int] = dataset.targets  # type: ignore
+        unique_labels = list(set(original_labels))
+        num_classes: int = len(unique_labels)
+        logger.info(f"Injecting noise with probability {probability} into dataset with {num_classes} classes.")
+        # Use a RandomState for reproducibility
+        rand_gen = np.random.RandomState(self.seed)
+        new_labels = original_labels.copy()
+
+        for idx, label in enumerate(original_labels):
+            if rand_gen.rand() < probability:
+                possible_labels = [ul for ul in unique_labels if ul != label]
+                if possible_labels:
+                    new_label = rand_gen.choice(possible_labels)
+                    new_labels[idx] = new_label
+                else:
+                    logger.warning(f"No alternative labels available for index {idx}.")
+        # Update the dataset targets in place
+        dataset.targets = new_labels  # type: ignore
+        logger.info("Noise injection completed.")
+        return dataset
+
+    def apply_imbalance(self, dataset: Any, imbalance_factor: int) -> Any:
+        """
+        Creates a long-tailed (imbalanced) version of the dataset.
+        This is intended for balanced CV datasets.
+        If the dataset is not balanced, a warning is logged and the average count is used as a baseline.
+
+        Args:
+            dataset (Any): The training dataset (must have a mutable 'targets' attribute).
+            imbalance_factor (int): The imbalance ratio (e.g., 50 for an imbalance of 50:1).
+
+        Returns:
+            Any: A Subset of the original dataset with an imbalanced class distribution.
+        """
+        if not hasattr(dataset, "targets"):
+            logger.warning("Dataset does not support 'targets' attribute; cannot apply imbalance modifier.")
+            return dataset
+
+        # Retrieve the labels from the dataset
+        labels: List[int] = dataset.targets  # type: ignore
+        unique_labels = sorted(list(set(labels)))
+        num_classes = len(unique_labels)
+        logger.info(f"Applying imbalance: {imbalance_factor} on dataset with {num_classes} classes.")
+
+        # Group indices by class
+        class_to_indices: Dict[int, List[int]] = {label: [] for label in unique_labels}
+        for idx, label in enumerate(labels):
+            class_to_indices[label].append(idx)
+
+        # Compute class counts
+        class_counts: Dict[int, int] = {label: len(indices) for label, indices in class_to_indices.items()}
+        counts = list(class_counts.values())
+        max_count = max(counts)
+        min_count = min(counts)
+        # Check if the dataset is balanced; if not, use average count as baseline.
+        if min_count == 0 or (max_count / (min_count + 1e-5)) > 1.1:
+            baseline = int(np.mean(counts))
+            logger.warning("Dataset is not perfectly balanced. Using average count as baseline for imbalance computation.")
+        else:
+            baseline = max_count
+
+        # Calculate decay factor: d = (1/imbalance_factor)^(1/(C - 1))
+        decay = (1.0 / imbalance_factor) ** (1.0 / (num_classes - 1))
+        logger.info(f"Using baseline count: {baseline} and decay factor: {decay:.4f}.")
+
+        # Determine desired count for each class in sorted order
+        desired_counts: Dict[int, int] = {}
+        for idx, label in enumerate(unique_labels):
+            desired = int(baseline * (decay ** idx))
+            # Ensure at least one sample is kept
+            desired_counts[label] = max(1, desired)
+            logger.debug(f"Class {label}: desired count {desired_counts[label]}, original count {class_counts[label]}.")
+
+        # For each class, randomly select the desired number of indices
+        rand_gen = np.random.RandomState(self.seed)
+        selected_indices: List[int] = []
+        for label in unique_labels:
+            indices = class_to_indices[label]
+            count_to_select = min(len(indices), desired_counts[label])
+            # Shuffle indices using the random generator
+            rand_gen.shuffle(indices)
+            selected = indices[:count_to_select]
+            selected_indices.extend(selected)
+
+        logger.info(f"Total samples selected after imbalance: {len(selected_indices)} out of {len(dataset)}.")
+
+        # Create a Subset dataset with the selected indices
+        imbalanced_dataset = Subset(dataset, selected_indices)
+        return imbalanced_dataset
+
+    def _parse_dataset_identifier(self, dataset_id: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Parses the dataset identifier string to extract the base dataset name and modifiers.
+        Supported modifiers are "noise" (followed by a float value) and "imbalance" (followed by an int value).
+
+        Args:
+            dataset_id (str): The dataset identifier string (e.g., "cifar10-noise-0.4-imbalance-50").
+
+        Returns:
+            Tuple[str, Dict[str, Any]]: A tuple containing the base dataset name and a dictionary of modifiers.
+        """
+        tokens = dataset_id.split("-")
+        base_dataset = tokens[0]
+        modifiers: Dict[str, Any] = {}
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "noise" and (idx + 1) < len(tokens):
+                try:
+                    noise_val = float(tokens[idx + 1])
+                    modifiers["noise"] = noise_val
+                except ValueError:
+                    logger.warning("Could not parse noise modifier value; ignoring noise modifier.")
+                idx += 2
+            elif token == "imbalance" and (idx + 1) < len(tokens):
+                try:
+                    imbalance_val = int(tokens[idx + 1])
+                    modifiers["imbalance"] = imbalance_val
+                except ValueError:
+                    logger.warning("Could not parse imbalance modifier value; ignoring imbalance modifier.")
+                idx += 2
+            else:
+                idx += 1
+        return base_dataset, modifiers
+
+    def _determine_domain(self, base_dataset: str) -> str:
+        """
+        Determines the domain of the dataset based on the base dataset name.
+
+        Args:
+            base_dataset (str): The base dataset name (e.g., "cifar10", "rte", "ogbg-molhiv").
+
+        Returns:
+            str: The inferred domain ("cv", "nlp", or "graph").
+        """
+        base_lower = base_dataset.lower()
+        if base_lower in ["cifar10", "cifar100", "tinyimagenet"]:
+            return "cv"
+        elif base_lower in ["rte", "mrpc", "stsb", "cola", "sst2", "qnli", "qqp", "mnli"]:
+            return "nlp"
+        elif base_lower == "ogbg-molhiv" or base_lower in ["mutag", "proteins", "nci1"]:
+            return "graph"
+        else:
+            logger.warning(f"Unable to determine domain for dataset: {base_dataset}. Defaulting to 'cv'.")
+            return "cv"
+
+    def _load_cv_dataset(self, base_dataset: str) -> Tuple[Any, Any, Any]:
+        """
+        Loads a computer vision dataset (CIFAR-10, CIFAR-100, or Tiny-ImageNet) using torchvision.
+        Splits the official training set into training and validation subsets (9:1 ratio).
+        For Tiny-ImageNet, uses the provided validation set as the test set.
+
+        Args:
+            base_dataset (str): The base CV dataset name.
+
+        Returns:
+            Tuple[Any, Any, Any]: A tuple of (train_set, val_set, test_set).
+        """
+        transform = transforms.ToTensor()
+        generator = torch.Generator().manual_seed(self.seed)
+        if base_dataset == "cifar10":
+            full_train = tv_datasets.CIFAR10(root=self.data_root, train=True, download=True, transform=transform)
+            test_set = tv_datasets.CIFAR10(root=self.data_root, train=False, download=True, transform=transform)
+        elif base_dataset == "cifar100":
+            full_train = tv_datasets.CIFAR100(root=self.data_root, train=True, download=True, transform=transform)
+            test_set = tv_datasets.CIFAR100(root=self.data_root, train=False, download=True, transform=transform)
+        elif base_dataset == "tinyimagenet":
+            # Load Tiny-ImageNet using ImageFolder; assumes folder structure exists under data_root/tiny-imagenet-200
+            train_dir = os.path.join(self.data_root, "tiny-imagenet-200", "train")
+            val_dir = os.path.join(self.data_root, "tiny-imagenet-200", "val")
+            full_train = tv_datasets.ImageFolder(root=train_dir, transform=transform)
+            # For Tiny-ImageNet, use the provided validation set as test set.
+            test_set = tv_datasets.ImageFolder(root=val_dir, transform=transform)
+        else:
+            logger.error(f"Unsupported CV dataset: {base_dataset}")
+            raise ValueError(f"Unsupported CV dataset: {base_dataset}")
+
+        # Split full_train into train and val (9:1 ratio)
+        total_len = len(full_train)
+        train_len = int(0.9 * total_len)
+        val_len = total_len - train_len
+        train_set, val_set = random_split(full_train, lengths=[train_len, val_len], generator=generator)
+        logger.info(f"CV dataset loaded: train ({len(train_set)} samples), val ({len(val_set)} samples), test ({len(test_set)} samples).")
+        return train_set, val_set, test_set
+
+    def _load_nlp_dataset(self, base_dataset: str) -> Tuple[Any, Any, Any]:
+        """
+        Loads an NLP dataset from the GLUE benchmark using Hugging Face's datasets library.
+        Excludes the WNLI task. If the dataset has no official test labels, the validation set is used as test set.
+
+        Args:
+            base_dataset (str): The base NLP dataset name (e.g., "rte", "mrpc").
+
+        Returns:
+            Tuple[Any, Any, Any]: A tuple of (train_set, val_set, test_set).
+        """
+        try:
+            # Load the GLUE dataset for the specified task
+            dataset = load_dataset("glue", base_dataset)
+        except Exception as e:
+            logger.error(f"Error loading NLP dataset {base_dataset}: {e}")
+            raise
+
+        # Use "train" split for training, "validation" for both validation and test.
+        train_set = dataset["train"]
+        val_set = dataset["validation"]
+        test_set = dataset["validation"]
+        logger.info(f"NLP dataset loaded for {base_dataset}: train ({len(train_set)} samples), val ({len(val_set)} samples), test ({len(test_set)} samples).")
+        return train_set, val_set, test_set
+
+    def _load_graph_dataset(self, base_dataset: str) -> Tuple[Any, Any, Any]:
+        """
+        Loads a graph dataset. For ogbg-molhiv, uses the official OGB split.
+        For other graph datasets (e.g., MUTAG, PROTEINS, NCI1), loads from TUDataset and splits using an 8:1:1 ratio.
+
+        Args:
+            base_dataset (str): The base graph dataset name.
+
+        Returns:
+            Tuple[Any, Any, Any]: A tuple of (train_set, val_set, test_set).
+        """
+        domain_lower = base_dataset.lower()
+        if domain_lower == "ogbg-molhiv":
+            if not HAS_OGB:
+                logger.error("OGB package is required for ogbg-molhiv but was not found.")
+                raise ImportError("OGB package is missing.")
+            dataset = PygGraphPropPredDataset(name="ogbg-molhiv", root=self.data_root)
+            split_indices = dataset.get_idx_split()
+            train_set = dataset[split_indices["train"]]
+            val_set = dataset[split_indices["valid"]]
+            test_set = dataset[split_indices["test"]]
+            logger.info(f"Graph dataset ogbg-molhiv loaded with official splits: train ({len(train_set)} samples), val ({len(val_set)} samples), test ({len(test_set)} samples).")
+            return train_set, val_set, test_set
+        elif domain_lower in ["mutag", "proteins", "nci1"]:
+            # TUDataset expects dataset name in uppercase
+            dataset = TUDataset(root=os.path.join(self.data_root, "TUDataset"), name=base_dataset.upper())
+            total_len = len(dataset)
+            train_len = int(0.8 * total_len)
+            val_len = int(0.1 * total_len)
+            test_len = total_len - train_len - val_len
+            generator = torch.Generator().manual_seed(self.seed)
+            train_set, val_set, test_set = random_split(dataset, lengths=[train_len, val_len, test_len], generator=generator)
+            logger.info(f"Graph dataset {base_dataset.upper()} loaded and split: train ({len(train_set)} samples), val ({len(val_set)} samples), test ({len(test_set)} samples).")
+            return train_set, val_set, test_set
+        else:
+            logger.error(f"Unsupported graph dataset: {base_dataset}")
+            raise ValueError(f"Unsupported graph dataset: {base_dataset}")
+```

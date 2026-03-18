@@ -1,0 +1,236 @@
+"""curriculum.py
+
+This module implements the CurriculumScheduler abstract base class and several concrete
+curriculum learning strategies. These strategies are designed to integrate with the training
+pipeline and adjust the training process dynamically based on the current loss and epoch.
+
+The key method, update_schedule(loss: float, epoch: int, **kwargs) -> float, returns a float
+that can be interpreted in different ways depending on the chosen strategy:
+  • For Self-Paced Learning (SPL), it represents a threshold for sample selection.
+  • For Teacher-Guided scheduling, it represents a threshold influenced by teacher loss.
+  • For Loss Reweighting methods, it is a multiplicative weight scaling the loss.
+
+Each concrete subclass extracts its hyperparameters from the "curriculum" section of the
+configuration dictionary. If a required parameter is missing, a default value is used.
+This file is part of the full project and should be imported by the Trainer module to drive
+the curriculum learning process.
+"""
+
+import math
+import logging
+from abc import ABC, abstractmethod
+from typing import Any, Dict
+
+# Set up logging for this module
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+class CurriculumScheduler(ABC):
+    """
+    Abstract base class providing a standard interface for curriculum learning strategies.
+
+    All curriculum learning schedulers must implement the update_schedule method, which
+    takes the current loss and epoch (plus any additional keyword arguments) and returns a
+    float value that drives the curriculum in training. The returned float's interpretation
+    (e.g., a selection threshold or weight factor) is determined by the concrete strategy.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initialize the curriculum scheduler by extracting common curriculum hyperparameters.
+
+        Extracted parameters from the "curriculum" section of the configuration include:
+          - warmup_epochs: Number of epochs to use a baseline threshold (default: 5)
+          - schedule_epochs: (Optional) total epochs for scheduling, default is set to 50 if absent.
+          - initial_threshold: The baseline threshold for sample selection (default: 0.5)
+          - growth_rate: The rate at which the threshold changes after warmup (default: 0.1)
+
+        Args:
+            config (Dict[str, Any]): The experiment configuration dictionary.
+        """
+        curriculum_config: Dict[str, Any] = config.get("curriculum", {})
+
+        self.warmup_epochs: int = int(curriculum_config.get("warmup_epochs", 5))
+        self.schedule_epochs: int = int(curriculum_config.get("schedule_epochs", 50))
+        self.initial_threshold: float = float(curriculum_config.get("initial_threshold", 0.5))
+        self.growth_rate: float = float(curriculum_config.get("growth_rate", 0.1))
+
+    @abstractmethod
+    def update_schedule(self, loss: float, epoch: int, **kwargs) -> float:
+        """
+        Abstract method to update the curriculum schedule.
+
+        Args:
+            loss (float): The current loss of the sample or batch.
+            epoch (int): The current epoch number in training.
+            **kwargs: Additional keyword arguments. For example, a teacher_guided strategy may
+                      expect a 'teacher_loss' keyword.
+
+        Returns:
+            float: A value that could represent a sample selection threshold or a loss reweighting
+                   factor. Its interpretation is determined by the concrete subclass.
+        """
+        pass
+
+
+class SelfPacedScheduler(CurriculumScheduler):
+    """
+    Implements a Self-Paced Learning (SPL) strategy.
+
+    The update_schedule method returns a threshold for sample selection. Samples with loss
+    below the returned threshold are selected for training. The threshold is computed as:
+
+      - For epochs less than warmup_epochs, the threshold is set to the initial_threshold.
+      - For epochs greater than or equal to warmup_epochs, the threshold is:
+             threshold = initial_threshold + growth_rate * (epoch - warmup_epochs)
+
+    This means that as training progresses beyond the warmup period, the threshold increases,
+    allowing more difficult samples to be incorporated.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initialize the SelfPacedScheduler using curriculum hyperparameters from the config.
+        """
+        super().__init__(config)
+        self.method_name: str = "SelfPacedLearning"
+        logger.info(
+            f"SelfPacedScheduler initialized with warmup_epochs={self.warmup_epochs}, "
+            f"initial_threshold={self.initial_threshold}, growth_rate={self.growth_rate}"
+        )
+
+    def update_schedule(self, loss: float, epoch: int, **kwargs) -> float:
+        """
+        Update the self-paced learning threshold based on the current epoch.
+
+        Args:
+            loss (float): The current loss (not directly used in this strategy).
+            epoch (int): The current epoch.
+            **kwargs: Not used in this strategy.
+
+        Returns:
+            float: The current threshold for sample selection. Samples with loss less than this
+                   threshold are selected for training.
+        """
+        if epoch < self.warmup_epochs:
+            threshold = self.initial_threshold
+        else:
+            threshold = self.initial_threshold + self.growth_rate * (epoch - self.warmup_epochs)
+        logger.debug(
+            f"[SelfPacedScheduler] Epoch: {epoch}, Loss: {loss:.4f}, "
+            f"Threshold: {threshold:.4f}"
+        )
+        return threshold
+
+
+class TeacherGuidedScheduler(CurriculumScheduler):
+    """
+    Implements a Teacher-Guided curriculum strategy.
+
+    This scheduler adjusts the sample selection threshold using guidance from a teacher model.
+    It expects an additional keyword argument 'teacher_loss' in update_schedule. The returned
+    float represents the threshold for sample selection, computed as:
+
+      - If 'teacher_loss' is provided:
+            If epoch < warmup_epochs:
+                threshold = teacher_loss * teacher_factor
+            Else:
+                threshold = teacher_loss * teacher_factor + growth_rate * (epoch - warmup_epochs)
+      - If 'teacher_loss' is not provided, a warning is issued and the initial_threshold is used.
+
+    The teacher_factor parameter amplifies the effect of the teacher's loss and is read from the
+    configuration (default: 1.0).
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initialize the TeacherGuidedScheduler with additional teacher_factor.
+        """
+        super().__init__(config)
+        self.method_name: str = "TeacherGuidedLearning"
+        teacher_factor = config.get("curriculum", {}).get("teacher_factor")
+        if teacher_factor is None:
+            teacher_factor = 1.0
+        self.teacher_factor: float = float(teacher_factor)
+        logger.info(
+            f"TeacherGuidedScheduler initialized with warmup_epochs={self.warmup_epochs}, "
+            f"initial_threshold={self.initial_threshold}, growth_rate={self.growth_rate}, "
+            f"teacher_factor={self.teacher_factor}"
+        )
+
+    def update_schedule(self, loss: float, epoch: int, **kwargs) -> float:
+        """
+        Update the schedule based on teacher guidance.
+
+        Args:
+            loss (float): The current student loss.
+            epoch (int): The current epoch.
+            **kwargs: Expected to include 'teacher_loss' representing the teacher's loss metric.
+
+        Returns:
+            float: The adjusted threshold for data selection, influenced by the teacher's loss.
+        """
+        teacher_loss = kwargs.get("teacher_loss")
+        if teacher_loss is None:
+            logger.warning(
+                "TeacherGuidedScheduler requires 'teacher_loss' in kwargs; using initial_threshold as fallback."
+            )
+            teacher_loss = self.initial_threshold
+
+        if epoch < self.warmup_epochs:
+            threshold = teacher_loss * self.teacher_factor
+        else:
+            threshold = teacher_loss * self.teacher_factor + self.growth_rate * (epoch - self.warmup_epochs)
+        logger.debug(
+            f"[TeacherGuidedScheduler] Epoch: {epoch}, Student Loss: {loss:.4f}, "
+            f"Teacher Loss: {teacher_loss:.4f}, Threshold: {threshold:.4f}"
+        )
+        return threshold
+
+
+class LossReweightingScheduler(CurriculumScheduler):
+    """
+    Implements a Loss Reweighting curriculum strategy.
+
+    This scheduler calculates a multiplicative weight for the loss of each sample to mitigate
+    the impact of noisy or hard samples. The weight factor is computed as:
+
+         weight = exp(-reweight_factor * loss)
+
+    where reweight_factor is a hyperparameter read from the configuration (default: 1.0).
+    The returned float should be used to scale the sample loss.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initialize the LossReweightingScheduler using the reweight_factor from config.
+        """
+        super().__init__(config)
+        self.method_name: str = "LossReweighting"
+        reweight_factor = config.get("curriculum", {}).get("reweight_factor")
+        if reweight_factor is None:
+            reweight_factor = 1.0
+        self.reweight_factor: float = float(reweight_factor)
+        logger.info(
+            f"LossReweightingScheduler initialized with reweight_factor={self.reweight_factor}"
+        )
+
+    def update_schedule(self, loss: float, epoch: int, **kwargs) -> float:
+        """
+        Update the scheduler to compute a weight factor based on the current loss.
+
+        Args:
+            loss (float): The current loss.
+            epoch (int): The current epoch (not used directly in the basic formulation).
+            **kwargs: Additional parameters are ignored in this strategy.
+
+        Returns:
+            float: A multiplicative weight calculated as exp(-reweight_factor * loss) to
+                   scale the loss. A lower weight is assigned to higher loss samples.
+        """
+        weight = math.exp(-self.reweight_factor * loss)
+        logger.debug(
+            f"[LossReweightingScheduler] Epoch: {epoch}, Loss: {loss:.4f}, Weight: {weight:.4f}"
+        )
+        return weight

@@ -1,0 +1,236 @@
+```python
+"""
+vae.py
+
+This module implements the Visual Answer Evaluation (VAE) component of the Versatile Data Cleanser (VDC) pipeline.
+Note: VAE here does not refer to a variational autoencoder. Instead, it performs binary evaluation of answers generated
+by the VQA module by comparing them with the expected answers.
+For label-specific questions, a deterministic (regex-based) evaluation is used.
+For general questions, the module employs a ChatGPT-aided evaluation which sends a prompt to the OpenAI API and parses
+its response. The module is configuration-driven so that all thresholds, patterns, and API settings can be customized
+via an evaluation configuration dictionary (typically loaded from config.yaml).
+"""
+
+import logging
+import re
+import time
+from typing import Any, Dict, List
+
+import openai
+
+from utils import clean_text, get_logger
+
+# Set up a module logger.
+logger = get_logger("vae")
+
+
+class VAE:
+    """
+    Visual Answer Evaluation (VAE) class for the VDC project.
+
+    This class evaluates the consistency of an answer (obtained via VQA) with the expected answer.
+    It supports two evaluation strategies:
+      - Deterministic string-based evaluation for label-specific questions.
+      - ChatGPT-based evaluation for general questions.
+
+    Public Methods:
+      - evaluate_answer(answer: str, expected: str, question_type: str) -> bool
+
+    Data members (initialized via eval_config):
+      - affirmative_patterns (List[re.Pattern]): Compiled regex patterns for affirmative responses.
+      - negative_patterns (List[re.Pattern]): Compiled regex patterns for negative responses.
+      - api_retry_limit (int): Maximum number of retries for ChatGPT API calls.
+      - api_retry_delay (int): Base delay between API retries, used with exponential backoff.
+      - api_timeout (int): Timeout (in seconds) for API calls (informative).
+      - default_general_result (bool): Default fallback result for general evaluation if API evaluation is ambiguous.
+      - api_model (str): ChatGPT model to be used for evaluation.
+      - eval_prompt_template (str): Template for constructing the evaluation prompt for general questions.
+    """
+
+    def __init__(self, eval_config: Dict[str, Any]) -> None:
+        """
+        Initializes the VAE module using evaluation configuration parameters.
+        
+        Args:
+            eval_config (Dict[str, Any]): A configuration dictionary containing evaluation settings.
+                Expected keys include:
+                  - "affirmative_patterns": List[str] of regex patterns for affirmative answers.
+                  - "negative_patterns": List[str] of regex patterns for negative answers.
+                  - "api_retry_limit": int, maximum retry attempts for ChatGPT API (default: 3).
+                  - "api_retry_delay": int, base delay (in seconds) between retries (default: 2).
+                  - "api_timeout": int, timeout in seconds for API calls (default: 10).
+                  - "default_general_result": bool, fallback result for general evaluation (default: False).
+                  - "chatgpt_model": str, ChatGPT API model to use (default: "gpt-3.5-turbo").
+                  - "eval_prompt_template": str, a prompt template with placeholders '{answer}' and '{expected}'.
+        """
+        # Set up affirmative and negative patterns for label-specific evaluation.
+        affirmative_list: List[str] = eval_config.get("affirmative_patterns", [
+            r"\byes\b", r"\byep\b", r"\byeah\b", r"\bindeed\b", r"\bcorrect\b", r"\baffirmative\b"
+        ])
+        negative_list: List[str] = eval_config.get("negative_patterns", [
+            r"\bno\b", r"\bnot\b", r"\bdon't\b", r"\bcannot\b"
+        ])
+        self.affirmative_patterns: List[re.Pattern] = [re.compile(pat, re.IGNORECASE) for pat in affirmative_list]
+        self.negative_patterns: List[re.Pattern] = [re.compile(pat, re.IGNORECASE) for pat in negative_list]
+
+        # API configuration for general question evaluation.
+        self.api_retry_limit: int = eval_config.get("api_retry_limit", 3)
+        self.api_retry_delay: int = eval_config.get("api_retry_delay", 2)
+        self.api_timeout: int = eval_config.get("api_timeout", 10)
+        self.default_general_result: bool = eval_config.get("default_general_result", False)
+        self.api_model: str = eval_config.get("chatgpt_model", "gpt-3.5-turbo")
+        self.eval_prompt_template: str = eval_config.get(
+            "eval_prompt_template",
+            ("You are a precise evaluator. Given the model's answer: '{answer}' and the expected answer: '{expected}', "
+             "determine if they match semantically. Answer only with 'yes' or 'no'.")
+        )
+
+        logger.info("Initialized VAE with configuration: affirmative_patterns=%s, negative_patterns=%s, "
+                    "api_retry_limit=%d, api_retry_delay=%d, default_general_result=%s, api_model=%s.",
+                    affirmative_list, negative_list, self.api_retry_limit, self.api_retry_delay,
+                    self.default_general_result, self.api_model)
+
+    def evaluate_label_specific(self, answer: str) -> bool:
+        """
+        Evaluates an answer for a label-specific question using deterministic string-based matching.
+
+        The answer is processed with robust cleaning and then scanned for affirmative and negative tokens.
+        If an affirmative token is present and no strong negative indicator is detected, the answer is considered correct.
+
+        Args:
+            answer (str): The answer text from the VQA module.
+
+        Returns:
+            bool: True if the answer is affirmative and not negated, False otherwise.
+        """
+        cleaned_answer: str = clean_text(answer)
+        logger.debug(f"Evaluating label-specific answer. Cleaned answer: '{cleaned_answer}'")
+
+        affirmative_found: bool = any(pattern.search(cleaned_answer) for pattern in self.affirmative_patterns)
+        negative_found: bool = any(pattern.search(cleaned_answer) for pattern in self.negative_patterns)
+        logger.debug(f"Affirmative found: {affirmative_found}, Negative found: {negative_found} in answer: '{cleaned_answer}'")
+
+        # If both affirmative and negative are present (ambiguous), we return False.
+        if affirmative_found and not negative_found:
+            return True
+        else:
+            return False
+
+    def evaluate_general(self, answer: str, expected: str) -> bool:
+        """
+        Evaluates an answer for a general question using ChatGPT API.
+
+        A prompt is constructed using the evaluation prompt template and the provided answer and expected answer.
+        The API is queried with a retry mechanism; if an unambiguous response ("yes" or "no") is received,
+        it is interpreted accordingly. In case of ambiguous or failed responses after retrying, a default fallback value is returned.
+
+        Args:
+            answer (str): The answer text from the VQA module.
+            expected (str): The expected answer for the question.
+
+        Returns:
+            bool: True if the evaluation deems the answer correct, False otherwise.
+        """
+        prompt: str = self.eval_prompt_template.format(answer=answer, expected=expected)
+        logger.info(f"Constructed evaluation prompt for general question: {prompt}")
+
+        retries: int = self.api_retry_limit
+        while retries > 0:
+            try:
+                messages = [
+                    {"role": "system", "content": "You are a precise assistant who evaluates semantic consistency."},
+                    {"role": "user", "content": prompt}
+                ]
+                logger.info(f"Sending prompt to ChatGPT API. Retries remaining: {retries}")
+                response = openai.ChatCompletion.create(
+                    model=self.api_model,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=5
+                )
+                response_text: str = response['choices'][0]['message']['content']
+                cleaned_response: str = clean_text(response_text)
+                logger.info(f"ChatGPT API response: '{response_text}', cleaned: '{cleaned_response}'")
+                # Check for unambiguous response.
+                if re.fullmatch(r"yes", cleaned_response, flags=re.IGNORECASE):
+                    return True
+                elif re.fullmatch(r"no", cleaned_response, flags=re.IGNORECASE):
+                    return False
+                else:
+                    logger.warning(f"Ambiguous response received: '{cleaned_response}'. Retrying evaluation.")
+            except Exception as e:
+                logger.error(f"Error during ChatGPT API call for evaluation: {e}. Retrying.")
+            retries -= 1
+            # Exponential backoff on retry delay.
+            delay = self.api_retry_delay * (2 ** (self.api_retry_limit - retries - 1))
+            time.sleep(delay)
+        
+        logger.warning("ChatGPT evaluation did not yield an unambiguous response after retries. "
+                       f"Defaulting to {self.default_general_result}.")
+        return self.default_general_result
+
+    def evaluate_answer(self, answer: str, expected: str, question_type: str) -> bool:
+        """
+        Evaluates an answer based on the question type.
+
+        For 'label_specific' questions, a deterministic evaluation is performed.
+        For 'general' questions, a ChatGPT API based evaluation is conducted.
+        If an unknown question_type is provided, the default fallback result is returned.
+
+        Args:
+            answer (str): The answer text from the VQA module.
+            expected (str): The expected answer for the provided question.
+            question_type (str): The type of question ("label_specific" or "general").
+
+        Returns:
+            bool: True if the answer is evaluated as consistent with the expected semantics; False otherwise.
+        """
+        logger.info(f"Evaluating answer for question type '{question_type}'. Answer: '{answer}', Expected: '{expected}'")
+        if question_type == "label_specific":
+            return self.evaluate_label_specific(answer)
+        elif question_type == "general":
+            return self.evaluate_general(answer, expected)
+        else:
+            logger.error(f"Unknown question type '{question_type}'. Defaulting evaluation to {self.default_general_result}.")
+            return self.default_general_result
+
+
+if __name__ == "__main__":
+    # Example usage and testing of the VAE module.
+    
+    # Sample evaluation configuration (normally derived from config.yaml).
+    sample_eval_config: Dict[str, Any] = {
+        "affirmative_patterns": [r"\byes\b", r"\byep\b", r"\byeah\b", r"\bindeed\b", r"\bcorrect\b", r"\baffirmative\b"],
+        "negative_patterns": [r"\bno\b", r"\bnot\b", r"\bdon't\b", r"\bcannot\b"],
+        "api_retry_limit": 3,
+        "api_retry_delay": 2,
+        "api_timeout": 10,
+        "default_general_result": False,
+        "chatgpt_model": "gpt-3.5-turbo",
+        "eval_prompt_template": ("You are a precise evaluator. Given the model's answer: '{answer}' and the expected answer: '{expected}', "
+                                 "determine if they match semantically. Answer only with 'yes' or 'no'.")
+    }
+    
+    # Create an instance of VAE.
+    vae_instance = VAE(eval_config=sample_eval_config)
+
+    # Test label-specific evaluation.
+    test_answer_label: str = "Yeah, yes, absolutely."
+    result_label: bool = vae_instance.evaluate_answer(
+        answer=test_answer_label,
+        expected="",
+        question_type="label_specific"
+    )
+    print(f"Label-Specific Evaluation Result: {result_label}")
+
+    # Test general evaluation.
+    # Note: For an actual evaluation, a valid OpenAI API key must be set.
+    test_answer_general: str = "The image shows a cat sitting on a mat."
+    expected_answer_general: str = "The image depicts a cat, which is expected for label 'cat'."
+    result_general: bool = vae_instance.evaluate_answer(
+        answer=test_answer_general,
+        expected=expected_answer_general,
+        question_type="general"
+    )
+    print(f"General Evaluation Result: {result_general}")
+```

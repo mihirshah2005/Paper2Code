@@ -1,0 +1,114 @@
+Below is the revised logic analysis for main.py that explicitly clarifies the placement and purpose of the curriculum scheduler update within the training loop to ensure complete reproducibility:
+
+────────────────────────────
+1. Load and Parse Configuration  
+────────────────────────────
+• Import the Config class (from config.py) and call its load() method to read settings from config.yaml.  
+• The configuration dictionary includes training hyperparameters (domain-specific settings for CV, NLP, and Graph), curriculum learning parameters (e.g., warmup_epochs, schedule_epochs, growth_rate), reproducibility seeds, and evaluation criteria.  
+• This dictionary is passed along to all modules to guarantee consistency.
+
+────────────────────────────
+2. Iterate Over Multiple Seeds for Reproducibility  
+────────────────────────────
+• Retrieve the list of seeds (e.g., [42, 666, 777, 888, 999]) from the configuration.  
+• For each seed, set the random states for Python’s random module, numpy, PyTorch, and other libraries to ensure reproducible experimental runs.  
+• Record results for each seed so that final metrics can be aggregated (mean and standard deviation).
+
+────────────────────────────
+3. Data Loading and Preprocessing  
+────────────────────────────
+• Instantiate the DatasetLoader (from dataset_loader.py) with the configuration.  
+• Call load_data() to download and split the datasets (e.g., CIFAR-10, CIFAR-100 for CV; GLUE datasets for NLP; ogbg-molhiv and TUDataset for Graph).  
+• Depending on the experimental setting (such as “noise-p” or “imbalance-r”), invoke apply_noise() and/or apply_imbalance() on the training data.  
+• The result is a data dictionary containing the training, validation, and test datasets or data loaders.
+
+────────────────────────────
+4. Model Instantiation  
+────────────────────────────
+• Instantiate the ModelManager (from model.py) using configuration details.  
+• ModelManager determines, based on the chosen domain and model identifiers, whether to build a CV model (e.g., LeNet, ResNet‐18, ViT), an NLP model (LSTM, BERT, GPT2), or a graph model (GCN, GAT, GIN).  
+• It adjusts the model’s input and output layers in line with dataset properties (such as number of classes) and returns the ready‐to‐train model.
+
+────────────────────────────
+5. Curriculum Learning Scheduler Initialization  
+────────────────────────────
+• Instantiate the CurriculumScheduler (from curriculum.py) using the configuration.  
+• This scheduler implements a common interface with methods such as update_schedule(loss: float, epoch: int) and is designed to encapsulate logic for data reweighting or selection based on training progress.  
+• Note that while some hyperparameters (e.g., warmup_epochs, growth_rate) may be specified as placeholders, the scheduler is designed to be extended with a concrete curriculum method later.
+
+────────────────────────────
+6. Training Loop Orchestration (Objective Fitting)  
+────────────────────────────
+• Instantiate the Trainer (from trainer.py) with the following components:  
+ – The model built by ModelManager,  
+ – The dataset dictionary from DatasetLoader,  
+ – The CurriculumScheduler instance, and  
+ – The overall configuration.
+  
+• In the Trainer’s core update cycle—executed for each epoch and for every batch—the following detailed steps occur:
+
+ a. Set the model to training mode (model.train()).  
+ b. For each batch in the training data, perform the following steps in order:
+
+  1. Clear previous gradients by calling optimizer.zero_grad().
+  
+  2. Execute a forward pass through the model with the current batch to compute predictions.
+  
+  3. Compute the loss between the predictions and the ground truth labels.  
+   • (If a curriculum method requires loss reweighting before gradient computation, the loss variable is modified accordingly here.)  
+  
+  4. Call loss.backward() to compute gradients—this step uses the original loss values so that gradient computations reflect the current state of model performance without interference from future curriculum adjustments.
+  
+  5. Immediately after gradient computation but before updating the model weights, call curriculum_scheduler.update_schedule(loss, epoch).  
+   • This invocation serves two main purposes:
+    – It records the current loss and epoch information to update the internal state of the curriculum scheduler.
+    – It computes or adjusts any factors (e.g., data selection probabilities or sample weightings) that will influence future batches.  
+   • Importantly, note that the scheduler update at this point does not modify the gradients of the already-computed batch. In our design, curriculum scheduling is intended to influence future iterations—not to retroactively alter the gradient update of the current batch. If a curriculum method requires reweighting to influence gradient computations, the reweighting must be applied as part of the forward-loss computation.
+  
+  6. Finally, update the model’s parameters by calling optimizer.step().
+  
+  7. Optionally, record metrics such as batch-level loss, GPU memory usage, and timing information if configured to do so.
+
+• This explicit placement ensures a clear separation: the backward pass computes gradients on the current loss, and then the curriculum scheduler processes those loss values to adjust the training dynamics for upcoming batches.
+
+────────────────────────────
+7. Evaluation and Metrics Calculation  
+────────────────────────────
+• Upon completing training for the current seed, instantiate the Evaluation class (from evaluation.py) with the trained model, the evaluation data (validation and/or test sets), and the configuration.  
+• Call Evaluation.evaluate(), which performs forward passes to obtain predictions and computes domain-specific performance metrics:  
+ – For CV: accuracy,  
+ – For NLP: accuracy, F1, Spearman, and Matthews correlations, and  
+ – For Graph: AUC.  
+• This module also incorporates complexity metrics such as total training time and maximum GPU memory usage if enabled.  
+• The evaluation returns a result dictionary that is stored for the current seed.
+
+────────────────────────────
+8. Aggregating Results Across Seeds  
+────────────────────────────
+• Collect evaluation outcomes from all seed-based runs.  
+• Aggregate these outcomes (computing mean and standard deviation) across seeds for each performance and complexity metric.  
+• This aggregation mirrors the paper’s reporting approach (e.g., as seen in Table 3).
+
+────────────────────────────
+9. Final Reporting and Logging  
+────────────────────────────
+• Log or print the aggregated metrics in a clear, possibly tabulated format.  
+• Optionally, generate plots (using matplotlib) to display performance variations (for instance, versus noise ratios or imbalance factors).  
+• Save evaluation logs and model checkpoints for further analysis and reproducibility.
+
+────────────────────────────
+10. Recap of Overall Program Call Flow  
+────────────────────────────
+The revised main.py follows these steps:
+ 1. Load configuration using Config.load().
+ 2. For each seed (ensuring reproducibility):
+  a. Set the random seed.
+  b. Use DatasetLoader to load and preprocess data (applying noise/imbalance as needed).
+  c. Instantiate the model via ModelManager.
+  d. Initialize the CurriculumScheduler.
+  e. Create the Trainer and run the training loop where—for each batch—the following order is enforced:
+   • Clear gradients, forward pass to compute loss, compute gradients via loss.backward(), then call curriculum_scheduler.update_schedule(loss, epoch) to adjust future training dynamics, and finally call optimizer.step() to update model parameters.
+  f. Evaluate the trained model using Evaluation and record performance and complexity metrics.
+ 3. Aggregate results across all seeds and report the final outcomes.
+
+This revised analysis clarifies that the curriculum_scheduler.update_schedule() is positioned after the gradient computation but before the optimizer step, and it explicitly notes that its purpose is to adjust future data weighting or sample selection rather than altering the current batch’s gradients. This design choice addresses the critique regarding the precise placement and influence of the curriculum scheduler within the training loop.

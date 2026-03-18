@@ -1,0 +1,40 @@
+🌟 Usage Summary 🌟
+[Planning] Overall plan
+🛠️ Model: o3-mini
+📥 Input tokens: 23998 (Cost: $0.02639780)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 4984 (Cost: $0.02192960)
+💵 Current total cost: $0.04832740
+🪙 Accumulated total cost so far: $0.04832740
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Architecture design
+🛠️ Model: o3-mini
+📥 Input tokens: 27368 (Cost: $0.03010480)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 1823 (Cost: $0.00802120)
+💵 Current total cost: $0.03812600
+🪙 Accumulated total cost so far: $0.08645340
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Logic design
+🛠️ Model: o3-mini
+📥 Input tokens: 5155 (Cost: $0.00567050)
+📦 Cached input tokens: 23552 (Cost: $0.01295360)
+📤 Output tokens: 1439 (Cost: $0.00633160)
+💵 Current total cost: $0.02495570
+🪙 Accumulated total cost so far: $0.11140910
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Configuration file generation
+🛠️ Model: o3-mini
+📥 Input tokens: 867 (Cost: $0.00095370)
+📦 Cached input tokens: 28672 (Cost: $0.01576960)
+📤 Output tokens: 2600 (Cost: $0.01144000)
+💵 Current total cost: $0.02816330
+🪙 Accumulated total cost so far: $0.13957240
+============================================
+

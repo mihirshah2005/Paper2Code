@@ -1,0 +1,195 @@
+```python
+"""
+main.py
+
+Entry point of the VDC (Versatile Data Cleanser) experimental pipeline.
+This script orchestrates the entire process:
+  1. Loads and validates configuration from "config.yaml".
+  2. Initializes dataset loader to load the CIFAR-10, ImageNet-100, or ImageNet-Dog datasets.
+  3. Injects dirty samples (both noisy labels and backdoor triggers) into the training dataset.
+  4. Purifies the training dataset using the VDCDetector (which integrates VQG, VQA, and VAE).
+  5. Retrains a classifier (ResNet-18) on the purified dataset using a Trainer.
+  6. Evaluates the retrained classifier using the Evaluation module.
+All key hyperparameters and settings are read from the configuration file.
+"""
+
+import sys
+import os
+import logging
+from typing import Any, Dict, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Subset
+
+from torchvision import models
+
+# Import modules from the project.
+from utils import load_config, init_logger, set_random_seed
+from dataset_loader import DatasetLoader
+from vqg import VQG
+from vqa import VQA
+from vae import VAE
+from detection import VDCDetector
+from trainer import Trainer
+from evaluation import Evaluation
+
+
+def main() -> None:
+    # ------------------------------------------------------------------------------
+    # 1. Configuration Loading, Validation, and Logging
+    # ------------------------------------------------------------------------------
+    config_file: str = "config.yaml"
+    config: Dict[str, Any] = load_config(config_file)
+    logger: logging.Logger = init_logger()
+    logger.info("Loaded configuration: %s", config)
+
+    # Determine dataset name from configuration; default to "CIFAR-10"
+    dataset_name: str = config.get("dataset_name", "CIFAR-10")
+    if "dataset_name" not in config:
+        config["dataset_name"] = dataset_name
+        logger.info("No 'dataset_name' specified in config, defaulting to '%s'.", dataset_name)
+    else:
+        logger.info("Using dataset specified in config: '%s'.", dataset_name)
+
+    # ------------------------------------------------------------------------------
+    # 2. Dataset Loading and Dirty Sample Injection
+    # ------------------------------------------------------------------------------
+    logger.info("Initializing DatasetLoader...")
+    dataset_loader: DatasetLoader = DatasetLoader(config)
+    data_dict: Dict[str, Any] = dataset_loader.load_data()
+
+    if dataset_name not in data_dict:
+        logger.error("Dataset '%s' not found in loaded data. Exiting...", dataset_name)
+        sys.exit(1)
+
+    train_dataset: Any = data_dict[dataset_name]["train"]
+    test_dataset: Any = data_dict[dataset_name]["test"]
+    logger.info("Loaded dataset '%s': train_size = %d, test_size = %d",
+                dataset_name, len(train_dataset), len(test_dataset))
+
+    # Inject dirty samples into the training dataset.
+    logger.info("Injecting dirty samples into the training dataset for '%s'...", dataset_name)
+    data_injected: Dict[str, Any] = dataset_loader.inject_dirty_samples(data_dict)
+    train_dataset_injected: Any = data_injected[dataset_name]["train"]
+    logger.info("Dirty sample injection completed for '%s'.", dataset_name)
+
+    # ------------------------------------------------------------------------------
+    # 3. Initialization of VQG, VQA, VAE, and VDCDetector for Purification
+    # ------------------------------------------------------------------------------
+    logger.info("Initializing VQG, VQA, and VAE modules for detection...")
+    # Get detection-related configuration parameters.
+    detection_config: Dict[str, Any] = config.get("detection", {})
+    # General question templates; default provided if missing.
+    general_templates: List[str] = detection_config.get(
+        "general_templates", ["Describe the image briefly.", "Describe the image in detail."]
+    )
+    # General questions count.
+    general_count: int = detection_config.get("general_questions_count", 2)
+    # Label-specific questions configuration per dataset.
+    label_specific_questions_config: Dict[str, int] = detection_config.get(
+        "label_specific_questions", {"CIFAR-10": 4, "ImageNet-100": 6, "ImageNet-Dog": 4}
+    )
+    label_specific_count: int = label_specific_questions_config.get(dataset_name, 4)
+    # Label-specific prompt template.
+    label_prompt_template: str = detection_config.get(
+        "label_specific_prompt_template",
+        "Please generate {num} visual questions for the label '{label}' to verify if the label is correct. "
+        "The questions should be phrased such that a correct image would likely yield a 'yes' answer."
+    )
+    # Build label-specific prompt configuration dictionary.
+    label_prompt_config: Dict[str, Any] = {
+        "dataset": dataset_name,
+        "prompt_template": label_prompt_template,
+        "general_count": general_count,
+        "label_specific_count": label_specific_count,
+        "chatgpt_model": config.get("api", {}).get("chatgpt", {}).get("model", "gpt-3.5-turbo")
+    }
+    # Instantiate VQG with general templates and label-specific prompt settings.
+    vqg_module: VQG = VQG(templates=general_templates, labelPrompts=label_prompt_config)
+    # Instantiate VQA using instruct_blip API configuration.
+    vqa_module: VQA = VQA(model_config=config.get("api", {}).get("instruct_blip", {}))
+    # Set up VAE evaluation configuration.
+    vae_eval_config: Dict[str, Any] = {
+        "api_model": config.get("api", {}).get("chatgpt", {}).get("model", "gpt-3.5-turbo"),
+        "max_retries": 3,
+        "initial_backoff": 1.0
+    }
+    vae_module: VAE = VAE(eval_config=vae_eval_config)
+    # Set detection threshold.
+    threshold: float = detection_config.get("threshold", 0.5)
+    # Instantiate the VDCDetector.
+    vdc_detector: VDCDetector = VDCDetector(vqg=vqg_module, vqa=vqa_module, vae=vae_module, threshold=threshold)
+    logger.info("VDCDetector initialized with threshold %.2f.", threshold)
+
+    # ------------------------------------------------------------------------------
+    # 4. Purification Process: Remove Dirty Samples from the Training Dataset
+    # ------------------------------------------------------------------------------
+    logger.info("Starting sample-level detection for dataset purification...")
+    clean_indices: List[int] = []
+    total_samples: int = len(train_dataset_injected)
+
+    for idx in range(total_samples):
+        try:
+            sample: Any = train_dataset_injected[idx]
+            # For CIFAR-10, sample is typically a tuple: (image, label).
+            image: Any = sample[0]
+            label_value: Any = sample[1]
+            label_str: str = str(label_value)
+            is_dirty, detection_details = vdc_detector.detect_sample(image, label_str)
+            if not is_dirty:
+                clean_indices.append(idx)
+        except Exception as e:
+            logger.error("Error processing sample index %d: %s", idx, str(e))
+            continue
+
+    logger.info("Purification complete for '%s': Total samples = %d, Clean samples = %d, Removed = %d",
+                dataset_name, total_samples, len(clean_indices), total_samples - len(clean_indices))
+
+    # Create the purified training dataset as a Subset.
+    purified_train_dataset: Any = Subset(train_dataset_injected, clean_indices)
+
+    # ------------------------------------------------------------------------------
+    # 5. Classifier Model Initialization and Training
+    # ------------------------------------------------------------------------------
+    logger.info("Initializing classifier model based on configuration...")
+    classifier_config: Dict[str, Any] = config.get("models", {})
+    classifier_type: str = classifier_config.get("classifier", "ResNet-18")
+    classifier_model: torch.nn.Module
+
+    if classifier_type.lower() == "resnet-18":
+        # For example, assume CIFAR-10 has 10 classes.
+        num_classes: int = 10
+        classifier_model = models.resnet18(pretrained=False)
+        in_features: int = classifier_model.fc.in_features
+        classifier_model.fc = nn.Linear(in_features, num_classes)
+    else:
+        logger.error("Unsupported classifier type '%s'. Exiting...", classifier_type)
+        sys.exit(1)
+    logger.info("Classifier model '%s' initialized.", classifier_type)
+
+    # Training hyperparameters: use configuration from config["training"]
+    training_config: Dict[str, Any] = config.get("training", {})
+    training_config["dataset_name"] = dataset_name  # Ensure the dataset name is set.
+    logger.info("Training on purified dataset '%s' with %d samples.", dataset_name, len(purified_train_dataset))
+
+    trainer: Trainer = Trainer(model=classifier_model, train_data=purified_train_dataset, hyperparams=training_config)
+    trained_model: torch.nn.Module = trainer.train()
+
+    # Save the trained classifier model.
+    model_save_path: str = "trained_classifier.pth"
+    torch.save(trained_model.state_dict(), model_save_path)
+    logger.info("Trained classifier saved as '%s'.", model_save_path)
+
+    # ------------------------------------------------------------------------------
+    # 6. Evaluation of the Trained Classifier
+    # ------------------------------------------------------------------------------
+    logger.info("Starting evaluation of the trained classifier on the test set...")
+    evaluator: Evaluation = Evaluation(model=trained_model, test_data=test_dataset, config=config, detector=None)
+    eval_results: Dict[str, Any] = evaluator.evaluate()
+    logger.info("Final Evaluation Metrics: %s", eval_results)
+
+
+if __name__ == "__main__":
+    main()
+```

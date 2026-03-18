@@ -1,0 +1,130 @@
+Below is the revised logic analysis for dataset_loader.py. In this version, we explicitly clarify how overlapping modifications are handled, the mechanism for reading poisoning parameters from the config file, the integration of clearly defined utility functions for trigger injection, and a detailed filtering mechanism for ImageNet-100 and ImageNet-Dog splits.
+
+──────────────────────────────
+1. Initialization and Configuration Handling
+
+• The DatasetLoader class is initialized with a configuration dictionary (e.g., loaded from config.yaml).  
+   – The class reads parameters such as “dirty_sample_generation.noisy_ratio” and “dirty_sample_generation.poisoning” for each dataset.
+   – For poisoning, the configuration (e.g., for CIFAR-10, samples_per_class: [50, 500]) must be explicitly read and, if multiple options are provided, a selection mechanism (e.g., an additional parameter or command-line flag) must determine which value is used in a given experiment.
+   – All dataset-specific folders or root paths (for ImageNet-100 and ImageNet-Dog) are set during initialization.
+   – The random seed (either set here or via a global utility function) is fixed to ensure that any random sampling (e.g., for filtering or injection) is reproducible.
+
+──────────────────────────────
+2. Loading Data via load_data()
+
+• The load_data() function loads the data for each supported dataset:
+
+  A. CIFAR-10:
+     – Use torchvision.datasets.CIFAR10 with train=True and train=False.
+     – Apply a transformation pipeline (e.g., converting to tensor, normalization with CIFAR-10 means and stds).
+  
+  B. ImageNet-100:
+     – Load the data using torchvision.datasets.ImageFolder pointed at the ImageNet-100 subset.
+     – Define a transform pipeline that includes resizing (e.g., to 224×224) and normalization (ImageNet means/stds).
+     – After loading, perform a filtering mechanism:
+         ▪ Group samples by their class label.
+         ▪ For the training set, randomly (or deterministically with a fixed seed) select 500 samples per class.
+         ▪ For the testing set, select 100 samples per class.
+         ▪ This filtering ensures reproducibility of dataset splits.
+  
+  C. ImageNet-Dog:
+     – Similarly, load with ImageFolder from the designated subset.
+     – Apply ImageNet-style transformations.
+     – Group samples by class and select 800 training images and 200 testing images per class.
+
+• The function returns a structured dictionary (e.g., { "train": train_data, "test": test_data }) containing image data and labels in a uniform format.
+
+──────────────────────────────
+3. Data Preprocessing
+
+• Each dataset uses a dedicated transformation pipeline that is consistent with downstream model requirements:  
+   – CIFAR-10: transforms may include random cropping and horizontal flipping for training.  
+   – ImageNet-100 and ImageNet-Dog: resize to the model’s expected input dimensions (e.g., 224×224), center crop, convert to tensor, and normalization.
+• Utility functions in utils.py (for image resizing and normalization) should be used to guarantee consistency.
+
+──────────────────────────────
+4. Injecting Dirty Samples via inject_dirty_samples()
+
+• This function modifies the training data to simulate dirty scenarios. Two types of corruptions are applied:
+
+  A. Poisoned Samples Injection (Backdoor Attacks):
+     – For each dataset, read the poisoning configuration from the config.  
+         ▪ For CIFAR-10, use the parameter (e.g., either 50 or 500 samples per class) as explicitly selected via config.
+         ▪ For ImageNet-100 and ImageNet-Dog, use the provided numbers (e.g., [5, 50] and 80, respectively).
+     – For each class in the training set, group samples and randomly select the specified number of samples.  
+         ▪ IMPORTANT: To avoid overlapping modifications, if a sample is selected for poisoning, then it must not be further processed for noisy label injection (unless explicitly implementing hybrid experiments which must follow a defined ordering).  
+         ▪ In our implementation, these modifications are mutually exclusive unless the experimental setup explicitly calls for hybrid dirty samples. In the standard experimental procedure, a sample is modified by only one mechanism.
+     – For each selected sample, determine the type of backdoor attack (e.g., BadNets, SIG, Blended, TrojanNN, SSBA, WaNet).  
+         ▪ Call the corresponding trigger injection function from utils.py.  
+         ▪ For example, use utils.inject_badnets_trigger(image, parameters) or a similar function for SIG, Blended, etc.
+         ▪ Each utility function must be well defined with parameters (such as trigger size, position, blending ratio, etc.) that match the settings described in the paper.
+     – Change the label of the poisoned sample to the designated target label (e.g., class 0), ensuring that the intended modification is in line with the experimental instructions.
+
+  B. Noisy Labels Injection:
+     – For samples not selected for poisoning (or in separate experiments), use the noisy_ratio (0.4) to decide whether to corrupt the label.
+     – For each applicable sample, apply:
+         ▪ For symmetric noise: randomly flip the label to any of the other (K–1) labels.
+         ▪ For asymmetric noise: flip the original label to the “next” label using (original_label mod K) + 1.
+     – Ensure that if a sample is already modified by backdoor (poisoning), then noisy label injection is not applied to that sample unless the experiment is intentionally simulating a hybrid scenario.
+  
+• The function uses clearly defined utility functions from utils.py for all trigger injection operations.  
+     – This integration is key: if a required trigger injection function is not yet defined, its design must follow a consistent API so that DatasetLoader can call it without ambiguity.
+  
+• Finally, return the modified training data along with metadata (e.g., lists of indices that were modified and modification types) for logging and traceability.
+
+──────────────────────────────
+5. Output and Data Structures
+
+• The DatasetLoader returns a dictionary with keys “train” and “test” where:  
+   – “train”: a list or tensor of processed images along with their (possibly modified) labels. These images have been subject to injection according to the mutually exclusive (or explicitly hybrid) strategy.  
+   – “test”: kept clean as per the original splits and filtered as necessary (with the defined count per class for ImageNet datasets).
+• Additional metadata may include mapping from original labels to new labels for dirty samples and a record of which samples underwent which type of injection.
+
+──────────────────────────────
+6. Summary of Flow within dataset_loader.py
+
+• __init__(config: dict):  
+   – Parse configuration parameters including dataset roots, dirty_sample_generation.noisy_ratio, and poisoning.samples_per_class (explicitly reading which poisoning option to use from the config).  
+   – Initialize any paths and set a random seed for reproducibility.
+
+• load_data():  
+   – Load CIFAR-10, ImageNet-100, and ImageNet-Dog using torchvision.  
+   – Apply dedicated transformation pipelines.  
+   – For ImageNet-100 and ImageNet-Dog, group by class and filter the datasets by randomly selecting the specified number of samples per class (500 for training/100 for testing in ImageNet-100; 800/200 for ImageNet-Dog) ensuring fixed selection with the random seed.
+
+• inject_dirty_samples(data: dict):  
+   – For each training sample:
+         ▪ First, split samples into two mutually exclusive groups (or decide based on an experimental flag if hybrid modifications are needed): one for poisoning and one for noisy label injection.
+         ▪ For poisoning: For each class, randomly pick the configured number of samples (read from config) and apply the appropriate trigger injection method from utils.py. Modify the image and change the label accordingly.
+         ▪ For noisy label injection: For each sample not modified by poisoning (or in a separate experiment), with probability equal to noisy_ratio, flip the label using either symmetric or asymmetric noise rules.
+   – Return the modified training dataset along with a log of the modifications (for later reproducibility and debugging).
+
+──────────────────────────────
+7. Considerations and Additional Clarifications
+
+• Overlapping Modifications:
+   – Clearly state that a sample selected for poisoning will not be further modified by the noisy label injection function. This protects against conflicting modifications and preserves reproducibility aligned with the paper’s experimental setup.
+   – If hybrid dirty samples are to be simulated, then the implementation must define a clear ordering (e.g., apply poisoning first, then apply a controlled noisy label injection) and document the behavior; however, for most experiments these modifications remain exclusive.
+
+• Configuration Tie-In:
+   – The poisoning configuration (e.g., 50 versus 500 samples per class for CIFAR-10) must be read directly from the config file. A helper function should retrieve the exact value based on the current experiment scenario.
+  
+• Utility Functions Integration:
+   – The DatasetLoader relies on a suite of utility functions for trigger injection:
+         ▪ e.g., utils.inject_badnets_trigger(), utils.inject_sig_trigger(), utils.inject_blended_trigger(), etc.
+         ▪ These functions should have clearly defined parameters and error handling.
+         ▪ The DatasetLoader should verify that these functions exist and log if a particular attack type is unsupported or missing.
+  
+• Filtering for ImageNet-100 and ImageNet-Dog:
+   – When grouping samples by class, sorting or random sampling must be applied using a fixed random seed.
+   – After grouping, a simple slicing (or random sampling) selects the first N samples (e.g., 500 training samples) per class. This operation must be well recorded so that the dataset split remains reproducible.
+
+──────────────────────────────
+Conclusion
+
+The revised logic analysis for dataset_loader.py now clearly describes:
+   – How overlapping modifications are avoided by ensuring that any sample selected for poisoning is not subsequently modified by noisy label injection (unless explicitly configured for a hybrid experiment).
+   – How the poisoning configuration is directly read from the config file and utilized to select the number of samples per class.
+   – The expected integration points with utility functions for each type of trigger injection, with a reminder that these functions need clear APIs.
+   – A detailed filtering mechanism for ImageNet-100 and ImageNet-Dog ensuring a fixed number of samples per class based on reproducible random sampling.
+This revised plan ensures that the experimental setup is faithfully reproduced in line with the original paper while maintaining consistency with the configuration file and reproducibility requirements.

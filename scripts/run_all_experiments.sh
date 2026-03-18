@@ -1,16 +1,24 @@
 #!/bin/bash
 # run_all_experiments.sh
 #
-# Runs all 5 experiment configurations for a single paper, then evaluates each.
+# Lives in: scripts/
+# Calls Python files in: codes/
+#
+# Runs all 4 experiment configurations for a single paper, then evaluates each.
 # Assumes you have already run 1_planning.py for this paper.
 #
-# Usage:
-#   bash run_all_experiments.sh <paper_name> <pdf_json_path> <base_output_dir> <data_dir>
+# Usage (from project root):
+#   bash scripts/run_all_experiments.sh <paper_name> <pdf_json_path> <base_output_dir> [data_dir] [gpt_version] [paper_format]
 #
 # Example:
-#   bash run_all_experiments.sh transformer data/transformer.json outputs/transformer ../data
+#   bash scripts/run_all_experiments.sh transformer data/transformer.json outputs/transformer ../data
 
 set -e
+
+# Resolve the project root (parent of scripts/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODES_DIR="${PROJECT_ROOT}/codes"
 
 PAPER_NAME=$1
 PDF_JSON_PATH=$2
@@ -20,12 +28,14 @@ GPT_VERSION=${5:-"o3-mini"}
 PAPER_FORMAT=${6:-"JSON"}
 
 if [ -z "$PAPER_NAME" ] || [ -z "$PDF_JSON_PATH" ] || [ -z "$BASE_OUTPUT_DIR" ]; then
-    echo "Usage: bash run_all_experiments.sh <paper_name> <pdf_json_path> <base_output_dir> [data_dir] [gpt_version] [paper_format]"
+    echo "Usage: bash scripts/run_all_experiments.sh <paper_name> <pdf_json_path> <base_output_dir> [data_dir] [gpt_version] [paper_format]"
     exit 1
 fi
 
 echo "============================================"
 echo "Running all experiments for: $PAPER_NAME"
+echo "  codes dir:   $CODES_DIR"
+echo "  output dir:  $BASE_OUTPUT_DIR"
 echo "============================================"
 
 # The planning output should already exist at BASE_OUTPUT_DIR
@@ -42,21 +52,27 @@ run_experiment() {
     echo "Experiment: $EXP_NAME"
     echo "--------------------------------------------"
 
-    # Create experiment output dir and symlink planning artifacts
+    # Create experiment output dir
     mkdir -p "$EXP_OUTPUT"
 
-    # Copy/link planning artifacts so the experiment can find them
+    # Copy planning artifacts so the experiment can find them
     if [ ! -f "$EXP_OUTPUT/planning_trajectories.json" ]; then
         cp "$BASE_OUTPUT_DIR/planning_trajectories.json" "$EXP_OUTPUT/" 2>/dev/null || true
         cp "$BASE_OUTPUT_DIR/planning_config.yaml" "$EXP_OUTPUT/" 2>/dev/null || true
         cp "$BASE_OUTPUT_DIR/task_list.json" "$EXP_OUTPUT/" 2>/dev/null || true
     fi
 
-    # Determine repo dir (for static analysis on existing code)
+    # Also copy any existing *_simple_analysis_response.json files
+    # (needed if static_only/multi_signal reuse baseline analysis outputs)
+    for f in "$BASE_OUTPUT_DIR"/*_simple_analysis_response.json; do
+        [ -f "$f" ] && cp -n "$f" "$EXP_OUTPUT/" 2>/dev/null || true
+    done
+
+    # Determine repo dir (for static analysis on existing .py files)
     REPO_DIR="${BASE_OUTPUT_DIR}/${PAPER_NAME}_repo"
 
-    # Run the analyzing experiment
-    python 2_analyzing_experiments.py \
+    # Run the analyzing experiment from the codes/ directory
+    python3 "${CODES_DIR}/2_analyzing_experiments.py" \
         --paper_name "$PAPER_NAME" \
         --gpt_version "$GPT_VERSION" \
         --paper_format "$PAPER_FORMAT" \
@@ -67,7 +83,7 @@ run_experiment() {
         --output_repo_dir "$REPO_DIR"
 
     echo "Experiment $EXP_NAME complete."
-    echo "Token summary: $(cat $EXP_OUTPUT/experiment_summary_${MODE}_${FORMAT}.json | python -c 'import sys,json; d=json.load(sys.stdin); print(f"total={d[\"total_tokens\"]:,}")')"
+    echo "Token summary: $(cat "$EXP_OUTPUT/experiment_summary_${MODE}_${FORMAT}.json" | python -c 'import sys,json; d=json.load(sys.stdin); print(f"total={d[\"total_tokens\"]:,}")')"
 }
 
 
@@ -107,5 +123,6 @@ echo "2. Run eval.py on each repo to get rubric scores"
 echo "3. Run collect_results.py to gather all scores into a table"
 echo ""
 echo "Example for one experiment:"
-echo "  python 3_coding.py --paper_name $PAPER_NAME --output_dir $BASE_OUTPUT_DIR/experiments/llm_only_json --output_repo_dir $BASE_OUTPUT_DIR/experiments/llm_only_json/${PAPER_NAME}_repo ..."
-echo "  python eval.py --paper_name $PAPER_NAME --target_repo_dir $BASE_OUTPUT_DIR/experiments/llm_only_json/${PAPER_NAME}_repo ..."
+echo "  python ${CODES_DIR}/3_coding.py --paper_name $PAPER_NAME --output_dir $BASE_OUTPUT_DIR/experiments/llm_only_json --output_repo_dir $BASE_OUTPUT_DIR/experiments/llm_only_json/${PAPER_NAME}_repo ..."
+echo "  python ${CODES_DIR}/eval.py --paper_name $PAPER_NAME --target_repo_dir $BASE_OUTPUT_DIR/experiments/llm_only_json/${PAPER_NAME}_repo ..."
+echo "  python ${CODES_DIR}/collect_results.py --base_dir outputs/ --papers transformer,vdc,curbench,gem,fit,sea"

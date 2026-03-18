@@ -1,0 +1,192 @@
+Below is a detailed roadmap to reproduce GDEM. This plan is broken down into clear sections covering the methodology, experimental setup (data, model training, evaluation), and key hyperparameters. Later, you can use this outline to guide your code development.
+
+──────────────────────────────
+1. OVERVIEW OF THE APPROACH
+
+• Goal: Distill a small synthetic graph G′ = (V′, E′, X′) that, when used to train a GNN, yields performance comparable to a GNN trained on the real graph G = (V, E, X).  
+• Key idea: Rather than matching gradients or representations (which are linked to specific GNNs and can cause spectral bias), GDEM directly matches the eigenbasis (a subset of eigenvectors corresponding to the smallest and largest eigenvalues) and node features of the real and synthetic graphs. It then “replicates” the real spectrum to reconstruct the synthetic graph’s Laplacian/adjacency structure.  
+• Main components:
+  - Eigenbasis Matching: Align a selected subset of eigenvectors U_K (from the real graph’s Laplacian) with a learnable synthetic eigenbasis U′_K.
+  - Discrimination Constraint: Preserve category-level (class) information by matching representations (using a cosine-similarity loss) computed from the node features and spectrum.
+  - Orthogonality Regularization: Ensure that the synthetic eigenbasis remains normalized and orthogonal.
+  - Final graph reconstruction: Combine the learned synthetic eigenbasis with the replicated real spectrum to compute L′ and A′.
+
+──────────────────────────────
+2. PRELIMINARIES & DATA PREPROCESSING
+
+A. Data Requirements  
+  • Datasets: Use the seven benchmark graphs mentioned (e.g., Citeseer, Pubmed, Ogbn-arxiv, Flickr, Reddit for homophilic; Squirrel and Gamers for heterophilic).  
+  • Data splits: For homophilic datasets, use the public splits; for heterophilic graphs, use the splits provided in the paper (e.g., training/validation/test ratios as specified).
+
+B. Preprocessing Steps  
+  1. Load the graph(s) (using libraries such as NetworkX or PyTorch Geometric) and extract:
+     – Node features X ∈ ℝ^(N×d)
+     – Adjacency matrix A (binary, symmetric, undirected)
+     – Labels Y for the node classification task.
+  2. Compute the normalized Laplacian L = I_N – D^(–½) A D^(–½) where D is the degree matrix.
+  3. Perform eigen-decomposition of L:
+     – Use a numerical solver (e.g., from scipy.sparse.linalg) to compute all or, preferably, a truncated set of eigenvalues λ_i and eigenvectors u_i.
+  4. Choose a subset for matching:
+     – Select K = K₁ + K₂ eigenvectors from the real graph: the K₁ smallest (low-frequency, capturing global structure) and the K₂ largest (high-frequency, capturing local details).  
+     – The ratio rₖ (e.g., in {0.8, 0.85, 0.9, 0.95, 1.0}) sets K₁ = rₖ N′ and K₂ = (1 – rₖ) N′ where N′ is the number of synthetic nodes (dependent on the chosen compression ratio).
+
+──────────────────────────────
+3. SYNTHETIC GRAPH INITIALIZATION
+
+A. Synthetic Node Features (X′)  
+  • There are two options:
+    – (Option 1) Random initialization or  
+    – (Option 2) Pre-train an MLP on the real node features X (with labels Y) and then “transfer” this MLP to get an initial X′ for the synthetic graph.  
+  • The paper notes that they “freeze” the well-trained MLP to fine-tune classification objectives on synthetic data.
+
+B. Synthetic Eigenbasis (U′_K) Initialization  
+  • Initialize a matrix U′_K ∈ ℝ^(N′×K) that will be optimized.  
+  • One recommended initialization is by creating a synthetic adjacency matrix via a stochastic block model (SBM), then decompose it (e.g., using eigen-decomposition) to get an initial orthonormal U′_K.  
+  • Alternatively, a random orthogonal initialization may suffice if SBM details are not available.
+
+──────────────────────────────
+4. MODEL LOSS FUNCTIONS & OPTIMIZATION
+
+The overall objective is defined as a weighted sum:  
+  L_total = α L_e + β L_d + γ L_o
+
+A. Eigenbasis Matching Loss (L_e)  
+  • Purpose: Make the synthetic eigenbasis U′_K “align” with the corresponding principal eigenbasis U_K from the real graph.  
+  • Proposed formulation (subject to refinement based on your interpretation):  
+    – For each selected index k, measure the difference between the projection matrices u_k u_k^T (real) and u′_k u′_k^T (synthetic).  
+    – Loss term: L_e = ∑_(k=1)^K ||(u_k u_k^T) – (u′_k u′_k^T)||_F²  
+  • Note: If a different formulation is suggested in Equation 3 (or similar) in the paper, adapt accordingly.
+
+B. Discrimination Constraint Loss (L_d)  
+  • Purpose: Preserve and match the category-level (class) information.  
+  • How:  
+    – Compute category-level representations H for the real graph (e.g., via X^T A Y or an aggregation over nodes by their class labels) and H′ for the synthetic graph.  
+    – Apply a cosine similarity loss to ensure that H and H′ are aligned, thus enforcing that the synthetic graph “discriminates” between classes similarly to the real graph.
+  • Loss term example: L_d = 1 – cosine_similarity(H, H′)
+
+C. Orthogonality Regularization (L_o)  
+  • Purpose: Maintain the normalized, orthogonal nature of the synthetic eigenbasis so that U′_K behaves like a proper eigenbasis.  
+  • Formulation: L_o = ||U′_K^T U′_K – I_K||_F  
+  • This prevents degenerate solutions when updating U′_K.
+
+D. Optimization Protocol and Alternating Updates  
+  • Training loop runs for T epochs (specific T may vary per dataset; consult hyperparameter table in the paper).
+  • Alternating update schedule:  
+    – Define τ₁ and τ₂ as the number of steps to alternate updates between the synthetic eigenbasis and node features.
+    – For each iteration t, if t modulo (τ₁ + τ₂) is less than τ₁, update U′_K using learning rate η₁; else update X′ using learning rate η₂.
+  • Use Adam as the optimizer for both sets of parameters.
+  • Hyperparameters: α, β, γ; learning rates (lr_eigenvecs, lr_feat); update intervals τ₁, τ₂; number of epochs T.
+
+──────────────────────────────
+5. GRAPH RECONSTRUCTION
+
+After the iterative optimization of U′_K and X′:
+
+A. Replicating the Spectrum  
+  • The method “directly replicates” the real graph spectrum, meaning that during synthetic graph construction you use the eigenvalues computed from the real graph.  
+  • Reconstruct the synthetic Laplacian and/or adjacency matrix using:  
+    – L′ = ∑_(k=1)^K λ_k (u′_k u′_k^T)  
+    – A′ = ∑_(k=1)^K (1 – λ_k) (u′_k u′_k^T)
+
+B. Output  
+  • Save or return the synthetic graph: (A′, X′), where A′ represents the distilled structure and X′ the node features.
+
+──────────────────────────────
+6. EXPERIMENTAL SETUP & EVALUATION
+
+A. Distillation Step  
+  • Run GDEM on the training set of the real graph to produce synthetic graphs.
+  • Repeat the distillation (e.g., 10 independent runs with different random seeds) to average and assess variance.
+
+B. Evaluation Step  
+  • Train GNNs from scratch on the synthetic graph. For example:
+    – Use a 2-layer GCN network with 256 hidden units.
+    – For cross-architecture generalization, also train:
+         • Spatial models: GCN, SGC, PPNP (2 layers).
+         • Spectral models: ChebyNet, BernNet, GPR-GNN (set polynomial order to 10; hidden units = 256).
+  • Evaluate using node classification accuracy on the test set of the real graph.
+  • Compare the performance (accuracy and variance) across different GNN architectures.
+  • Additionally, compute metrics such as total variation (TV) of node features on the synthetic graph to compare with the real graph distribution.
+
+C. Baseline Comparisons  
+  • Implement or reuse baselines, which include:
+    – Traditional graph reduction methods (Random, Herding, K-Center, and coarsening as in Loukas, 2019).
+    – Other graph distillation methods: GCOND, SGDD, and SFGC.
+  • Ensure that you run evaluations using the same training protocols (same GNN architectures, same splits) to enable fair comparisons.
+
+D. Ablation Studies  
+  • Evaluate the contribution of each loss component (L_e, L_d, L_o) by training variants “without” one or more terms.
+  • Analyze the impact on both overall accuracy and cross-architecture generalization (variance across architectures).
+
+E. Hyperparameter Settings  
+  • Compression Ratio: Set N′ as a percentage of the real graph nodes (e.g., within 0.05%–1.0% as done in the experiments).
+  • Eigenbasis Matching Fraction (rₖ): Choose values from {0.8, 0.85, 0.9, 0.95, 1.0} to assess performance impact.
+  • Training Epochs, Learning Rates, and Alternation Steps: Follow the suggestions from Table 11 (or similar) in the paper’s appendix.
+  
+
+──────────────────────────────
+7. IMPLEMENTATION CHALLENGES & CONSIDERATIONS
+
+A. Eigen-decomposition for Large Graphs  
+  • When dealing with very large graphs, full eigen-decomposition can be computationally expensive. Use efficient solvers (e.g., sparse eigen solvers) and consider computing only the required K eigenvectors.
+  
+B. Alternating Updates  
+  • Ensure that the two sets of parameters (U′_K and X′) are updated in an alternating (or cyclical) fashion as described. This may require careful scheduler implementation to switch optimizers or parameter groups.
+  
+C. Initialization Details  
+  • The paper mentions initializing U′_K via a stochastic block model (SBM). If the SBM code is not provided, a pragmatic approach is to initialize with a random orthonormal matrix.
+  • For X′, if pre-training an MLP is used, ensure that the MLP is properly trained on real data before freezing its weights for synthetic feature initialization.
+  
+D. Loss Function Formulation Ambiguity  
+  • Certain equations (e.g., exact forms of L_e and L_d) are not fully detailed. Make explicit assumptions in your implementation and note these in your documentation.
+  
+E. Reproducibility  
+  • Log all hyperparameters and training details (seed values, learning rates, alternation schedule, compression ratios) for reproducibility.
+  • Track time overhead of distillation separately, as the paper emphasizes efficiency.
+
+──────────────────────────────
+8. ROADMAP SUMMARY
+
+Step-by-Step Outline:
+1. Set up the environment with necessary libraries (PyTorch, NumPy, SciPy, potentially PyG).
+2. Implement graph loading and preprocessing:
+   – Load real graphs and compute the normalized Laplacian.
+   – Calculate eigenvalues/eigenvectors and select the two ends (smallest K₁ and largest K₂).
+3. Initialize the synthetic graph:
+   – Create synthetic node features (X′) via random initialization or via a pre-trained MLP.
+   – Initialize synthetic eigenbasis U′_K (using a random orthogonal or SBM-driven initialization).
+4. Define loss functions:
+   – Code L_e for eigenbasis matching.
+   – Code L_d for the discrimination constraint (with cosine similarity between category-level representations).
+   – Code L_o for eigenbasis orthogonality.
+5. Set up the training loop:
+   – Alternate updates between U′_K and X′ using the specified schedule (τ₁ and τ₂).
+   – Use Adam with separate learning rates as needed; optimize L_total = α L_e + β L_d + γ L_o.
+6. Upon convergence:
+   – Reconstruct the synthetic graph’s Laplacian L′ and adjacency A′ using the learned U′_K and the real spectrum.
+   – Save the distilled synthetic graph.
+7. Evaluation:
+   – Train various GNN architectures from scratch on the synthetic graph.
+   – Evaluate node classification accuracy on the test set of the original graph.
+   – Compare against baseline methods (both in accuracy and runtime).
+8. Conduct ablation studies:
+   – Remove loss components separately and analyze the impact.
+   – Visualize metrics such as total variation (TV) across synthetic graphs versus the real graph.
+
+──────────────────────────────
+9. UNCLEAR ASPECTS / ASSUMPTIONS
+
+• Exact formulas for L_e and L_d are not fully spelled out in the paper text. You will need to decide on specific formulations (e.g., Frobenius norm between projection matrices for L_e, and use of cosine similarity for L_d) and document these choices.  
+• The SBM-based initialization for U′_K is mentioned but not detailed; if unavailable, consider random orthonormal initialization.  
+• The paper specifies alternating update steps (τ₁, τ₂) but does not detail their values—initial experiments may require trial and error guided by the hyperparameter table.
+
+──────────────────────────────
+10. NEXT STEPS
+
+• Begin by writing modular functions for data preprocessing, eigen-decomposition, and synthetic graph initialization.  
+• Implement the loss functions and verify that their gradients propagate correctly.  
+• Test the alternating update scheme on a small graph (e.g., Citeseer or Pubmed) before scaling to the larger datasets.  
+• Establish logging and visualization (for losses and TV values) to monitor convergence and spectral similarity.  
+• Once the synthetic graph is distilled, implement the evaluation pipelines for different GNN architectures for node classification.
+
+Following this detailed plan should allow you to implement GDEM faithfully and prepare for subsequent code development.

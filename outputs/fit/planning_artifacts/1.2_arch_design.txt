@@ -1,0 +1,71 @@
+----------------------------------------
+[Implementation approach]
+We will utilize PyTorch as the deep learning framework along with torchvision for image transformations and data loading, and Hugging Face’s pretrained VAE module for encoding and decoding images. The system is modularized into separate components for dataset loading, model construction (incorporating the FiT transformer with flexible tokenization, 2D RoPE, Masked MHSA, and SwiGLU), training (including diffusion process scheduling, EMA updates, and loss computed only on valid tokens), and evaluation (calculating metrics such as FID, IS, sFID, Precision, and Recall). Open-source libraries will be used to keep the code concise and maintainable.
+
+----------------------------------------
+[File list]
+- main.py
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+
+----------------------------------------
+[Data structures and interfaces]
+classDiagram
+    class Main {
+        +__init__(config: dict)
+        +run_experiment() -> None
+    }
+    class DatasetLoader {
+        +__init__(config: dict)
+        +load_data() -> DataLoader
+    }
+    class Model {
+        +__init__(params: dict)
+        +forward(x: Tensor) -> Tensor
+        +load_pretrained_vae(vae_path: str) -> None
+    }
+    class Trainer {
+        +__init__(model: Model, dataloader: DataLoader, config: dict)
+        +train() -> None
+        +save_checkpoint(epoch: int) -> None
+    }
+    class Evaluation {
+        +__init__(model: Model, dataloader: DataLoader, config: dict)
+        +evaluate() -> dict
+    }
+    Main --> DatasetLoader
+    Main --> Model
+    Main --> Trainer
+    Main --> Evaluation
+    Trainer --> Model
+    Evaluation --> Model
+
+
+----------------------------------------
+[Program call flow]
+sequenceDiagram
+    participant M as Main
+    participant DL as DatasetLoader
+    participant MD as Model
+    participant TR as Trainer
+    participant EV as Evaluation
+
+    M->>DL: Create DatasetLoader(config) and call load_data()
+    DL-->>M: Return DataLoader with transforms, resizing, and token padding
+    M->>MD: Instantiate Model(params) 
+    MD->>MD: Load pretrained VAE via load_pretrained_vae(vae_path)
+    M->>TR: Initialize Trainer(model, dataloader, config)
+    TR->>MD: For each training batch, perform forward(x), compute loss (masking padding tokens), and update weights (using AdamW and EMA)
+    TR-->>M: Training completes and checkpoints are saved
+    M->>EV: Create Evaluation(model, dataloader, config) and call evaluate()
+    EV->>MD: Process evaluation batches through forward()
+    MD-->>EV: Return latent tokens/predictions
+    EV-->>M: Return evaluation metrics (FID, IS, sFID, Precision, Recall)
+
+
+----------------------------------------
+[Anything UNCLEAR]
+Some specifics that need clarification include the exact dimensions and method for patchifying the VAE latent output, detailed diffusion hyperparameters (noise schedule, number of timesteps, etc.), and the precise implementation formulas for 2D RoPE interpolation (especially the decoupled version). Also, confirmation on the expected dataset format and evaluation metrics computation (e.g., integration with TensorFlow ADM evaluation) would be beneficial.
+

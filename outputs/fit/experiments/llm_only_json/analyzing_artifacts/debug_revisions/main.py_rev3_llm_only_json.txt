@@ -1,0 +1,87 @@
+# main.py – Revised Logic Analysis
+
+"""
+This file is the entry point that orchestrates the entire FiT reproduction pipeline. The revised logic detailed below addresses previous critiques by defining key parameters explicitly, clarifying interfaces for data preprocessing and token management, integrating explicit unpatchify operations, incorporating detailed training loop practices, and expounding the evaluation of multiple extrapolation methods.
+
+1. Configuration Loading & Experiment Variant Selection:
+   • Load "config.yaml" using a YAML parser.
+   • Extract standard parameters:
+       - Training: learning_rate, batch_size, optimizer ("AdamW", weight_decay 0.0), EMA decay (0.9999).
+       - Model: patch_size (2), max_token_length (L_max = 256), transformer details (positional_embedding "2D RoPE", attention "Masked MHSA", ffn "SwiGLU"), and the pretrained VAE checkpoint ("huggingface/stabilityai/sd-vae-ft-ema").
+       - Diffusion: number of sampling steps (250) and noise_schedule ("DDPM").
+       - Data: dataset ("ImageNet"), resize_max_area (65536, i.e. 256×256), and augmentation ("Horizontal Flip").
+       - Extrapolation: a list with methods ["PI", "EI", "NTK", "YaRN", "VisionNTK", "VisionYaRN"] and a scale factor defined by the formula:
+             scale_factor = max(max(H_test, W_test) / L_train, 1.0)
+         • Here, L_train is explicitly defined by our implementation: we set L_train = sqrt(L_max) (i.e. sqrt(256) = 16) unless a different value is specified. This explicit definition ensures correct alignment during resolution extrapolation.
+       - Evaluation: metrics to compute (FID, sFID, IS, Precision, Recall) along with any evaluation-specific parameters.
+   • An experiment variant flag (e.g., config["model"]["variant"]) is also loaded to select between FiT-B/2 and FiT-XL/2. Selection of the variant adjusts not only the training_steps (400K vs. 1.8M) but also any other hyperparameters (such as number of layers and hidden dimensions) required to match the paper’s experimental settings.
+   • Set random seeds for torch, numpy, and Python’s random module to ensure reproducibility across experiments.
+
+2. Dataset Preparation with Dedicated Training and Evaluation Splits:
+   • Instantiate the DatasetLoader using the loaded configuration.
+   • Call DatasetLoader.load_data() with split parameters to obtain two separate DataLoaders:
+       - The training DataLoader handles:
+           ▸ Reading the ImageNet dataset.
+           ▸ Applying dynamic image transformations (including resizing high-resolution images to ensure the area ≤ 256×256 while preserving aspect ratios and horizontal flip augmentation).
+           ▸ Patchifying the VAE latent outputs (using patch_size = 2) and dynamically padding token sequences to a fixed max token length (L_max = 256).
+       - A dedicated evaluation DataLoader is created via the same interface with a split indicator (e.g., split="validation" or "test") so that evaluation data remains unbiased.
+   • By explicitly defining the interface of load_data(), we ensure that dynamic patchification and split management comply with the intended data preprocessing.
+
+3. Model Initialization and Token Management (Patchify/Unpatchify):
+   • Instantiate the Model object with the parameters from the config.
+   • The Model construction:
+       - Builds the FiT transformer backbone based on DiT with modifications (2D RoPE instead of absolute positional embeddings, Masked MHSA for valid tokens only, and SwiGLU replacing the conventional MLP).
+       - Implements a patchify method that:
+            ▸ Receives the latent output from the VAE encoder.
+            ▸ Computes the latent map dimensions based on the image resolution.
+            ▸ Splits the latent map into patches (tokens) according to the patch_size (2).
+            ▸ Dynamically pads the resulting token sequence to L_max = 256.
+         This concrete handling of variable resolutions is critical for proper token management during training and resolution extrapolation.
+       - Implements an inverse unpatchify method that:
+            ▸ Reconstructs the spatial latent map from the padded token sequence.
+            ▸ Uses stored shape metadata from the patchify process to accurately reconstruct the original latent dimensions.
+            ▸ This method ensures that during evaluation, after diffusion sampling and positional embedding interpolation, the latent tokens are correctly converted back to a format that the VAE decoder can process.
+   • Load the pretrained VAE by calling Model.load_pretrained_vae(vae_path), ensuring that both encoder and decoder are ready for input image encoding and image reconstruction during inference.
+
+4. Training Setup with Enhanced Trainer.train:
+   • Create a Trainer instance by passing the Model, the training DataLoader, and the full configuration.
+   • Trainer.train() incorporates:
+       - Iterating over batches from the training DataLoader with proper shuffling.
+       - For each batch:
+            ▸ Perform a forward pass through the Model.
+            ▸ Compute the diffusion-based loss (for example, mean squared error relative to the added noise) using an attention mask that ensures loss is only computed on valid (non-padding) tokens.
+       - Integration of advanced training practices:
+            ▸ Gradient accumulation to maintain an effective batch size if memory constraints dictate.
+            ▸ Mixed precision training using torch.cuda.amp to improve memory usage and computation speed.
+            ▸ (Optionally) a learning rate scheduler to adjust the learning rate over time, even if the default configuration specifies a constant rate.
+       - Update model parameters using the AdamW optimizer and apply EMA updates (decay set to 0.9999).
+       - Log training progress including loss values, token utilization details, and checkpoint metrics via Trainer.save_checkpoint() periodically.
+   • These detailed training loop practices guarantee that the diffusion model training adheres closely to the methodology in the paper.
+
+5. Evaluation & Inference with Comprehensive Extrapolation Methods:
+   • After training completes or a checkpoint is loaded, instantiate an Evaluation object using the EMA-trained Model, the evaluation DataLoader, and evaluation-specific configuration.
+   • In Evaluation.evaluate():
+       - Begin the diffusion sampling procedure by sampling an initial latent noise vector (Gaussian distributed) with a length corresponding to the desired output resolution.
+       - Execute K = 250 denoising iterations according to the DDPM noise schedule.
+       - For resolution extrapolation, iterate over all interpolation methods listed in config["extrapolation"]["methods"]:
+            ▸ For each method (PI, EI, NTK, YaRN, VisionNTK, and VisionYaRN), apply its specific positional embedding interpolation logic:
+                    • PI may rescale position coordinates linearly.
+                    • EI might conduct bilinear interpolation on the positional embeddings.
+                    • NTK/YaRN methods incorporate the defined scale factor (using L_train as defined, i.e. sqrt(L_max) or another explicit setting) into modifying the rotary frequencies.
+                    • VisionNTK/VisionYaRN further decouple the 2D RoPE for height and width.
+            ▸ For each extrapolation method, adjust the 2D RoPE accordingly, construct the position map for the test resolution, execute the Model’s forward pass, and then call unpatchify to reconstruct the latent spatial map.
+            ▸ Decode the latent map into an image using the VAE decoder.
+       - Compute evaluation metrics (FID, sFID, IS, Precision, and Recall) for each extrapolation method. This comprehensive evaluation ensures that all methods are tested per the experimental setup.
+       - Log and output the metrics for detailed analysis and comparison with the paper's reported results.
+
+6. Orchestration and Finalization:
+   • The main.py file orchestrates the following overall workflow:
+         1. Load configuration and experiment-specific parameters (including the branch for FiT-B/2 vs. FiT-XL/2) and set random seeds.
+         2. Instantiate DatasetLoader, acquiring separate DataLoaders for training and evaluation.
+         3. Instantiate the Model, load the pretrained VAE, and ensure patchify/unpatchify methods correctly handle variable resolutions.
+         4. Create the Trainer and execute the enhanced training loop, which integrates attention masking, gradient accumulation, and mixed precision.
+         5. Upon training completion, instantiate the Evaluation module; run the sampling procedure for every extrapolation method outlined in the config (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN); and compute all evaluation metrics.
+         6. Output and log comprehensive results for further comparison with state-of-the-art systems.
+         
+This revised logic clearly defines the extrapolation scale factor computation (using L_train = sqrt(L_max) or another explicitly defined value), specifies the expected behavior of DatasetLoader.load_data (with dynamic patchification and split management), details both the patchify and unpatchify operations within the Model, enriches the Trainer.train loop with explicit guidance on training practices, and elaborates the Evaluation.evaluate procedure to iterate and apply all positional embedding interpolation methods.
+"""

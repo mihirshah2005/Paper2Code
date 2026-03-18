@@ -1,0 +1,60 @@
+{
+  "all": [
+    {
+      "target_func_name": "DatasetLoader.__init__",
+      "severity_level": "medium",
+      "critique": "The initialization logic assumes a configuration flag to decide between shared and separate SentencePiece vocabularies (especially for the English–French task), but it does not specify the flag's name or what values it is expected to hold. This ambiguity could lead to misinterpretations or mismatches with the actual config file.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Dataset Access and Splitting",
+      "severity_level": "medium",
+      "critique": "The analysis describes a default 80/10/10 split when predefined splits are unavailable, yet this ratio is hard-coded as an example. The original paper's splitting strategy may differ, so this aspect should be configurable or clearly documented if any deviation occurs.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "SentencePiece Tokenization and Model Management",
+      "severity_level": "medium",
+      "critique": "The file naming convention for SentencePiece models (e.g., 'spm_{dataset_name}_{task}_vocab{vocab_size}.model') does not differentiate between source and target models in cases where separate vocabularies are used. This can lead to ambiguity or file conflicts if separate vocabularies are required by the experimental design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "custom_collate_fn",
+      "severity_level": "low",
+      "critique": "While the dynamic batching approach is explained in detail, it uses a fixed token threshold (e.g., 25000 tokens) as an example rather than directly tying to the configuration parameter (config['training']['batch_size_tokens']). This may cause inconsistencies if the config value differs from the example.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Parsing Task Preparation",
+      "severity_level": "medium",
+      "critique": "The linearization procedure for converting bracketed tree structures into token sequences is described in generic terms. It does not address how to handle potential edge cases (such as unary productions or other atypical tree structures) that may be critical for reproducing the paper’s experimental results.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "DatasetLoader.__init__",
+      "severity_level": "medium",
+      "critique": "The initialization logic assumes a configuration flag to decide between shared and separate SentencePiece vocabularies (especially for the English–French task), but it does not specify the flag's name or what values it is expected to hold. This ambiguity could lead to misinterpretations or mismatches with the actual config file.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Dataset Access and Splitting",
+      "severity_level": "medium",
+      "critique": "The analysis describes a default 80/10/10 split when predefined splits are unavailable, yet this ratio is hard-coded as an example. The original paper's splitting strategy may differ, so this aspect should be configurable or clearly documented if any deviation occurs.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "SentencePiece Tokenization and Model Management",
+      "severity_level": "medium",
+      "critique": "The file naming convention for SentencePiece models (e.g., 'spm_{dataset_name}_{task}_vocab{vocab_size}.model') does not differentiate between source and target models in cases where separate vocabularies are used. This can lead to ambiguity or file conflicts if separate vocabularies are required by the experimental design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Parsing Task Preparation",
+      "severity_level": "medium",
+      "critique": "The linearization procedure for converting bracketed tree structures into token sequences is described in generic terms. It does not address how to handle potential edge cases (such as unary productions or other atypical tree structures) that may be critical for reproducing the paper’s experimental results.",
+      "source": "llm-judge"
+    }
+  ]
+}

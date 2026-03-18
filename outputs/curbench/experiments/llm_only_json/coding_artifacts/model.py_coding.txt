@@ -1,0 +1,505 @@
+```python
+"""
+model.py
+
+This module defines the ModelManager class that builds backbone models for
+Computer Vision (CV), Natural Language Processing (NLP), and Graph domains.
+It uses configuration settings from config.yaml (via the config.py module)
+to set default hyperparameters and enforce strict parameter validation.
+
+Supported CV models:
+    - LeNet: A simple convolutional neural network.
+    - ResNet-18: Based on torchvision.models.resnet18.
+    - ViT: A minimal Vision Transformer implementation (SimpleViT).
+
+Supported NLP models:
+    - LSTM: A custom LSTM-based classifier.
+    - BERT: Instantiated via Hugging Face's BertForSequenceClassification.
+    - GPT2: Instantiated via Hugging Face's GPT2ForSequenceClassification.
+      Note: Tokenization and text preprocessing are not handled here.
+
+Supported Graph models (using torch_geometric):
+    - GCN: A simple Graph Convolutional Network.
+    - GAT: A simple Graph Attention Network.
+    - GIN: A simple Graph Isomorphism Network.
+
+All models are built with explicit parameter validation to ensure reproducibility.
+Any missing critical parameter will raise an error immediately.
+Extra parameters not within the allowed set will trigger a warning (or
+an exception in strict mode).
+"""
+
+import math
+import logging
+
+import torch
+import torch.nn as nn
+import torchvision.models as tv_models
+
+from transformers import BertForSequenceClassification, GPT2ForSequenceClassification
+
+# Import torch_geometric modules for graph models.
+try:
+    from torch_geometric.nn import GCNConv, GATConv, GINConv, global_mean_pool
+except ImportError:
+    logging.warning("torch_geometric is not installed. Graph models will not be available.")
+
+# Set up module-level logger.
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
+
+
+# -----------------------------
+# CV Model Implementations
+# -----------------------------
+class LeNet(nn.Module):
+    """A simple implementation of the LeNet architecture for image classification."""
+    def __init__(self, in_channels: int = 3, num_classes: int = 10) -> None:
+        super(LeNet, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, 6, kernel_size=5)
+        self.pool = nn.AvgPool2d(2)
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = torch.flatten(x, 1)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class SimpleViT(nn.Module):
+    """
+    A minimal Vision Transformer (ViT) implementation.
+    Divides the input image into patches, embeds them, adds positional encodings,
+    applies a Transformer Encoder, and produces a classification output.
+    """
+    def __init__(self,
+                 image_size: int,
+                 patch_size: int,
+                 num_classes: int,
+                 num_layers: int = 6,
+                 hidden_dim: int = 64,
+                 num_heads: int = 8,
+                 mlp_dim: int = 128,
+                 dropout: float = 0.1,
+                 in_channels: int = 3) -> None:
+        super(SimpleViT, self).__init__()
+        if image_size % patch_size != 0:
+            raise ValueError("SimpleViT: image_size must be divisible by patch_size")
+        self.image_size: int = image_size
+        self.patch_size: int = patch_size
+        self.num_patches: int = (image_size // patch_size) ** 2
+        self.patch_dim: int = in_channels * patch_size * patch_size
+
+        # Linear embedding of flattened patches.
+        self.patch_embed = nn.Linear(self.patch_dim, hidden_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, hidden_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads, dim_feedforward=mlp_dim, dropout=dropout
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.mlp_head = nn.Linear(hidden_dim, num_classes)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.xavier_uniform_(self.patch_embed.weight)
+        if self.patch_embed.bias is not None:
+            nn.init.zeros_(self.patch_embed.bias)
+        nn.init.xavier_uniform_(self.mlp_head.weight)
+        if self.mlp_head.bias is not None:
+            nn.init.zeros_(self.mlp_head.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [B, channels, height, width]
+        B, C, H, W = x.shape
+        # Divide image into patches using unfold.
+        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        # patches shape: [B, C, num_patches_y, num_patches_x, patch_size, patch_size]
+        patches = patches.contiguous().view(B, C, -1, self.patch_size, self.patch_size)
+        patches = patches.permute(0, 2, 1, 3, 4)  # [B, num_patches, C, patch_size, patch_size]
+        patches = patches.reshape(B, self.num_patches, -1)  # [B, num_patches, patch_dim]
+        tokens = self.patch_embed(patches)  # [B, num_patches, hidden_dim]
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, hidden_dim]
+        tokens = torch.cat((cls_tokens, tokens), dim=1)  # [B, num_patches+1, hidden_dim]
+        tokens = tokens + self.pos_embed
+        tokens = self.dropout(tokens)
+        # Transformer expects input shape: [sequence_length, batch, hidden_dim]
+        tokens = tokens.transpose(0, 1)
+        encoded = self.transformer(tokens)
+        encoded = encoded.transpose(0, 1)  # [B, sequence_length, hidden_dim]
+        cls_encoded = encoded[:, 0]  # Use the class token representation.
+        out = self.mlp_head(cls_encoded)
+        return out
+
+
+# -----------------------------
+# NLP Model Implementation
+# -----------------------------
+class LSTMClassifier(nn.Module):
+    """
+    A simple LSTM-based classifier for NLP tasks.
+    Expects that tokenization and text preprocessing (e.g., padding)
+    are handled externally. The vocabulary size must be provided.
+    """
+    def __init__(self,
+                 vocab_size: int,
+                 embedding_dim: int,
+                 hidden_dim: int,
+                 num_layers: int = 1,
+                 bidirectional: bool = False,
+                 num_classes: int = 2) -> None:
+        super(LSTMClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.lstm = nn.LSTM(
+            embedding_dim,
+            hidden_dim,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            batch_first=True
+        )
+        lstm_output_dim = hidden_dim * (2 if bidirectional else 1)
+        self.fc = nn.Linear(lstm_output_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is expected to be of shape [B, sequence_length]
+        embedded = self.embedding(x)
+        _, (hidden, _) = self.lstm(embedded)
+        if self.lstm.bidirectional:
+            hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        else:
+            hidden = hidden[-1]
+        out = self.fc(hidden)
+        return out
+
+
+# -----------------------------
+# Graph Model Implementations
+# -----------------------------
+class GraphGCN(nn.Module):
+    """
+    A simple Graph Convolutional Network (GCN) for graph classification.
+    Uses torch_geometric.nn.GCNConv layers and global mean pooling.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int = 16,
+                 num_layers: int = 2, num_classes: int = 2) -> None:
+        super(GraphGCN, self).__init__()
+        if 'GCNConv' not in globals():
+            raise ImportError("torch_geometric is required to use GraphGCN.")
+        self.convs = nn.ModuleList()
+        self.convs.append(GCNConv(in_channels, hidden_channels))
+        for _ in range(num_layers - 1):
+            self.convs.append(GCNConv(hidden_channels, hidden_channels))
+        self.fc = nn.Linear(hidden_channels, num_classes)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        for conv in self.convs:
+            x = conv(x, edge_index)
+            x = torch.relu(x)
+        x = global_mean_pool(x, batch)
+        x = self.fc(x)
+        return x
+
+
+class GraphGAT(nn.Module):
+    """
+    A simple Graph Attention Network (GAT) for graph classification.
+    Uses torch_geometric.nn.GATConv layers and global mean pooling.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int = 8,
+                 num_layers: int = 2, num_heads: int = 8, num_classes: int = 2) -> None:
+        super(GraphGAT, self).__init__()
+        if 'GATConv' not in globals():
+            raise ImportError("torch_geometric is required to use GraphGAT.")
+        self.convs = nn.ModuleList()
+        # First layer: multi-head attention.
+        self.convs.append(GATConv(in_channels, hidden_channels, heads=num_heads))
+        for _ in range(num_layers - 1):
+            # Subsequent layer: merge heads by setting heads=1.
+            self.convs.append(GATConv(hidden_channels * num_heads, hidden_channels, heads=1))
+        self.fc = nn.Linear(hidden_channels, num_classes)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        for conv in self.convs:
+            x = conv(x, edge_index)
+            x = torch.relu(x)
+        x = global_mean_pool(x, batch)
+        x = self.fc(x)
+        return x
+
+
+class GraphGIN(nn.Module):
+    """
+    A simple Graph Isomorphism Network (GIN) for graph classification.
+    Uses torch_geometric.nn.GINConv layers and global mean pooling.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int = 16,
+                 num_layers: int = 2, num_classes: int = 2) -> None:
+        super(GraphGIN, self).__init__()
+        if 'GINConv' not in globals():
+            raise ImportError("torch_geometric is required to use GraphGIN.")
+        self.convs = nn.ModuleList()
+        nn1 = nn.Sequential(nn.Linear(in_channels, hidden_channels),
+                            nn.ReLU(),
+                            nn.Linear(hidden_channels, hidden_channels))
+        self.convs.append(GINConv(nn1))
+        for _ in range(num_layers - 1):
+            mlp = nn.Sequential(nn.Linear(hidden_channels, hidden_channels),
+                                nn.ReLU(),
+                                nn.Linear(hidden_channels, hidden_channels))
+            self.convs.append(GINConv(mlp))
+        self.fc = nn.Linear(hidden_channels, num_classes)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        for conv in self.convs:
+            x = conv(x, edge_index)
+            x = torch.relu(x)
+        x = global_mean_pool(x, batch)
+        x = self.fc(x)
+        return x
+
+
+# -----------------------------
+# ModelManager Definition
+# -----------------------------
+class ModelManager:
+    """
+    ModelManager builds backbone models for the CV, NLP, and Graph domains.
+    It validates extra parameters against an allowed whitelist and integrates
+    configuration values from config.yaml. Critical parameters missing in both
+    the provided kwargs and configuration will trigger an error.
+    """
+    def __init__(self, config: dict, strict_mode: bool = False) -> None:
+        """
+        Initialize ModelManager with a configuration dictionary.
+
+        Args:
+            config (dict): Configuration dictionary loaded from config.yaml.
+            strict_mode (bool): If True, extra parameters will raise errors.
+        """
+        self.config = config
+        self.strict_mode = strict_mode
+        self.cv_config = config.get("training", {}).get("cv", {})
+        self.nlp_config = config.get("training", {}).get("nlp", {})
+        self.graph_config = config.get("training", {}).get("graph", {})
+        self.logger = LOGGER
+
+    def _validate_params(self,
+                         provided: dict,
+                         allowed_keys: set,
+                         defaults: dict) -> dict:
+        """
+        Validate provided parameters against allowed keys and merge with defaults.
+
+        Args:
+            provided (dict): Parameters provided via kwargs.
+            allowed_keys (set): Set of allowed parameter names.
+            defaults (dict): Default parameter values.
+
+        Returns:
+            dict: Merged dictionary of validated parameters.
+            
+        Raises:
+            ValueError: If a required parameter is missing or an unexpected parameter
+                        is provided in strict_mode.
+        """
+        validated = {}
+        # Start with default values.
+        for key, value in defaults.items():
+            validated[key] = value
+
+        # Update with provided parameters and check for unexpected keys.
+        for key, value in provided.items():
+            if key not in allowed_keys:
+                message = (f"Unexpected parameter '{key}' provided. "
+                           f"Allowed parameters: {allowed_keys}")
+                if self.strict_mode:
+                    raise ValueError(message)
+                else:
+                    self.logger.warning(message)
+            else:
+                validated[key] = value
+
+        # Ensure that all allowed keys exist in validated (if required, they must be provided).
+        for key in allowed_keys:
+            if key not in validated:
+                message = f"Missing required parameter '{key}'."
+                raise ValueError(message)
+        return validated
+
+    def build_model(self,
+                    model_name: str,
+                    domain: str,
+                    num_classes: int,
+                    **kwargs) -> nn.Module:
+        """
+        Build and return the model based on its domain and name, validating parameters.
+
+        Args:
+            model_name (str): Identifier for the model (e.g., "LeNet", "ResNet-18", "ViT", etc.).
+            domain (str): Domain of the model ("cv", "nlp", or "graph").
+            num_classes (int): The number of output classes.
+            **kwargs: Extra keyword arguments for model-specific configurations.
+
+        Returns:
+            nn.Module: The instantiated model.
+
+        Raises:
+            ValueError: For unsupported domains/models or missing critical parameters.
+        """
+        domain = domain.lower()
+        model_name_lower = model_name.lower()
+        allowed_params = {}
+        defaults = {}
+        validated_params = {}
+
+        if domain == "cv":
+            if model_name_lower == "lenet":
+                # Allowed parameters for LeNet: optional in_channels.
+                allowed_params = {"in_channels"}
+                defaults = {"in_channels": 3}
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = LeNet(in_channels=validated_params["in_channels"], num_classes=num_classes)
+            elif model_name_lower == "resnet-18":
+                # Allowed parameter: pretrained flag.
+                allowed_params = {"pretrained"}
+                defaults = {"pretrained": False}
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                use_pretrained: bool = validated_params["pretrained"]
+                model = tv_models.resnet18(pretrained=use_pretrained)
+                num_features = model.fc.in_features
+                model.fc = nn.Linear(num_features, num_classes)
+            elif model_name_lower == "vit":
+                # For ViT, required: image_size and patch_size.
+                allowed_params = {"image_size", "patch_size", "num_layers", "hidden_dim",
+                                  "num_heads", "mlp_dim", "dropout", "in_channels"}
+                defaults = {"num_layers": 6, "hidden_dim": 64, "num_heads": 8,
+                            "mlp_dim": 128, "dropout": 0.1, "in_channels": 3}
+                required_keys = {"image_size", "patch_size"}
+                for req in required_keys:
+                    if req not in kwargs:
+                        if req in self.cv_config:
+                            kwargs[req] = self.cv_config[req]
+                    if req not in kwargs:
+                        raise ValueError(f"For ViT model, missing required parameter '{req}' in kwargs or configuration.")
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = SimpleViT(image_size=validated_params["image_size"],
+                                  patch_size=validated_params["patch_size"],
+                                  num_layers=validated_params["num_layers"],
+                                  hidden_dim=validated_params["hidden_dim"],
+                                  num_heads=validated_params["num_heads"],
+                                  mlp_dim=validated_params["mlp_dim"],
+                                  dropout=validated_params["dropout"],
+                                  in_channels=validated_params["in_channels"],
+                                  num_classes=num_classes)
+            else:
+                raise ValueError(f"Unsupported CV model: {model_name}")
+        elif domain == "nlp":
+            if model_name_lower == "lstm":
+                # For LSTM, required: embedding_dim, hidden_dim, vocab_size.
+                allowed_params = {"embedding_dim", "hidden_dim", "num_layers", "bidirectional", "vocab_size"}
+                defaults = {"num_layers": 1, "bidirectional": False}
+                required_keys = {"embedding_dim", "hidden_dim", "vocab_size"}
+                for req in required_keys:
+                    if req not in kwargs:
+                        if req in self.nlp_config:
+                            kwargs[req] = self.nlp_config[req]
+                    if req not in kwargs:
+                        raise ValueError(f"For LSTM model, missing required parameter '{req}' in kwargs or configuration.")
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = LSTMClassifier(vocab_size=validated_params["vocab_size"],
+                                       embedding_dim=validated_params["embedding_dim"],
+                                       hidden_dim=validated_params["hidden_dim"],
+                                       num_layers=validated_params["num_layers"],
+                                       bidirectional=validated_params["bidirectional"],
+                                       num_classes=num_classes)
+            elif model_name_lower == "bert":
+                # For BERT, allowed parameter: pretrained_model_name.
+                allowed_params = {"pretrained_model_name"}
+                defaults = {"pretrained_model_name": "bert-base-uncased"}
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = BertForSequenceClassification.from_pretrained(
+                    validated_params["pretrained_model_name"],
+                    num_labels=num_classes
+                )
+                self.logger.info("Note: Tokenization and text preprocessing for BERT are handled externally.")
+            elif model_name_lower == "gpt2":
+                # For GPT2, allowed parameter: pretrained_model_name.
+                allowed_params = {"pretrained_model_name"}
+                defaults = {"pretrained_model_name": "gpt2"}
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = GPT2ForSequenceClassification.from_pretrained(
+                    validated_params["pretrained_model_name"],
+                    num_labels=num_classes
+                )
+                self.logger.info("Note: Tokenization and text preprocessing for GPT2 are handled externally.")
+            else:
+                raise ValueError(f"Unsupported NLP model: {model_name}")
+        elif domain == "graph":
+            if model_name_lower == "gcn":
+                # For GCN, required: in_channels.
+                allowed_params = {"in_channels", "hidden_channels", "num_layers"}
+                defaults = {"hidden_channels": 16, "num_layers": 2}
+                required_keys = {"in_channels"}
+                for req in required_keys:
+                    if req not in kwargs:
+                        if req in self.graph_config:
+                            kwargs[req] = self.graph_config[req]
+                    if req not in kwargs:
+                        raise ValueError(f"For GCN model, missing required parameter '{req}' in kwargs or configuration.")
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = GraphGCN(in_channels=validated_params["in_channels"],
+                                 hidden_channels=validated_params["hidden_channels"],
+                                 num_layers=validated_params["num_layers"],
+                                 num_classes=num_classes)
+            elif model_name_lower == "gat":
+                # For GAT, required: in_channels.
+                allowed_params = {"in_channels", "hidden_channels", "num_layers", "num_heads"}
+                defaults = {"hidden_channels": 8, "num_layers": 2, "num_heads": 8}
+                required_keys = {"in_channels"}
+                for req in required_keys:
+                    if req not in kwargs:
+                        if req in self.graph_config:
+                            kwargs[req] = self.graph_config[req]
+                    if req not in kwargs:
+                        raise ValueError(f"For GAT model, missing required parameter '{req}' in kwargs or configuration.")
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = GraphGAT(in_channels=validated_params["in_channels"],
+                                 hidden_channels=validated_params["hidden_channels"],
+                                 num_layers=validated_params["num_layers"],
+                                 num_heads=validated_params["num_heads"],
+                                 num_classes=num_classes)
+            elif model_name_lower == "gin":
+                # For GIN, required: in_channels.
+                allowed_params = {"in_channels", "hidden_channels", "num_layers"}
+                defaults = {"hidden_channels": 16, "num_layers": 2}
+                required_keys = {"in_channels"}
+                for req in required_keys:
+                    if req not in kwargs:
+                        if req in self.graph_config:
+                            kwargs[req] = self.graph_config[req]
+                    if req not in kwargs:
+                        raise ValueError(f"For GIN model, missing required parameter '{req}' in kwargs or configuration.")
+                validated_params = self._validate_params(kwargs, allowed_params, defaults)
+                model = GraphGIN(in_channels=validated_params["in_channels"],
+                                 hidden_channels=validated_params["hidden_channels"],
+                                 num_layers=validated_params["num_layers"],
+                                 num_classes=num_classes)
+            else:
+                raise ValueError(f"Unsupported graph model: {model_name}")
+        else:
+            raise ValueError(f"Unsupported domain: {domain}. Expected one of 'cv', 'nlp', or 'graph'.")
+
+        self.logger.info(f"Model built: {model_name} for domain {domain} with parameters: {validated_params}")
+        return model
+```

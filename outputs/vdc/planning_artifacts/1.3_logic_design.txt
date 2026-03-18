@@ -1,0 +1,49 @@
+----------------------------------------
+[Required packages]
+- numpy==1.21.0
+- torch==1.9.0
+- torchvision==0.10.0
+- transformers==4.15.0
+- openai==0.27.0
+- requests==2.26.0
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['dataset_loader.py', 'DatasetLoader class: Handles loading CIFAR-10, ImageNet-100, and ImageNet-Dog datasets using torchvision. Contains functions for image preprocessing, splitting train/test sets, and injecting dirty samples (poisoned samples, noisy labels). Imports torch, torchvision, numpy, and utils for data augmentation and trigger injection.']
+- ['utils.py', 'Utility functions: Provides shared helper functions such as image preprocessing, trigger overlay functions for backdoor attacks (BadNets, Blended, SIG, etc.), random seed setup, configuration loading, logging, and caching API responses for ChatGPT and Instruct-BLIP.']
+- ['vqg.py', 'VQG class: Implements visual question generation module. Contains methods to generate general questions (using predefined templates) and label-specific questions (by interfacing with ChatGPT API). This module loads configuration details such as number of questions to generate per label and prompt templates. Depends on utils for API call caching.']
+- ['vqa.py', 'VQA class: Implements visual question answering module. Wraps around an existing multimodal model (e.g., Instruct-BLIP using HuggingFace) to answer passed questions based on input images. Ensures correct image preprocessing. Depends on torch and torchvision.']
+- ['vae.py', 'VAE class: Implements visual answer evaluation module. Contains functions that evaluate individual answers. For deterministic label-specific questions, performs simple string matching; for general questions, sends evaluation prompts to ChatGPT API. May use utility functions for text cleaning and similarity checking.']
+- ['detection.py', 'VDCDetector class: Integrates VQG, VQA, and VAE modules. For a given sample (image and label), it calls VQG to generate questions, then uses VQA to answer each question, and finally VAE to evaluate each answer. It computes the matching score (vote-based ensemble) and decides whether the sample is dirtied (matching score < 0.5). Depends on all three modules.']
+- ['trainer.py', 'Trainer class: Implements model training for retraining a classifier (ResNet-18) on the purified dataset. Handles training loop, hyperparameter schedule (epochs, batch size, learning rate decay) using torch and torchvision. Logs metrics such as ACC and ASR. Depends on dataset_loader.py for purified data.']
+- ['evaluation.py', 'Evaluation class: Performs model evaluation on test data. Computes key metrics such as TPR, FPR, ASR, and ACC. Uses the trained model (ResNet-18) from trainer.py and processed test dataset from dataset_loader.py.']
+- ['main.py', 'Entry point: Initializes configurations and modules. Loads the dataset via DatasetLoader, performs dirty sample injection and purification using VDCDetector, trains the final model using Trainer, and evaluates the results via Evaluation. Orchestrates the whole experiment flow.']
+
+----------------------------------------
+[Task list]
+- dataset_loader.py
+- utils.py
+- vqg.py
+- vqa.py
+- vae.py
+- detection.py
+- trainer.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Shared configuration variables (e.g., threshold values, number of questions, poison/noise ratios) and utility functions (for image preprocessing, logging, API call caching, and trigger injection) are used across modules such as dataset_loader.py, utils.py, and trainer.py. Consistent use of these functions ensures reproducibility and helps centralize changes in experimental parameters.
+
+----------------------------------------
+[Anything UNCLEAR]
+Clarification is needed on the exact preprocessing steps and format for the ImageNet-100 and ImageNet-Dog datasets, specific parameter settings for some backdoor triggers (e.g., SSBA and WaNet), and the management of API rate limits or caching strategies for ChatGPT and Instruct-BLIP calls.
+

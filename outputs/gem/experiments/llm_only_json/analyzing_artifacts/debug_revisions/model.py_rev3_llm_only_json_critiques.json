@@ -1,0 +1,54 @@
+{
+  "all": [
+    {
+      "target_func_name": "compute_loss (Eigenbasis Matching Loss)",
+      "severity_level": "medium",
+      "critique": "There is ambiguity in the naming and expected input: the description refers to a target eigenbasis U_real while the function signature uses 'real_eigen'. This mismatch may lead to confusion about whether the input should be a full eigenbasis or just eigenvalue information.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reconstruct_graph",
+      "severity_level": "medium",
+      "critique": "The reconstruction procedure assumes a fixed ordering between the real eigenvalues and the columns of the learned synthetic eigenbasis. However, since eigenvectors are defined only up to an arbitrary orthogonal transformation, assigning real eigenvalues to specific columns might cause misalignment if additional ordering constraints are not enforced.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "compute_loss (Discrimination Constraint Loss L_d)",
+      "severity_level": "low",
+      "critique": "The loss computation for L_d relies on externally preprocessed category representations (H and H′) that are expected to be normalized and of shape (C, d). Although the documentation mentions this prerequisite, the lack of internal checks or preprocessing could lead to issues if the inputs do not meet these specifications.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "update_eigenbasis and update_features",
+      "severity_level": "low",
+      "critique": "The manual update methods illustrate parameter updates within a 'with torch.no_grad()' block, but they do not specify how learning rates or other hyperparameters should be determined. This omission might create inconsistencies if these functions are used instead of PyTorch’s optimizers.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "__init__ (Class Initialization)",
+      "severity_level": "low",
+      "critique": "The configuration description mixes detailed computations for K (using a fraction rₖ) with a simplified approach (setting K equal to N′), which could be confusing if the configuration file actually requires a more nuanced computation of the eigenbasis size.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "forward (Synthetic Node Features usage)",
+      "severity_level": "low",
+      "critique": "While the synthetic node feature matrix (X_synth) is initialized and returned in the forward pass, its role in the loss computation or graph reconstruction is not clearly defined. This may lead to questions regarding its integration into the overall method as described in the paper.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "compute_loss (Eigenbasis Matching Loss)",
+      "severity_level": "medium",
+      "critique": "There is ambiguity in the naming and expected input: the description refers to a target eigenbasis U_real while the function signature uses 'real_eigen'. This mismatch may lead to confusion about whether the input should be a full eigenbasis or just eigenvalue information.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reconstruct_graph",
+      "severity_level": "medium",
+      "critique": "The reconstruction procedure assumes a fixed ordering between the real eigenvalues and the columns of the learned synthetic eigenbasis. However, since eigenvectors are defined only up to an arbitrary orthogonal transformation, assigning real eigenvalues to specific columns might cause misalignment if additional ordering constraints are not enforced.",
+      "source": "llm-judge"
+    }
+  ]
+}

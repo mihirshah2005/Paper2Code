@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is our detailed critique of the provided logic analysis:\n\n1. Beam Search Termination Criteria  \n – The analysis tells us to break the decoding loop once “every candidate in the beam” has generated an EOS token. In practice, some beam search implementations may instead choose to keep candidates that haven’t finished until the best candidate is clearly finished. This ambiguity in exactly when to stop (e.g., if one candidate lags behind or if a partial early-stop should be signaled) could lea",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is our detailed critique of the provided logic analysis:\n\n1. Beam Search Termination Criteria  \n – The analysis tells us to break the decoding loop once “every candidate in the beam” has generated an EOS token. In practice, some beam search implementations may instead choose to keep candidates that haven’t finished until the best candidate is clearly finished. This ambiguity in exactly when to stop (e.g., if one candidate lags behind or if a partial early-stop should be signaled) could lea",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

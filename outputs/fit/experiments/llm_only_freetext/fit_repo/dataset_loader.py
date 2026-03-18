@@ -1,0 +1,174 @@
+"""
+dataset_loader.py
+
+This module defines the DatasetLoader class for loading and preprocessing our image dataset according
+to the FiT paper specifications. It includes custom image transformations that preserve the original
+aspect ratio, resize high-resolution images to a maximum area (e.g., 256x256 = 65,536 pixels),
+apply horizontal flip augmentation, convert images to tensor format, and compute tokenization
+parameters (token mask and token length) based on the VAE latent patchification setting.
+"""
+
+import os
+import glob
+import math
+import random
+from typing import Any, Dict, List
+
+from PIL import Image
+import torch
+from torch import Tensor
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+
+
+class CustomImageDataset(Dataset):
+    """
+    A custom dataset that loads images from a directory, applies preprocessing transformations,
+    and computes token mask and token length for flexible latent tokenization.
+    """
+
+    def __init__(self, root_dir: str, config: Dict[str, Any]) -> None:
+        """
+        Initialize the dataset with the root directory and configuration parameters.
+        
+        Args:
+            root_dir (str): The path to the image dataset directory.
+            config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        """
+        super().__init__()
+        self.root_dir: str = root_dir
+        self.config: Dict[str, Any] = config
+
+        # Find all image files in root_dir with common image extensions.
+        self.image_files: List[str] = []
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+        for ext in valid_extensions:
+            self.image_files.extend(glob.glob(os.path.join(self.root_dir, '**', f'*{ext}'), recursive=True))
+        self.image_files.sort()
+
+        if len(self.image_files) == 0:
+            raise ValueError(f"No image files found in directory: {self.root_dir}")
+
+        # Configuration parameters
+        self.resize_max_area: int = int(self.config.get("data", {}).get("resize_max_area", 65536))
+        self.augmentation: str = str(self.config.get("data", {}).get("augmentation", "Horizontal Flip"))
+        self.patch_size: int = int(self.config.get("model", {}).get("patch_size", 2))
+        self.max_token_length: int = int(self.config.get("model", {}).get("max_token_length", 256))
+        # Assumed downscale factor for VAE encoding (fixed for the pretrained VAE)
+        self.latent_downscale_factor: int = 8
+        # Horizontal flip probability
+        self.hflip_prob: float = 0.5
+
+    def __len__(self) -> int:
+        """Return the total number of images."""
+        return len(self.image_files)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        """
+        Process an image: load, possibly resize, apply augmentation, convert to tensor, and compute token mask.
+
+        Returns:
+            A dictionary with:
+                - "image": the preprocessed image tensor.
+                - "token_mask": a binary mask (Tensor of shape [max_token_length]) indicating which tokens are valid.
+                - "token_length": the number of valid tokens (int), truncated to max_token_length if necessary.
+        """
+        # Load image using PIL and ensure RGB mode
+        img_path: str = self.image_files[index]
+        with Image.open(img_path) as img:
+            image = img.convert("RGB")
+
+        # Obtain original dimensions
+        width: int
+        height: int
+        width, height = image.size  # PIL gives (width, height)
+        original_area: int = width * height
+
+        # Resize high-resolution images if the area exceeds resize_max_area
+        if original_area > self.resize_max_area:
+            scale: float = math.sqrt(self.resize_max_area / original_area)
+            new_width: int = max(1, int(width * scale))
+            new_height: int = max(1, int(height * scale))
+            image = image.resize((new_width, new_height), resample=Image.BILINEAR)
+        else:
+            new_width, new_height = width, height  # Keep original dimensions if area is within limit
+
+        # Apply horizontal flip augmentation if specified in config
+        if self.augmentation.lower() == "horizontal flip":
+            if random.random() < self.hflip_prob:
+                image = image.transpose(method=Image.FLIP_LEFT_RIGHT)
+
+        # Convert image to tensor (values range [0, 1])
+        image_tensor: Tensor = TF.to_tensor(image)
+
+        # -----------------------------
+        # Preprocessing for VAE Latent Tokenization
+        # -----------------------------
+        # Assumption: The pretrained VAE downsamples the image by a factor of 8.
+        latent_height: int = new_height // self.latent_downscale_factor
+        latent_width: int = new_width // self.latent_downscale_factor
+
+        # Compute token grid dimensions after patchifying with patch_size (e.g., patch_size=2)
+        tokens_height: int = latent_height // self.patch_size
+        tokens_width: int = latent_width // self.patch_size
+        computed_token_count: int = tokens_height * tokens_width
+
+        # Create token mask of fixed length (max_token_length)
+        if computed_token_count > self.max_token_length:
+            # Edge-Case: Truncate to max_token_length. All tokens are considered valid.
+            token_count: int = self.max_token_length
+            token_mask: Tensor = torch.ones(self.max_token_length, dtype=torch.int64)
+        else:
+            token_count = computed_token_count
+            valid_tokens: List[int] = [1] * token_count
+            padding_tokens: List[int] = [0] * (self.max_token_length - token_count)
+            token_mask = torch.tensor(valid_tokens + padding_tokens, dtype=torch.int64)
+
+        return {
+            "image": image_tensor,              # Preprocessed image tensor.
+            "token_mask": token_mask,             # Binary mask of valid tokens (length = max_token_length).
+            "token_length": token_count           # Number of valid tokens (might be truncated to max_token_length).
+        }
+
+
+class DatasetLoader:
+    """
+    DatasetLoader class to initialize the dataset and return a DataLoader for training/evaluation.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initialize the DatasetLoader with the provided configuration.
+        
+        Args:
+            config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        """
+        self.config: Dict[str, Any] = config
+
+        # Determine the dataset root directory.
+        # If the path does not exist, one may need to set this accordingly.
+        dataset_dir: str = str(self.config.get("data", {}).get("dataset", "ImageNet"))
+        if not os.path.exists(dataset_dir):
+            raise ValueError(f"Dataset directory '{dataset_dir}' does not exist. Please check config.data.dataset.")
+
+        self.dataset: Dataset = CustomImageDataset(root_dir=dataset_dir, config=self.config)
+
+    def load_data(self) -> DataLoader:
+        """
+        Create a DataLoader for the dataset with appropriate batch size and shuffling.
+        
+        Returns:
+            DataLoader: A PyTorch DataLoader for the preprocessed dataset.
+        """
+        batch_size: int = int(self.config.get("training", {}).get("batch_size", 256))
+        # Optionally, num_workers can be set (defaulting to 4).
+        num_workers: int = 4
+
+        data_loader: DataLoader = DataLoader(
+            dataset=self.dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True
+        )
+        return data_loader

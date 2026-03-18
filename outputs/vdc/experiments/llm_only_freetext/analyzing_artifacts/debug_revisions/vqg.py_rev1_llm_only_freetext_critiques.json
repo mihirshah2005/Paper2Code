@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Overall, the logic analysis is thorough and captures the two main functionalities—the general question generation and the label‐specific dynamic question generation—as well as the integration of caching and configuration. However, there are a few areas that could be clarified or tightened up:\n\n1. Error Handling in API Calls (Medium Severity):  \n • The analysis mentions that if the ChatGPT API call fails, the method “should either trigger a retry or return a fallback.” However, there isn’t a clea",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Overall, the logic analysis is thorough and captures the two main functionalities—the general question generation and the label‐specific dynamic question generation—as well as the integration of caching and configuration. However, there are a few areas that could be clarified or tightened up:\n\n1. Error Handling in API Calls (Medium Severity):  \n • The analysis mentions that if the ChatGPT API call fails, the method “should either trigger a retry or return a fallback.” However, there isn’t a clea",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

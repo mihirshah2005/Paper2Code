@@ -1,0 +1,218 @@
+{
+  "paper_name": "vdc",
+  "mode": "llm_only",
+  "feedback_format": "json",
+  "max_iterations": 3,
+  "total_prompt_tokens": 980437,
+  "total_completion_tokens": 196207,
+  "total_tokens": 1176644,
+  "per_file_iterations": {
+    "dataset_loader.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 5,
+        "low": 2,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 2,
+        "high": 2,
+        "medium": 5,
+        "low": 2,
+        "total_critiques": 9
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 3,
+        "low": 2,
+        "total_critiques": 6
+      }
+    ],
+    "utils.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 4,
+        "low": 3,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 5,
+        "low": 2,
+        "total_critiques": 8
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 5,
+        "low": 4,
+        "total_critiques": 10
+      }
+    ],
+    "vqg.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 6,
+        "low": 1,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 3,
+        "low": 2,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      }
+    ],
+    "vqa.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 4,
+        "low": 1,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 3,
+        "low": 1,
+        "total_critiques": 5
+      }
+    ],
+    "vae.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 2,
+        "low": 4,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 2,
+        "low": 1,
+        "total_critiques": 4
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 2,
+        "low": 2,
+        "total_critiques": 5
+      }
+    ],
+    "detection.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 4,
+        "low": 2,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 4,
+        "low": 1,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 5,
+        "total_critiques": 8
+      }
+    ],
+    "trainer.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 2,
+        "low": 3,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 2,
+        "low": 4,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 3,
+        "high": 2,
+        "medium": 3,
+        "low": 2,
+        "total_critiques": 7
+      }
+    ],
+    "evaluation.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 2,
+        "low": 2,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 2,
+        "low": 2,
+        "total_critiques": 5
+      }
+    ],
+    "main.py": [
+      {
+        "iteration": 1,
+        "high": 3,
+        "medium": 2,
+        "low": 2,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 6,
+        "low": 3,
+        "total_critiques": 9
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 4,
+        "low": 2,
+        "total_critiques": 7
+      }
+    ]
+  }
+}

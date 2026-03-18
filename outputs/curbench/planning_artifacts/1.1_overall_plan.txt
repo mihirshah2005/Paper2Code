@@ -1,0 +1,202 @@
+Below is a detailed roadmap outlining the steps and key components needed to reproduce the experiments and methodologies described in the CurBench paper. This plan covers both the core methodology and all experimental aspects (datasets, settings, model details, training protocols, curriculum learning modules, evaluation metrics, and reproducibility considerations) so that you can later translate it into a working Python codebase.
+
+────────────────────────────
+1. Environment and Project Setup
+────────────────────────────
+• Set up a reproducible Python environment (e.g., via conda or virtualenv) using Python 3.8+.
+• Install core libraries:
+  – PyTorch and torchvision (for CV models and datasets)
+  – Hugging Face Transformers (for BERT and GPT2)
+  – torchtext or Hugging Face Datasets / NLP utilities (for GLUE and other text datasets)
+  – PyTorch Geometric (and related packages) for graph models and datasets
+  – Additional libraries: numpy, pandas, scikit-learn (for performance metric computations), matplotlib or seaborn (for plotting results), and logging tools.
+• Set up GPU profiling utilities (e.g., use torch.cuda.max_memory_allocated for memory, Python’s time module for timing) to record complexity metrics.
+
+────────────────────────────
+2. Data Preparation and Preprocessing
+────────────────────────────
+A. Datasets (15 in total) – Categorized by domain:
+  • Computer Vision (CV):
+    – CIFAR-10 and CIFAR-100: Download via torchvision; images are 32×32×3.
+    – Tiny-ImageNet: Download from CS231n resources; note that you will use the validation set (since the test labels are unreleased) and split the original training set 9:1 into training and validation.
+  • Natural Language Processing (NLP):
+    – GLUE benchmark datasets (8 datasets after excluding WNLI): e.g., RTE, MRPC, STS-B, CoLA, SST-2, QNLI, QQP, MNLI.
+    – Load via Hugging Face’s datasets or similar utilities. Use validation sets as test sets because test labels are not provided.
+  • Graph Machine Learning:
+    – ogbg-molhiv (from OGB): Use the official split (train/valid/test) as given.
+    – Additional datasets from TUDataset (e.g., MUTAG, PROTEINS, NCI1): Randomly split these into training, validation, and test sets using an 8:1:1 ratio.
+
+B. Experimental Settings:
+  • Standard Setting: Use the original datasets after splitting.
+  • Noise Setting (denoted “noise-p”):
+    – For the training set only, flip each label with a probability p (where p ∈ (0.0, 1.0], e.g., p = 0.4 for many experiments). When p = 0, this is equivalent to the standard setting.
+    – Implement a function that takes in training labels and, using a uniform random process, randomly assigns a different incorrect label with probability p.
+  • Imbalance Setting (denoted “imbalance-r”):
+    – Only applied for CV tasks (CIFAR-10, CIFAR-100, Tiny-ImageNet) since NLP and graph datasets are already imbalanced.
+    – Modify the training set so that the number of samples per class follows an exponential/geometric distribution. For each class c (from 0 to C – 1), compute the sample count using: n_c = n_0 × d^c (with d ∈ (0, 1)), such that the imbalance factor r = n_0:n_{C-1}.
+    – Create utility functions to sub-sample data accordingly. Allow “r” (e.g., r = 50) to be a configurable parameter.
+
+C. Data Loader Module:
+  • Create a unified “Data Processing” module that:
+    – Parses dataset identifiers (e.g., "cifar10", "cifar100-noise-0.4", "tinyimagenet-imbalance-50").
+    – Loads the raw dataset, performs the train/validation/test splitting.
+    – Applies the noise or imbalance preprocessing as specified.
+    – Returns data loaders (with a fixed batch size, e.g., 50) for training, validation, and testing.
+
+────────────────────────────
+3. Backbone Models and Model Loading
+────────────────────────────
+A. Model Categories and Details:
+  • CV Models:
+    – LeNet: A basic convolutional neural network (~0.07M parameters).
+    – ResNet-18: Standard architecture modified (≈11.2M parameters); adjust final classification layer for the number of classes.
+    – ViT: Vision Transformer (attention-based, ~9.6M parameters); configure image patch sizes and adjust final head accordingly.
+  • NLP Models:
+    – LSTM-based classifier (~10.4M parameters): Build a simple recurrent network for sequence classification.
+    – BERT: Use a pretrained BERT model (from Hugging Face) fine-tuned on the target tasks (≈109M parameters).
+    – GPT2: Use pretrained GPT2 and fine-tune for classification tasks (~124M parameters).
+  • Graph Models:
+    – GCN: Graph Convolutional Network (using torch_geometric; ~0.01M parameters).
+    – GAT: Graph Attention Network (using attention mechanisms; ~0.14M parameters).
+    – GIN: Graph Isomorphism Network (following Weisfeiler-Lehman theory; ~0.01M parameters).
+
+B. Model Loader Module:
+  • Create a “Model Loading” module that
+    – Accepts a model identifier and target dataset.
+    – Instantiates the correct architecture and modifies the input/output layers based on dataset properties (e.g., input dimensions, number of classes).
+    – Loads pretrained weights when necessary (BERT, GPT2) or initializes others from scratch.
+  
+────────────────────────────
+4. Training Pipeline and Objective Fitting
+────────────────────────────
+A. Develop a Core Training Loop (“Objective Fitting” module) that:
+  • Accepts a model, optimizer, loss function, and data loaders.
+  • Integrates the curriculum learning module to guide the training process.
+  • Runs for a fixed number of epochs (differing per model/domain as described below).
+
+B. Training Hyperparameters (based on Appendix details):
+  • For CV Models (LeNet, ResNet-18, ViT):
+    – Batch size: 50
+    – Optimizer: Adam with constant learning rate = 0.0001
+    – Epochs: 200
+  • For LSTM (NLP):
+    – Batch size: 50
+    – Optimizer: SGD with cosine annealing learning rate (from 0.00001 to 1)
+    – Epochs: 10
+  • For BERT and GPT2 (NLP):
+    – Batch size: 50
+    – Optimizer: AdamW with constant learning rate = 0.00002
+    – Epochs: 3
+  • For Graph Models (GCN, GAT, GIN):
+    – Batch size: 50
+    – Optimizer: Adam
+    – For TUDataset: learning rate = 0.01; for ogbg-molhiv (OGB): learning rate = 0.001
+    – Epochs: 200
+  • Ensure that each experiment is run with fixed seeds from the set {42, 666, 777, 888, 999} for reproducibility and report the average and standard deviation.
+
+C. Logging and Checkpointing:
+  • Integrate logging of training loss, evaluation metrics on the validation set.
+  • Record total training time and periodically capture maximum GPU memory usage.
+  • Save checkpoints as needed.
+
+────────────────────────────
+5. Implementing Curriculum Learning Strategies
+────────────────────────────
+A. Overall Framework:
+  • Develop a “Curriculum Learning” module that plugs into the training pipeline.
+  • Abstract curriculum strategies into a base class interface (e.g., “CurriculumScheduler”) with methods such as:
+    – initialize() – set up any required internal states or meta-networks;
+    – update() – determine which data samples (or weights) to select/update based on current training loss/epoch;
+    – schedule() – manage “warm-up”, “growth”, or “schedule epochs” as described in the paper.
+  • The module should be modular so that additional methods can be easily added.
+
+B. Categories and Specific Methods:
+  • Data Selection Methods:
+    – Vanilla Self-Paced Learning (SPL, Kumar et al., 2010): Order samples based on training loss and select “easy” samples first.
+    – DIHCL (Zhou et al., 2020)
+    – Teacher transferring methods (e.g., TTCL, Weinshall et al., 2018) – use a pretrained teacher model to guide sample selection.
+    – (Other methods in this category such as MCL, variants by Weinshall et al. and those by Cheng et al.)
+  • Model Adjustment Method:
+    – CBS (Sinha et al., 2020): Adjust model input using a Gaussian filter in order to limit the amount of information.
+  • Loss Reweighting Methods:
+    – LRE (Ren et al., 2018a), MW-Net (Shu et al., 2019), DDS (Wang et al., 2020): Use meta-learning frameworks to assign weights to samples based on difficulty.
+    – Other methods like DCL, SuperLoss, and ScreenerNet (Kim & Choi, 2018) that modify the loss.
+  • Note: Some curriculum methods are designed specifically for CV tasks (e.g., CBS, LGL, C2F, EfficientTrain). For NLP and Graph, only implement methods that are generic or already applied in those domains.
+  
+C. Hyperparameters for Curriculum Methods:
+  • Refer to the Appendix (Table 7 and related sections) for default hyperparameter values (e.g., warm epochs, growth epochs, meta-learning hyperparameters).
+  • Allow them to be passed as configuration settings, and note if adjustments are required for text-related tasks (e.g., when training for only 3 or 10 epochs).
+  • If some details are ambiguous or not fully specified (e.g., precise meta-network architecture), note these points explicitly and document assumptions.
+
+────────────────────────────
+6. Evaluation Metrics and Experimental Analysis
+────────────────────────────
+A. Performance Metrics (domain-dependent):
+  • CV:
+    – Use Accuracy as the primary metric.
+  • NLP (GLUE tasks):
+    – For classification tasks, report Accuracy.
+    – For tasks such as MRPC or STS-B, report F1 Score, and for others, report Spearman and Matthews correlation coefficients as provided.
+  • Graph:
+    – Report AUC (Area Under the ROC Curve), as per Yang et al. (2021) for ogbg-molhiv.
+    
+B. Complexity Metrics:
+  • Record total GPU training time (in hours) for a full training run.
+  • Record maximum GPU memory consumption (in GB) using GPU profiling (e.g., torch.cuda.max_memory_allocated()).
+  
+C. Experimental Protocol:
+  • For each combination of dataset, backbone model, and experimental setting (standard, noise, imbalance), run:
+    – A baseline training (without curriculum learning).
+    – Training with each curriculum learning strategy.
+  • For noise experiments:
+    – Vary noise level p over a range (e.g., 0.0, 0.1, 0.2, …, 0.8) as in Figure 4.
+  • For imbalance experiments (CV only):
+    – Vary the imbalance factor r over values such as 1, 10, 20, 50, 100, 200 (see Figure 5).
+  • Repeat each experiment 5 times with distinct seeds (42, 666, 777, 888, 999) and report the average and standard deviation.
+  
+D. Reporting:
+  • Organize results into tables analogous to Table 3 in the paper, comparing baseline versus the “+ CL” (best curriculum method for that combination).
+  • Plot curves for performance versus noise ratio and performance versus imbalance factor.
+  • Plot complexity figures (training time and memory usage) for at least one representative combination (e.g., ResNet-18 with CIFAR-10) similar to Figure 6.
+
+────────────────────────────
+7. Reproducibility and Documentation
+────────────────────────────
+• Use configuration files (YAML/JSON) to store experiment settings and hyperparameters.
+• Log all settings, seeds, and any random initialization details to ensure exact reproducibility.
+• Document any assumptions made where the paper is ambiguous (for instance, details of meta-network architecture for MW-Net or scheduling parameters for curriculum growth).
+• Prepare detailed training logs and script files so that subsequent runs can be automated and compared.
+• Consider writing unit tests for key modules (data processing, curriculum scheduler, model loader) to ensure correctness.
+
+────────────────────────────
+8. Potential Ambiguities and Points Needing Clarification
+────────────────────────────
+• Some curriculum method hyperparameters (e.g., warm epochs, schedule epochs, growth parameters) are only briefly mentioned; confirm these by referring to the original papers or treat them as tunable parameters.
+• The exact implementation details for methods such as CBS, LGL, C2F, and EfficientTrain are not fully detailed in the paper; check the referenced papers or provide documentation stating any modifications made for reproducibility.
+• When applying curriculum methods on domains different from the ones originally proposed (e.g., some methods are only applied to CV in the original experiments), note these limitations and document any necessary adjustments or exclusions.
+
+────────────────────────────
+9. Summary of the Code Architecture
+────────────────────────────
+• Module 1 – Data Processing:
+  – Functions for dataset downloading, splitting, noise injection, and imbalance formation.
+• Module 2 – Model Loading:
+  – Classes/functions that load and configure backbone models based on domain and dataset.
+• Module 3 – Training Pipeline (Objective Fitting):
+  – General training loop that integrates loss computation, backpropagation, and curriculum scheduling.
+• Module 4 – Curriculum Learning:
+  – Base class “CurriculumScheduler” plus concrete classes for each method.
+  – Integration hooks in the training loop to select or reweight data samples.
+• Module 5 – Evaluation:
+  – Functions to calculate performance metrics (accuracy, F1, correlations, AUC) and complexity metrics.
+  – Reporting and plotting utilities.
+• Module 6 – Experiment Management:
+  – Scripts to run experiments for each combination of dataset, model, method, and setting.
+  – Support for multiple seeds and logging/averaging of results.
+
+────────────────────────────
+Final Remarks
+────────────────────────────
+This comprehensive plan follows the methodology and experimental setups of the CurBench paper. It covers data acquisition and preprocessing, backbone model configuration, curriculum learning module design, training regimes with domain-specific hyperparameters, evaluation protocols (both performance and complexity), and clear reproducibility practices. Use this roadmap to structure your codebase, and be sure to document any modifications made along the way (especially in areas where the paper’s details are less explicit).
+
+Following this plan will enable you to build a robust and modular implementation that mirrors the experiments described in the paper, facilitating fair benchmarking of curriculum learning methods.

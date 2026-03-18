@@ -1,0 +1,388 @@
+"""dataset_loader.py
+
+This module implements the DatasetLoader class which loads CIFAR-10, ImageNet-100,
+and ImageNet-Dog datasets using torchvision, applies necessary image preprocessing,
+and injects dirty samples (both noisy labels and poisoned/backdoored images)
+according to the experimental settings specified in the configuration.
+
+The dirty sample injection is performed by modifying training samples:
+  - Noisy Label Injection: With probability noisy_ratio, a sample’s label is flipped
+    uniformly at random (symmetric noise) from the available labels (excluding the true label).
+  - Poisoned Sample Injection: For each class, a fixed number of samples are randomly selected,
+    a backdoor trigger is embedded (via a helper function from utils), and the label is set
+    to a target (e.g., 0).
+
+This module defines a custom dataset wrapper (DirtyDataset) that holds a list of sample dictionaries.
+Each sample dictionary contains:
+    - For image samples loaded from ImageFolder: "image_path", later loaded and transformed.
+    - For pretrained datasets like CIFAR-10: "image" (already a tensor).
+    - "label": current (possibly dirty) label.
+    - "clean_label": original clean label.
+    - "is_poisoned": bool flag.
+    - "is_noisy": bool flag.
+    
+Dependencies: torch, torchvision, numpy, random, os, PIL, and a helper function inject_backdoor_trigger from utils.
+"""
+
+import os
+import random
+from typing import Any, Dict, List
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+# Assume that utils.inject_backdoor_trigger exists.
+from utils import inject_backdoor_trigger
+
+
+class DirtyDataset(Dataset):
+    """A simple PyTorch Dataset wrapping a list of sample dictionaries."""
+    def __init__(self, samples_list: List[Dict[str, Any]]) -> None:
+        """
+        Args:
+            samples_list (List[Dict[str, Any]]): List of sample dicts.
+                Each dict should contain keys such as:
+                  "image" or "image_path", "label", "clean_label", "is_poisoned", "is_noisy".
+        """
+        self.samples = samples_list
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # Returns the sample dictionary.
+        return self.samples[idx]
+
+
+class DatasetLoader:
+    """DatasetLoader loads and preprocesses datasets and injects dirty samples for experiments."""
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initialize the DatasetLoader with the provided configuration.
+
+        Args:
+            config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        """
+        self.config = config
+        # Set random seeds for reproducibility.
+        seed: int = self.config.get("seed", 42)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        # Define image preprocessing transforms for each dataset.
+        self.transforms: Dict[str, Any] = {}
+
+        # CIFAR-10 transform: using known CIFAR-10 normalization statistics.
+        self.transforms["CIFAR-10"] = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.4914, 0.4822, 0.4465),
+                                 std=(0.2470, 0.2435, 0.2616))
+        ])
+
+        # For ImageNet-100 and ImageNet-Dog, use ImageNet-scale transforms.
+        imagenet_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406),
+                                 std=(0.229, 0.224, 0.225))
+        ])
+        self.transforms["ImageNet-100"] = imagenet_transform
+        self.transforms["ImageNet-Dog"] = imagenet_transform
+
+        # Define default data directories for each dataset.
+        self.data_dirs: Dict[str, str] = {
+            "CIFAR-10": "./data/cifar10",
+            "ImageNet-100": "./data/imagenet100",
+            "ImageNet-Dog": "./data/imagenet_dog"
+        }
+
+    def load_data(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Loads the datasets and returns a structured dictionary
+        containing both training and testing splits for each dataset.
+
+        Returns:
+            Dict[str, Dict[str, Any]]: A dictionary with keys: "CIFAR-10", "ImageNet-100", "ImageNet-Dog".
+              Each value is another dictionary with keys "train" and "test" containing the respective dataset.
+        """
+        data_dict: Dict[str, Dict[str, Any]] = {}
+
+        # ---------------------------
+        # Load CIFAR-10 using torchvision.datasets.CIFAR10
+        # ---------------------------
+        cifar_train = datasets.CIFAR10(root=self.data_dirs["CIFAR-10"],
+                                       train=True,
+                                       download=True,
+                                       transform=self.transforms["CIFAR-10"])
+        cifar_test = datasets.CIFAR10(root=self.data_dirs["CIFAR-10"],
+                                      train=False,
+                                      download=True,
+                                      transform=self.transforms["CIFAR-10"])
+        data_dict["CIFAR-10"] = {
+            "train": cifar_train,
+            "test": cifar_test
+        }
+
+        # ---------------------------
+        # Load ImageNet-100 using torchvision.datasets.ImageFolder
+        # Assume folder structure: ./data/imagenet100/train and ./data/imagenet100/test
+        # Randomly select 100 classes and limit to 500 images per class for training and 100 for testing.
+        imagenet100_train_full = datasets.ImageFolder(
+            root=os.path.join(self.data_dirs["ImageNet-100"], "train"),
+            transform=self.transforms["ImageNet-100"]
+        )
+        imagenet100_test_full = datasets.ImageFolder(
+            root=os.path.join(self.data_dirs["ImageNet-100"], "test"),
+            transform=self.transforms["ImageNet-100"]
+        )
+        all_classes = imagenet100_train_full.classes
+        if len(all_classes) > 100:
+            selected_classes = sorted(random.sample(all_classes, 100))
+        else:
+            selected_classes = all_classes
+
+        imagenet100_train = self._filter_dataset(imagenet100_train_full, selected_classes, samples_per_class=500)
+        imagenet100_test = self._filter_dataset(imagenet100_test_full, selected_classes, samples_per_class=100)
+        data_dict["ImageNet-100"] = {
+            "train": imagenet100_train,
+            "test": imagenet100_test
+        }
+
+        # ---------------------------
+        # Load ImageNet-Dog using torchvision.datasets.ImageFolder
+        # Assume folder structure: ./data/imagenet_dog/train and ./data/imagenet_dog/test
+        # For dog classes, randomly select 10 classes, 800 training and 200 testing samples per class.
+        imagenet_dog_train_full = datasets.ImageFolder(
+            root=os.path.join(self.data_dirs["ImageNet-Dog"], "train"),
+            transform=self.transforms["ImageNet-Dog"]
+        )
+        imagenet_dog_test_full = datasets.ImageFolder(
+            root=os.path.join(self.data_dirs["ImageNet-Dog"], "test"),
+            transform=self.transforms["ImageNet-Dog"]
+        )
+        dog_classes = imagenet_dog_train_full.classes
+        if len(dog_classes) > 10:
+            selected_dog_classes = sorted(random.sample(dog_classes, 10))
+        else:
+            selected_dog_classes = dog_classes
+
+        imagenet_dog_train = self._filter_dataset(imagenet_dog_train_full, selected_dog_classes, samples_per_class=800)
+        imagenet_dog_test = self._filter_dataset(imagenet_dog_test_full, selected_dog_classes, samples_per_class=200)
+        data_dict["ImageNet-Dog"] = {
+            "train": imagenet_dog_train,
+            "test": imagenet_dog_test
+        }
+
+        return data_dict
+
+    def _filter_dataset(self,
+                        dataset: Dataset,
+                        selected_classes: List[str],
+                        samples_per_class: int) -> DirtyDataset:
+        """
+        Filters an ImageFolder dataset to include only the selected classes and limits to
+        a given number of samples per class.
+        
+        Args:
+            dataset (Dataset): A torchvision.datasets.ImageFolder dataset.
+            selected_classes (List[str]): List of class names to include.
+            samples_per_class (int): Desired number of samples per selected class.
+        
+        Returns:
+            DirtyDataset: A custom dataset containing filtered sample dictionaries.
+                      Each sample dict contains: "image_path", "label", "clean_label", "is_poisoned", "is_noisy", and "class_name".
+        """
+        idx_to_class = {v: k for k, v in dataset.class_to_idx.items()}
+        # Collect samples from dataset.samples, which is a list of (file_path, label)
+        samples_list: List[Dict[str, Any]] = []
+        for file_path, label in dataset.samples:
+            class_name = idx_to_class[label]
+            if class_name in selected_classes:
+                samples_list.append({
+                    "image_path": file_path,
+                    "label": label,       # current label (integer)
+                    "clean_label": label, # original clean label
+                    "is_poisoned": False,
+                    "is_noisy": False,
+                    "class_name": class_name
+                })
+        # Group samples by class and select up to samples_per_class each.
+        samples_group: Dict[str, List[Dict[str, Any]]] = {cls: [] for cls in selected_classes}
+        for sample in samples_list:
+            samples_group[sample["class_name"]].append(sample)
+        filtered_samples: List[Dict[str, Any]] = []
+        for cls in selected_classes:
+            group = samples_group.get(cls, [])
+            random.shuffle(group)
+            filtered_samples.extend(group[:samples_per_class])
+        return DirtyDataset(filtered_samples)
+
+    def inject_dirty_samples(self, data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Injects dirty samples (noisy labels and poisoned/backdoored images) into the training datasets.
+        The injection is applied per dataset as follows:
+          - Poisoning: For each class, a specified number of samples have a backdoor trigger injected
+            and their label changed to the target (fixed to 0).
+          - Noisy labels: For non-poisoned samples, with probability equal to the noisy ratio,
+            the label is flipped (symmetric noise).
+        
+        Args:
+            data (Dict[str, Dict[str, Any]]): Dictionary containing the datasets as returned by load_data().
+        
+        Returns:
+            Dict[str, Dict[str, Any]]: The modified data dictionary where the training split of
+            each dataset has been altered.
+        """
+        noisy_ratio: float = self.config.get("dirty_sample_generation", {}).get("noisy_ratio", 0.4)
+        poisoning_config: Dict[str, Any] = self.config.get("dirty_sample_generation", {}).get("poisoning", {})
+
+        # Process each dataset's training split.
+        for dataset_name in data:
+            if dataset_name == "CIFAR-10":
+                # Retrieve the original CIFAR-10 training dataset (torchvision dataset)
+                original_dataset = data[dataset_name]["train"]
+                samples_list: List[Dict[str, Any]] = []
+                for idx in range(len(original_dataset)):
+                    image, label = original_dataset[idx]
+                    samples_list.append({
+                        "image": image,  # already a tensor via transform
+                        "label": label,
+                        "clean_label": label,
+                        "is_poisoned": False,
+                        "is_noisy": False
+                    })
+                # Poisoned Sample Injection for CIFAR-10.
+                # Get the poisoning samples_per_class value; by default, use the first value if a list is provided.
+                cifar_poison_vals: List[int] = poisoning_config.get("CIFAR-10", {}).get("samples_per_class", [50])
+                cifar_poison_count: int = cifar_poison_vals[0] if isinstance(cifar_poison_vals, list) else cifar_poison_vals
+                # Group samples by label.
+                samples_by_class: Dict[int, List[Dict[str, Any]]] = {}
+                for sample in samples_list:
+                    lbl = sample["label"]
+                    samples_by_class.setdefault(lbl, []).append(sample)
+                # For each class, randomly select samples to poison.
+                for lbl, sample_group in samples_by_class.items():
+                    num_to_poison: int = min(cifar_poison_count, len(sample_group))
+                    poisoned_indices: List[int] = random.sample(range(len(sample_group)), num_to_poison)
+                    for idx_in_group in poisoned_indices:
+                        sample = sample_group[idx_in_group]
+                        # For poisoning, modify image by injecting a backdoor trigger.
+                        # Since the image is a tensor, convert it to PIL image first.
+                        pil_image = transforms.ToPILImage()(sample["image"])
+                        # Use helper from utils; here default trigger type is "BadNets".
+                        poisoned_pil = inject_backdoor_trigger(pil_image, trigger_type="BadNets", dataset=dataset_name)
+                        # Reapply CIFAR-10 transform to get a tensor image.
+                        sample["image"] = self.transforms["CIFAR-10"](poisoned_pil)
+                        sample["label"] = 0  # Set target label to 0.
+                        sample["is_poisoned"] = True
+                # Noisy Label Injection for non-poisoned samples.
+                all_labels = list(range(10))  # CIFAR-10 labels.
+                for sample in samples_list:
+                    if not sample["is_poisoned"]:
+                        if random.random() < noisy_ratio:
+                            true_label = sample["clean_label"]
+                            noisy_choices = [lbl for lbl in all_labels if lbl != true_label]
+                            if noisy_choices:
+                                sample["label"] = random.choice(noisy_choices)
+                                sample["is_noisy"] = True
+                # Wrap the modified samples with DirtyDataset.
+                data[dataset_name]["train"] = DirtyDataset(samples_list)
+
+            elif dataset_name == "ImageNet-100":
+                # For ImageNet-100, the training set is a DirtyDataset created by _filter_dataset.
+                dirty_dataset: DirtyDataset = data[dataset_name]["train"]
+                new_samples: List[Dict[str, Any]] = []
+                # Load each image from its stored file path and apply transform.
+                for item in dirty_dataset.samples:
+                    try:
+                        pil_image = Image.open(item["image_path"]).convert("RGB")
+                    except Exception as e:
+                        continue  # Skip if image loading fails.
+                    item["image"] = self.transforms["ImageNet-100"](pil_image)
+                    new_samples.append(item)
+                dirty_dataset.samples = new_samples
+                # Get poisoning values for ImageNet-100.
+                poison_vals = poisoning_config.get("ImageNet-100", {}).get("samples_per_class", [5])
+                imagenet100_poison_count: int = poison_vals[0] if isinstance(poison_vals, list) else poison_vals
+                # Determine number of classes from the filtered samples.
+                all_labels = list(set([item["label"] for item in dirty_dataset.samples]))
+                # Group samples by label.
+                samples_by_class: Dict[int, List[Dict[str, Any]]] = {}
+                for sample in dirty_dataset.samples:
+                    lbl = sample["label"]
+                    samples_by_class.setdefault(lbl, []).append(sample)
+                for lbl in all_labels:
+                    if lbl in samples_by_class:
+                        group = samples_by_class[lbl]
+                        num_to_poison: int = min(imagenet100_poison_count, len(group))
+                        poisoned_indices = random.sample(range(len(group)), num_to_poison)
+                        for idx_in_group in poisoned_indices:
+                            sample = group[idx_in_group]
+                            # Convert tensor image to PIL image for trigger injection.
+                            pil_img = transforms.ToPILImage()(sample["image"])
+                            poisoned_pil = inject_backdoor_trigger(pil_img, trigger_type="BadNets", dataset=dataset_name)
+                            sample["image"] = self.transforms["ImageNet-100"](poisoned_pil)
+                            sample["label"] = 0  # Target label.
+                            sample["is_poisoned"] = True
+                # Noisy Label Injection for non-poisoned samples.
+                all_class_labels = sorted(all_labels)
+                for sample in dirty_dataset.samples:
+                    if not sample["is_poisoned"]:
+                        if random.random() < noisy_ratio:
+                            true_label = sample["clean_label"]
+                            noisy_choices = [lbl for lbl in all_class_labels if lbl != true_label]
+                            if noisy_choices:
+                                sample["label"] = random.choice(noisy_choices)
+                                sample["is_noisy"] = True
+                data[dataset_name]["train"] = dirty_dataset
+
+            elif dataset_name == "ImageNet-Dog":
+                # For ImageNet-Dog, process similarly to ImageNet-100.
+                dirty_dataset: DirtyDataset = data[dataset_name]["train"]
+                new_samples = []
+                for item in dirty_dataset.samples:
+                    try:
+                        pil_image = Image.open(item["image_path"]).convert("RGB")
+                    except Exception as e:
+                        continue
+                    item["image"] = self.transforms["ImageNet-Dog"](pil_image)
+                    new_samples.append(item)
+                dirty_dataset.samples = new_samples
+                poison_val = poisoning_config.get("ImageNet-Dog", {}).get("samples_per_class", 80)
+                imagenet_dog_poison_count: int = poison_val if isinstance(poison_val, int) else int(poison_val)
+                all_labels = list(set([item["label"] for item in dirty_dataset.samples]))
+                samples_by_class = {}
+                for sample in dirty_dataset.samples:
+                    lbl = sample["label"]
+                    samples_by_class.setdefault(lbl, []).append(sample)
+                for lbl in all_labels:
+                    if lbl in samples_by_class:
+                        group = samples_by_class[lbl]
+                        num_to_poison = min(imagenet_dog_poison_count, len(group))
+                        poisoned_indices = random.sample(range(len(group)), num_to_poison)
+                        for idx_in_group in poisoned_indices:
+                            sample = group[idx_in_group]
+                            pil_img = transforms.ToPILImage()(sample["image"])
+                            poisoned_pil = inject_backdoor_trigger(pil_img, trigger_type="BadNets", dataset=dataset_name)
+                            sample["image"] = self.transforms["ImageNet-Dog"](poisoned_pil)
+                            sample["label"] = 0
+                            sample["is_poisoned"] = True
+                # Noisy label injection for non-poisoned samples.
+                all_class_labels = sorted(all_labels)
+                for sample in dirty_dataset.samples:
+                    if not sample["is_poisoned"]:
+                        if random.random() < noisy_ratio:
+                            true_label = sample["clean_label"]
+                            noisy_choices = [lbl for lbl in all_class_labels if lbl != true_label]
+                            if noisy_choices:
+                                sample["label"] = random.choice(noisy_choices)
+                                sample["is_noisy"] = True
+                data[dataset_name]["train"] = dirty_dataset
+
+        return data

@@ -1,0 +1,106 @@
+Below is the revised logic analysis for the vqg.py module with explicit error handling and well-defined fallback strategies integrated into the generate_label_specific_questions method.
+
+──────────────────────────────
+1. OVERVIEW
+
+• The VQG module produces two kinds of questions:
+  – General Questions: Predefined, template-based prompts (e.g., “Describe the image briefly.”).
+  – Label-Specific Questions: Custom questions tailored to the provided label generated via a ChatGPT API call.
+
+• These questions are critical inputs for later stages in the VDC pipeline (VQA and VAE). Therefore, the question generation must be robust against API errors, network issues, and unexpected response formats.
+
+──────────────────────────────
+2. INITIALIZATION (__init__)
+
+• The VQG class is initialized with:
+  – A list of predetermined general question templates.
+  – A base prompt template for label-specific questions.
+  – The desired number of label-specific questions per dataset (from config.yaml: CIFAR-10 = 4, ImageNet-100 = 6, ImageNet-Dog = 4).
+  – A cache (e.g., a Python dictionary) to store generated questions per label.
+  – Configuration parameters for API calls (e.g., maximum retry count, retry delay) which can be defined within the module or loaded from a separate config.
+
+──────────────────────────────
+3. METHOD: generate_general_questions(label: str) -> List[str]
+
+• This method selects the required number (general_questions_count from config.yaml, i.e., 2) of predetermined general questions.
+• The questions may be chosen in a fixed order or via reproducible randomized selection.
+• Since these templates are internal and predefined, no external API calls or error handling is needed here.
+
+──────────────────────────────
+4. METHOD: generate_label_specific_questions(label: str) -> List[str]
+
+This method generates a set of questions specific to a given label by interacting with ChatGPT. The revised logic includes explicit error handling, retries, and a fallback strategy if the API call or parsing does not yield enough questions.
+
+Step-by-step breakdown:
+
+A. Fetching Required Count and Cache Check
+   1. Determine the expected number of questions (N_expected) based on the dataset configuration.
+   2. Check the internal cache: If there exists an entry for the given label, return the cached list to avoid redundant API calls.
+
+B. Constructing the Prompt
+   1. Construct a detailed prompt that instructs ChatGPT to generate N_expected label‑specific questions.
+      • For example, “For the label ‘{label}’, please generate exactly N_expected insightful visual questions. Format your output strictly as a JSON array of strings.”
+   2. This explicit instruction to output valid JSON helps enforce a consistent structure.
+
+C. Making the API Call with Robust Error Handling and Retries
+   1. Use a try/except block along with a retry mechanism:
+      – Wrap the ChatGPT API call inside a loop with a maximum number of retries (e.g., 3 retries).
+      – For each attempt:
+         • Call the API using the utility function from utils.py.
+         • Catch network-related exceptions, API errors (including rate limits), or unexpected errors.
+         • If an error is caught, log the error and wait for a specified delay (using exponential backoff or a fixed delay).
+      – If all retries fail, log a critical error and move to the fallback strategy.
+
+D. Parsing the API Response with a Multi-Stage Approach
+   1. First, attempt to parse the API response as JSON:
+      – Use a JSON parser to interpret the response as a list of strings.
+      – If successful and the resulting list is valid, proceed.
+   2. If JSON parsing fails:
+      – Normalize and clean the returned text.
+      – Use robust heuristic parsing:
+         • Search for bullet markers (e.g., “– ”, “* ”, numbers followed by “.”) and apply a regular expression that extracts sentences ending with a question mark “?”.
+         • Filter out any candidate strings that are too short or do not end with “?” to reduce noise.
+   3. Validate the parsed list:
+      – Verify that the list contains at least N_expected questions.
+      
+E. Fallback Strategy for Insufficient Questions
+   1. If the parsed list contains fewer than N_expected questions:
+      – Reissue the API call once more with a modified prompt (if retry count remains) emphasizing “return exactly N_expected questions” or increase verbosity.
+      – If subsequent attempts still yield insufficient questions, append a set of default, safe template questions that are pre-stored (for example, a default list keyed by common labels or a generic default fallback list) until the total count reaches N_expected.
+         • The default templates should be curated to align with the style of the generated questions.
+   2. Log a warning indicating that the fallback strategy was used.
+
+F. Caching and Returning the Results
+   1. Cache the final validated list of questions (of length N_expected) with the corresponding label so that subsequent calls for the same label bypass the API call.
+   2. Return the list.
+
+──────────────────────────────
+5. DEPENDENCIES & UTILITIES
+
+• The module relies on the openai package for ChatGPT API calls.
+• It uses utility functions in utils.py for:
+  – Caching API responses.
+  – Robust JSON parsing and string cleaning.
+  – Time delays (for retry backoff) and logging.
+• All configurable parameters (e.g., maximum retries, delay durations, expected question counts) are to be either embedded in the module or loaded via the configuration (config.yaml).
+
+──────────────────────────────
+6. FUNCTIONAL FLOW SUMMARY
+
+For a given label:
+  a. Check cache and decide if a new API call is needed.
+  b. Construct a prompt that enforces a JSON output format.
+  c. Attempt to call ChatGPT with a retry loop handling network and API errors.
+  d. Parse the response using JSON-first parsing; if it fails, use heuristic extraction.
+  e. Validate the number of questions:
+     – If fewer than expected, attempt one more API call or append default questions.
+  f. Cache and return a reliably sized list of label‑specific questions.
+
+──────────────────────────────
+7. FINAL REMARKS
+
+• The revised logic now clearly defines how to handle network errors and API failures through explicit retries with delays. 
+• It specifies a fallback strategy for when fewer than the required number of questions are extracted (by reissuing the API call or appending default template questions), ensuring predictable behavior.
+• This robustness in generate_label_specific_questions is crucial to maintaining the overall reliability of the VDC pipeline.
+
+This analysis ensures that label-specific question generation in vqg.py is robust, handles errors gracefully, and maintains consistency even when ChatGPT API responses deviate from expectations.

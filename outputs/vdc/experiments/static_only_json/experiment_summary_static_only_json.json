@@ -1,0 +1,92 @@
+{
+  "paper_name": "vdc",
+  "mode": "static_only",
+  "feedback_format": "json",
+  "max_iterations": 3,
+  "total_prompt_tokens": 292896,
+  "total_completion_tokens": 32432,
+  "total_tokens": 325328,
+  "per_file_iterations": {
+    "dataset_loader.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "utils.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "vqg.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "vqa.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "vae.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "detection.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "trainer.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "evaluation.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ],
+    "main.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "total_critiques": 0
+      }
+    ]
+  }
+}

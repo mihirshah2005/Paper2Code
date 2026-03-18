@@ -1,0 +1,41 @@
+----------------------------------------
+[Required packages]
+- numpy==1.21.0
+- torch==1.9.0
+- torchvision==0.10.0
+- tqdm==4.62.0
+- Pillow==8.3.0
+- scipy==1.7.0
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['dataset_loader.py', 'Defines the DatasetLoader class that handles reading the image dataset (e.g., ImageNet), applying image transformations (resizing while preserving aspect ratio, horizontal flip augmentation), and dynamically computing token lengths. It integrates the pre-processing required for patchifying the VAE latent codes and pads the token sequences to a fixed maximum length (L_max).']
+- ['model.py', 'Implements the Model class which encapsulates the FiT transformer architecture. This includes:\n - Loading and interfacing with a pre-trained VAE (for encoding and decoding images).\n - Tokenizing the VAE latent output via patchification (with patch size p=2).\n - Building the flexible transformer blocks that integrate 2D Rotary Positional Embedding (RoPE), Masked Multi-Head Self-Attention (MHSA), and replacing MLP with a SwiGLU block.\n - Implementing the necessary positional interpolation methods (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN) for resolution extrapolation.\nThis module is dependent on the dataset loader for the input dimensions and on the trainer for forward passes.']
+- ['trainer.py', 'Develops the Trainer class responsible for the training pipeline of the diffusion model. The Trainer handles:\n - Constructing the training loop that iterates over batches of data.\n - Computing the diffusion process loss, ensuring that loss is only computed over valid (non-padding) tokens via a mask.\n - Applying the optimizer (AdamW with a constant learning rate), and updating model weights with EMA (decay 0.9999).\n - Saving checkpoints and logging training metrics.\nIt depends on the Model class and the DatasetLoader output.']
+- ['evaluation.py', "Creates the Evaluation class to conduct inference and evaluation of the trained model. This class:\n - Loads the trained model's EMA weights.\n - Implements the diffusion sampling procedure for generating images (e.g., 250 denoising DDPM iterations).\n - Applies resolution extrapolation techniques via positional interpolation methods for both in-distribution and out-of-distribution resolutions.\n - Computes and reports evaluation metrics such as FID, sFID, Inception Score, Precision, and Recall.\nIt depends on the Model class and requires access to pre-processed data from the DatasetLoader."]
+- ['main.py', 'Acts as the entry point of the application. This file:\n - Loads the configuration and initializes the DatasetLoader to prepare the data.\n - Instantiates the Model and loads the pre-trained VAE checkpoint.\n - Creates a Trainer instance to begin training the diffusion model.\n - After training, instantiates the Evaluation class to run inference and compute performance metrics.\nIt orchestrates the interactions between dataset loading, model training, and evaluation.']
+
+----------------------------------------
+[Task list]
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Common configuration parameters (e.g., L_max = 256, patch size p=2, learning rate, EMA decay) and utility functions (e.g., for image patchification, token padding, and construction of the attention mask) will be shared across modules. Logging utilities and checkpoint management code should be maintained in shared helper functions or a separate config.py file.
+
+----------------------------------------
+[Anything UNCLEAR]
+Clarification is needed on the exact details of patchifying the VAE latent output (dimensions and reshaping process), the specific diffusion hyperparameters (noise schedule, number of timesteps, etc.), and the precise formulas for 2D RoPE and its decoupled variant implementations. Additionally, guidance on handling evaluation metric computation (integration with TensorFlow ADM evaluation or alternative libraries) would be beneficial.
+

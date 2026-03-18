@@ -1,0 +1,102 @@
+Below is the revised logic analysis for the vqg.py module. This version explicitly addresses the critiques raised regarding error handling, determinism, caching keys, response parsing, fault-tolerance for API failures, and clarity in utility integration.
+
+──────────────────────────────
+1. CLASS INITIALIZATION (__init__)
+
+• Purpose:  
+  – The VQG class generates general and label‑specific questions.  
+  – During initialization, it loads and stores configuration details such as:  
+  • A fixed list of general question templates,  
+  • A mapping from dataset identifiers (e.g., "CIFAR-10", "ImageNet-100", "ImageNet-Dog") to the number of label‑specific questions that should be generated, and  
+  • Other prompt details (e.g., version of the prompt template) for label‑specific question generation.
+
+• Revised Handling of Dataset Configuration:  
+  – The __init__() method verifies that the provided configuration includes a valid mapping for the dataset currently being processed.  
+  – If an unknown dataset identifier is provided (i.e., no mapping of label‑specific question count exists), the code will either fall back to a default value (for example, defaulting to 4 questions) or raise a clear error (with an informative message) indicating that the dataset is not recognized.  
+  – Logging will be used to warn about using the fallback value so that the user is aware of the issue.
+
+• Integration with Utilities:  
+  – The initialization explicitly documents the expected interface for external utilities (e.g., a caching function and a ChatGPT API call wrapper, such as ask_chatgpt). These utilities are expected to provide caching (using a defined key structure) and API response retrieval in a specified format.
+
+──────────────────────────────
+2. generate_general_questions(label: str) -> List[str]
+
+• Purpose:  
+  – To produce a set of general questions from a predefined list of templates.
+
+• Revised Deterministic Selection:  
+  – Instead of random sampling without a fixed seed, the method will adopt a deterministic selection strategy. Possible approaches include:  
+  • Sorting the list of available templates and selecting the first N templates, or  
+  • Using a fixed random seed (if sampling is preferred) to ensure reproducibility.  
+  – The method will also check whether the total number of available general question templates is at least equal to the number specified in the configuration (detection.general_questions_count).  
+  – If there are fewer templates than needed, the code will either choose to return all available templates (with a logged warning) or raise an explicit error, detailing that the number of required templates was not met.
+
+• Return:  
+  – A deterministic list of general question templates.
+
+──────────────────────────────
+3. generate_label_specific_questions(label: str) -> List[str]
+
+• Purpose:  
+  – To dynamically generate label‑specific questions using an LLM (ChatGPT) with a prompt that incorporates the provided label.
+
+• Revised Caching Strategy:  
+  – The caching key must be robust enough to avoid collisions. To achieve this, the key should incorporate:  
+  • The dataset identifier (e.g., "CIFAR-10", "ImageNet-100", etc.)  
+  • The label string,  
+  • The expected number of questions (from configuration), and  
+  • A version identifier for the prompt template (or a hash of the prompt template).  
+  – This helps ensure that if the same label appears in different datasets or if the prompt changes, the cache does not return an outdated or inappropriate set of questions.
+
+• Revised API Request & Response Parsing:  
+  – The prompt for the ChatGPT API will be carefully constructed to instruct the API to output the questions in a predetermined format. For example, the prompt may instruct the API to return a JSON array of strings.  
+  – The method must include explicit parsing logic:  
+  • If the response is in JSON, parse it accordingly, and validate that the output is indeed a list of strings.  
+  • If the expected JSON format is not returned, the method should log a detailed error and attempt to extract questions using a fallback (e.g., splitting by newlines combined with validation that each line is non-empty).  
+  – Validation steps ensure that each question meets a minimum length or passes other sanity checks, logging or raising an error if the response format is not as expected.
+
+• Revised Error Handling and Recovery:  
+  – The API call is wrapped in a try/except block to capture and log issues (e.g., network failures, API rate limit errors).  
+  – Implement a simple retry mechanism with a preset maximum number of retries (e.g., two retries) before falling back.
+  – If all retries fail, the method can either return a set of default questions (pre-defined for that label) or explicitly raise an error that will be caught by the higher-level detection pipeline, ensuring downstream tasks are not given an empty list unexpectedly.
+
+• Return:  
+  – A validated list of label‑specific questions generated by ChatGPT, cached using the robust key described above.
+
+──────────────────────────────
+4. (Optional) Combined Method: generate_all_questions(label: str, dataset_id: str) -> Dict[str, List[str]]
+
+• Purpose:  
+  – This helper method would call both generate_general_questions and generate_label_specific_questions and return a dictionary (or similar structure) containing both lists.
+  
+• Note:  
+  – The dataset identifier should be passed explicitly so that the caching key in generate_label_specific_questions can include it.
+
+──────────────────────────────
+5. EXTERNAL UTILITIES INTEGRATION
+
+• Specify and Document:  
+  – The expected behaviors for external functions such as ask_chatgpt(prompt, cache_key) and caching utilities should be clearly documented. For example:  
+  • ask_chatgpt should accept a prompt string and a cache key, check if a cached response exists, and if not, perform the API call and cache the result.  
+  – The vqg.py module must document the assumed interfaces and expected outputs. This documentation should be available both in the code comments and in a separate developer document if needed.
+
+──────────────────────────────
+6. SUMMARY OF CHANGES
+
+• __init__:  
+  – Add safety checks for dataset-specific configuration and use a fallback default if needed.  
+  – Document the expected structure for prompt versions and caching keys.
+
+• generate_general_questions:  
+  – Use deterministic selection (via fixed sorting or seeded randomness) to avoid non-determinism and ensure reproducibility.  
+  – Handle cases where available templates are insufficient.
+
+• generate_label_specific_questions:  
+  – Enhance the caching key by including dataset identifier and prompt template version.  
+  – Clearly define and enforce an output format (preferably JSON) in the ChatGPT prompt, and implement robust parsing with validation.  
+  – Introduce a retry mechanism for API failures and more explicit error logging.
+
+• External Utilities:  
+  – Clearly specify the contracts for caching functions and API wrappers to ensure that integration issues are minimized.
+
+By incorporating these revisions, the vqg.py module’s logic becomes more robust, reproducible, and maintainable. The added checks and explicit handling of error states ensure that unexpected inputs or API variability will not lead to silent failures or incorrect downstream behavior in the overall VDC detection pipeline.

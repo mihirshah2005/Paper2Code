@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below are my remarks on the analysis, organized by affected function or area and the severity of each issue:\n\n1. Abstract Method Enforcement in update_schedule  \n • The analysis correctly identifies that update_schedule should be decorated with @abstractmethod. One minor note is that while the analysis states “raise NotImplementedError” inside update_schedule, in practice the @abstractmethod decorator already prevents instantiation without a proper override. (Severity: Low – More of a clarificat",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below are my remarks on the analysis, organized by affected function or area and the severity of each issue:\n\n1. Abstract Method Enforcement in update_schedule  \n • The analysis correctly identifies that update_schedule should be decorated with @abstractmethod. One minor note is that while the analysis states “raise NotImplementedError” inside update_schedule, in practice the @abstractmethod decorator already prevents instantiation without a proper override. (Severity: Low – More of a clarificat",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "all": [
+    {
+      "target_func_name": "apply_sig_trigger",
+      "severity_level": "medium",
+      "critique": "The function description uses the formula v(i, j) = ∆ sin(2πj f/m) without a clear definition of the variable 'm' (e.g., whether it denotes the image width or another dimension). This ambiguity could lead to inconsistency with the original paper’s intended design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_ssba_trigger",
+      "severity_level": "medium",
+      "critique": "The function relies on an undefined 'additional_params' parameter and suggests a potential U-Net implementation without clearly specifying how the configuration file influences these parameters. This could break the planned design if further detail is not provided.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_wanet_trigger",
+      "severity_level": "medium",
+      "critique": "The parameter 'warping_params' is not defined or linked to the configuration file, leaving its implementation vague. This might lead to inconsistencies with the intended attack simulation as described in the paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "init_seed",
+      "severity_level": "medium",
+      "critique": "While the function sets seeds for Python’s random, NumPy, and Torch, it does not mention seeding for torch.cuda (e.g., torch.cuda.manual_seed_all) which could affect reproducibility in GPU-based experiments.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "preprocess_image",
+      "severity_level": "low",
+      "critique": "The function is expected to select normalization and resizing parameters based on dataset names; however, it does not explicitly detail how these parameters are extracted from the configuration file. This could lead to potential mismatches if the config is updated.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "overlay_badnets_trigger",
+      "severity_level": "low",
+      "critique": "The design suggests a hard-coded trigger (a 3×3 white square for CIFAR‑10) rather than dynamically using configuration parameters. This might contradict the intended flexibility of reading dataset‐specific settings from the config file.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_api_cache_key",
+      "severity_level": "low",
+      "critique": "The mechanism for hashing and serializing the input parameters to create a stable key is not detailed. Ambiguities in this implementation could potentially lead to collisions or inconsistencies in the cache.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "apply_sig_trigger",
+      "severity_level": "medium",
+      "critique": "The function description uses the formula v(i, j) = ∆ sin(2πj f/m) without a clear definition of the variable 'm' (e.g., whether it denotes the image width or another dimension). This ambiguity could lead to inconsistency with the original paper’s intended design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_ssba_trigger",
+      "severity_level": "medium",
+      "critique": "The function relies on an undefined 'additional_params' parameter and suggests a potential U-Net implementation without clearly specifying how the configuration file influences these parameters. This could break the planned design if further detail is not provided.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_wanet_trigger",
+      "severity_level": "medium",
+      "critique": "The parameter 'warping_params' is not defined or linked to the configuration file, leaving its implementation vague. This might lead to inconsistencies with the intended attack simulation as described in the paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "init_seed",
+      "severity_level": "medium",
+      "critique": "While the function sets seeds for Python’s random, NumPy, and Torch, it does not mention seeding for torch.cuda (e.g., torch.cuda.manual_seed_all) which could affect reproducibility in GPU-based experiments.",
+      "source": "llm-judge"
+    }
+  ]
+}

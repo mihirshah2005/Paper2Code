@@ -1,0 +1,117 @@
+Below is the revised logic analysis for the “utils.py” module. In this revision we have refined the descriptions to ensure full clarity and robustness—especially in the configuration loading section—while retaining a clear outline of all core functionalities.
+
+──────────────────────────────
+1. Configuration Loading
+
+• Purpose:  
+  – Read the external YAML configuration file (e.g., “config.yaml”) and parse it into a Python dictionary so that all modules (DatasetLoader, Trainer, VDCDetector, etc.) can access hyperparameters and other settings.
+
+• Key Functions:  
+  – load_config(config_file: str) -> dict  
+    ▪ Open the YAML file using a YAML parser (using yaml.safe_load).  
+    ▪ Wrap file I/O operations in a try/except block to catch exceptions such as FileNotFoundError or yaml.YAMLError.  
+    ▪ In case of a missing file or parsing error, log the error using the logging framework. Then, either exit gracefully or revert to a set of default configuration values (if defaults are defined) to ensure the program does not proceed with an undefined configuration.  
+  – (Optionally) reload_config for dynamic configuration updates during debugging or experiment restarts, with similar exception handling and logging.
+
+──────────────────────────────
+2. Random Seed Setup
+
+• Purpose:  
+  – Ensure reproducibility across experiments by setting a fixed random seed.
+
+• Key Functions:  
+  – set_random_seed(seed: int) -> None  
+    ▪ Set the seed for Python’s built-in random module.  
+    ▪ Set np.random.seed(seed) for deterministic NumPy operations.  
+    ▪ Set torch.manual_seed(seed) (and torch.cuda.manual_seed_all if using GPUs) for reproducibility in PyTorch execution.
+
+──────────────────────────────
+3. Logging
+
+• Purpose:  
+  – Provide a consistent logging interface across the experiment to capture runtime events, errors, and key debug information.
+
+• Key Functions:  
+  – init_logger(log_file: Optional[str] = None) -> logging.Logger  
+    ▪ Configure Python’s built-in logging module by setting a specific logging level (e.g., INFO or DEBUG) and a standard message format (including timestamps, log level, and messages).  
+    ▪ If a log file is specified, set up file handlers along with console handlers so that all logging information is persisted alongside real-time debugging output.
+
+──────────────────────────────
+4. Image Preprocessing
+
+• Purpose:  
+  – Convert and transform raw images into the format required by VQA models and other detection modules.
+
+• Key Functions:  
+  – preprocess_image(image: Any, dataset: str) -> torch.Tensor  
+    ▪ Based on the dataset (CIFAR-10, ImageNet-100, or ImageNet-Dog), apply appropriate torchvision transforms including resizing, conversion to tensor, and normalization.  
+    ▪ Ensure that preprocessing is consistent with the requirements of the Instruct-BLIP model (or any other model being used).
+
+──────────────────────────────
+5. Backdoor Attack Trigger Overlay Functions
+
+• Purpose:  
+  – Provide helper functions that inject “dirty” characteristics into clean images to simulate various backdoor attack scenarios as described in the paper.
+
+• Key Functions & Ideas:
+
+  A. BadNets Trigger (Visible Trigger)
+    – overlay_badnets_trigger(image: np.ndarray, dataset: str, patch_size: Optional[Tuple[int,int]] = None) -> np.ndarray  
+      ▪ For CIFAR-10, default to a 3×3 patch; for ImageNet datasets, use a larger patch (e.g., 21×21).  
+      ▪ Locate the lower-right corner of the image and replace that region with a fixed color (for example, a white patch).
+
+  B. Blended Trigger
+    – overlay_blended_trigger(image: np.ndarray, trigger_img: np.ndarray, blend_ratio: float = 0.1) -> np.ndarray  
+      ▪ Resize the trigger image to an appropriate size matching a part of the input image.  
+      ▪ Compute a weighted sum (e.g., (1 - blend_ratio) * image + blend_ratio * trigger_img) and clip the result so that pixel values stay within a valid range.
+
+  C. SIG Trigger (Invisible Trigger)
+    – apply_sig_trigger(image: np.ndarray, delta: float, frequency: float) -> np.ndarray  
+      ▪ Compute a sine signal based on pixel column (or row) indices using the provided delta and frequency.  
+      ▪ Add the computed signal to the image (optionally uniformly across channels) and clip pixel values appropriately.
+
+  D. Other Attacks (TrojanNN, SSBA, WaNet)
+    – Provide placeholder functions (e.g., apply_trojanNN_trigger, apply_ssba_trigger, apply_wanet_trigger) that describe the intended operation.  
+      ▪ For TrojanNN, overlay a predefined trigger (such as an Apple logo) at a fixed location.  
+      ▪ For SSBA and WaNet, note that a simplified version of elastic warping or a neural-network-based simulation might be used if the full implementation is too complex.
+
+──────────────────────────────
+6. API Call Caching
+
+• Purpose:  
+  – Cache responses from external API calls (ChatGPT for question generation/evaluation and Instruct-BLIP for VQA) to minimize redundant API requests, manage rate limits, and improve runtime efficiency.
+
+• Key Functions:  
+  – get_cached_response(key: str) -> Optional[str]  
+    ▪ Check an in-memory or file-based cache for an existing response associated with the provided key.  
+  – cache_response(key: str, response: str) -> None  
+    ▪ Store the API response under the given key in the cache. Optionally persist the cache to a local file for better reusability across runs.  
+  – Provide a caching wrapper function that automatically checks the cache before making a new API call.
+
+──────────────────────────────
+7. Text Utility Functions
+
+• Purpose:  
+  – Normalize and clean textual data to provide a robust input for string matching and evaluation in the VAE module.
+
+• Key Functions:  
+  – clean_text(text: str) -> str  
+    ▪ Convert text to lowercase, strip extra whitespace, and optionally remove punctuation.  
+    ▪ Return the cleaned text to ensure that string matching comparisons in the answer evaluation phase are robust against minor formatting differences.
+
+──────────────────────────────
+8. Integration and Dependencies
+
+• Dependencies:  
+  – numpy, torch, torchvision for numerical operations and image processing.  
+  – yaml (for configuration loading) and logging (for runtime event capture).  
+  – requests (for interacting with API endpoints) to support caching of API responses.
+
+• Integration:  
+  – Other modules (DatasetLoader, VQG, VQA, VAE, Trainer, Evaluation) will import functions from utils.py for tasks such as image preprocessing, trigger injection, logging, configuration loading, random seed setup, and API response caching.  
+  – The configuration data loaded from load_config() will drive other parts of the codebase (e.g., thresholds, question counts, noise ratios) ensuring consistency across experiments.
+
+──────────────────────────────
+Conclusion
+
+This revised “utils.py” module logic analysis outlines the essential helper functions required to support the VDC pipeline. The configuration loading process now explicitly describes error handling using try/except blocks and details recovery mechanisms (such as logging errors or using default values) when configuration files are missing or malformed. Additionally, the analysis clarifies functions for random seed setup, logging, image preprocessing, injecting backdoor triggers for dirty sample simulation, API call caching, and text normalization. These functions collectively ensure that the experimental code is robust, reproducible, and well integrated with the overall system design.

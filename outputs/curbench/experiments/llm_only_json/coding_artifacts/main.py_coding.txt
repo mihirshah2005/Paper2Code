@@ -1,0 +1,293 @@
+```python
+"""main.py
+
+Main entry point for the CurBench experiments.
+This file integrates configuration loading, data preprocessing,
+model instantiation, curriculum scheduling, training, and evaluation.
+The experiments loop over different configurations and reproducibility
+seeds, aggregating the evaluation metrics for each experiment.
+"""
+
+import copy
+import random
+import time
+import logging
+import numpy as np
+import torch
+
+# Import project modules.
+from config import Config
+from dataset_loader import DatasetLoader
+from model import ModelManager
+from curriculum import SimpleCurriculumScheduler
+from trainer import Trainer
+from evaluation import Evaluation
+
+# Set up module-level logging.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+LOGGER = logging.getLogger(__name__)
+
+
+def enforce_determinism(seed: int) -> None:
+    """
+    Enforce full determinism by setting seeds for random, numpy, and torch,
+    and configuring cuDNN appropriately.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    LOGGER.info(f"Determinism enforced with seed: {seed}")
+
+
+class EpochBasedCurriculumScheduler:
+    """
+    Wrapper for a curriculum scheduler that ensures that update_schedule is called only once per epoch.
+    In "epoch" update_mode, the first call for a new epoch triggers the base scheduler update,
+    and subsequent calls return the same result.
+    """
+    def __init__(self, base_scheduler: SimpleCurriculumScheduler):
+        self.base_scheduler = base_scheduler
+        self.last_epoch = None
+        self.last_result = None
+
+    def update_schedule(self, loss: float, epoch: int) -> dict:
+        if epoch != self.last_epoch:
+            # New epoch: call the base scheduler update.
+            self.last_result = self.base_scheduler.update_schedule(loss, epoch)
+            self.last_epoch = epoch
+            LOGGER.info(f"(Epoch mode) Updated scheduler for new epoch {epoch}: {self.last_result}")
+            return self.last_result
+        else:
+            # Same epoch: reuse previous result.
+            return self.last_result
+
+
+def infer_num_classes(domain: str, dataset_identifier: str, data_dict: dict) -> int:
+    """
+    Infers the number of classes for the experiment based on the domain and dataset_identifier.
+    For CV, attempts to use the dataset attribute 'classes'; for NLP and Graph, defaults are provided.
+    """
+    domain = domain.lower()
+    if domain == "cv":
+        test_data = data_dict.get("test", None)
+        if test_data is not None and hasattr(test_data, "classes"):
+            return len(test_data.classes)
+        else:
+            lower_id = dataset_identifier.lower()
+            if "cifar10" in lower_id:
+                return 10
+            elif "cifar100" in lower_id:
+                return 100
+            elif "tinyimagenet" in lower_id:
+                return 200
+            else:
+                return 10  # Default fallback
+    elif domain == "nlp":
+        # For GLUE tasks we assume binary classification as a default.
+        return 2
+    elif domain == "graph":
+        # Many graph tasks (e.g., ogbg-molhiv, TUDataset variants) are binary.
+        return 2
+    else:
+        raise ValueError(f"Unknown domain '{domain}' encountered when inferring number of classes.")
+
+
+def aggregate_results(result_list: list) -> dict:
+    """
+    Aggregates a list of result dictionaries (numeric metrics) into mean and std values.
+
+    Args:
+        result_list (list): List of dictionaries, each containing numeric metric key-values.
+
+    Returns:
+        dict: Aggregated dictionary where for each key, a tuple (mean, std) is provided.
+    """
+    if not result_list:
+        return {}
+    agg = {}
+    keys = result_list[0].keys()
+    for key in keys:
+        values = []
+        for res in result_list:
+            # Only aggregate if the metric is numeric.
+            val = res.get(key)
+            if isinstance(val, (int, float)):
+                values.append(val)
+        if values:
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            agg[key] = (mean_val, std_val)
+    return agg
+
+
+def main():
+    # ---------------------------
+    # 1. Load Global Configuration
+    # ---------------------------
+    config_instance = Config("config.yaml")
+    global_config = config_instance.get_config()
+    LOGGER.info("Global configuration loaded successfully.")
+
+    # Extract curriculum update mode; default to "minibatch" if not provided.
+    curriculum_config = global_config.get("curriculum", {})
+    update_mode = curriculum_config.get("update_mode", "minibatch")
+    if "update_mode" not in curriculum_config:
+        LOGGER.warning("Curriculum update_mode not specified in configuration; defaulting to 'minibatch'.")
+    LOGGER.info(f"Curriculum update_mode set to '{update_mode}'.")
+
+    # ---------------------------
+    # 2. Define Experiment Configurations
+    # ---------------------------
+    # Each experiment configuration includes domain, dataset identifier, and model type.
+    experiments = [
+        {
+            "domain": "cv",
+            "dataset": "cifar10-noise-0.4-imbalance-50",
+            "model": "ResNet-18"
+        },
+        {
+            "domain": "nlp",
+            "dataset": "mrpc-noise-0.2",
+            "model": "BERT"
+        },
+        {
+            "domain": "graph",
+            "dataset": "ogbg-molhiv-noise-0.0",
+            "model": "GCN"
+        }
+    ]
+    LOGGER.info(f"Defined {len(experiments)} experiment configurations.")
+
+    # Retrieve reproducibility seeds.
+    seed_list = global_config.get("reproducibility", {}).get("seeds", [])
+    if not seed_list:
+        LOGGER.error("No reproducibility seeds found in configuration. Exiting.")
+        return
+
+    # Aggregated experiment results container.
+    overall_results = []
+
+    # ---------------------------
+    # 3. Outer Loop: Iterating over Experiment Configurations
+    # ---------------------------
+    for exp_idx, exp_conf in enumerate(experiments):
+        exp_domain = exp_conf["domain"].lower()
+        exp_dataset = exp_conf["dataset"]
+        exp_model_name = exp_conf["model"]
+
+        LOGGER.info(f"Starting Experiment {exp_idx + 1}: Domain='{exp_domain}', Dataset='{exp_dataset}', Model='{exp_model_name}'")
+        seed_results = []
+
+        # ---------------------------
+        # 4. Inner Loop: Iterate over Seeds for Reproducibility
+        # ---------------------------
+        for seed in seed_list:
+            LOGGER.info(f"Starting seed: {seed} for experiment {exp_idx + 1}")
+            # Enforce determinism per seed.
+            enforce_determinism(seed)
+
+            # Create a deep copy of the global configuration for this seed.
+            exp_config = copy.deepcopy(global_config)
+            # Inject the current domain into configuration so that Trainer can pick it up.
+            exp_config["domain"] = exp_domain
+
+            # Initialize DatasetLoader with experiment configuration.
+            try:
+                data_loader = DatasetLoader(exp_config)
+                data_dict = data_loader.load_data(exp_dataset)
+                LOGGER.info(f"Data loaded successfully for dataset '{exp_dataset}'.")
+            except Exception as e:
+                LOGGER.error(f"Error loading dataset '{exp_dataset}' for seed {seed}: {e}")
+                continue
+
+            # Infer number of classes based on domain and dataset.
+            try:
+                num_classes = infer_num_classes(exp_domain, exp_dataset, data_dict)
+                LOGGER.info(f"Inferred number of classes: {num_classes}")
+            except Exception as e:
+                LOGGER.error(f"Error inferring number of classes: {e}")
+                continue
+
+            # Build the model using ModelManager.
+            try:
+                model_manager = ModelManager(exp_config)
+                model = model_manager.build_model(model_name=exp_model_name,
+                                                  domain=exp_domain,
+                                                  num_classes=num_classes)
+                LOGGER.info(f"Model '{exp_model_name}' built successfully for domain '{exp_domain}'.")
+            except Exception as e:
+                LOGGER.error(f"Error building model '{exp_model_name}': {e}")
+                continue
+
+            # Instantiate curriculum scheduler.
+            try:
+                base_scheduler = SimpleCurriculumScheduler(exp_config)
+                if update_mode.lower() == "epoch":
+                    curriculum_scheduler = EpochBasedCurriculumScheduler(base_scheduler)
+                    LOGGER.info("Using epoch-based curriculum update mode.")
+                else:
+                    curriculum_scheduler = base_scheduler
+                    LOGGER.info("Using minibatch-based curriculum update mode.")
+            except Exception as e:
+                LOGGER.error(f"Error initializing curriculum scheduler: {e}")
+                continue
+
+            # Initialize Trainer.
+            try:
+                trainer = Trainer(model=model, data=data_dict, curriculum=curriculum_scheduler, config=exp_config)
+                training_stats = trainer.train()
+                LOGGER.info(f"Training completed for seed {seed}. Stats: {training_stats}")
+            except Exception as e:
+                LOGGER.error(f"Error during training for seed {seed}: {e}")
+                continue
+
+            # Evaluation.
+            try:
+                evaluator = Evaluation(model=model, data=data_dict, config=exp_config)
+                eval_results = evaluator.evaluate()
+                LOGGER.info(f"Evaluation results for seed {seed}: {eval_results}")
+            except Exception as e:
+                LOGGER.error(f"Error during evaluation for seed {seed}: {e}")
+                continue
+
+            # Combine training stats and evaluation results, and record seed.
+            combined_result = {"seed": seed}
+            combined_result.update(training_stats)
+            combined_result.update(eval_results)
+            seed_results.append(combined_result)
+
+        # ---------------------------
+        # 5. Aggregate Results over Seeds for This Experiment
+        # ---------------------------
+        if seed_results:
+            aggregated = aggregate_results(seed_results)
+            LOGGER.info(f"Aggregated results for Experiment {exp_idx + 1}: {aggregated}")
+            overall_results.append({
+                "experiment": exp_conf,
+                "aggregated": aggregated,
+                "individual_results": seed_results
+            })
+        else:
+            LOGGER.warning(f"No successful runs for Experiment {exp_idx + 1}.")
+
+    # ---------------------------
+    # 6. Final Reporting
+    # ---------------------------
+    LOGGER.info("All experiments completed. Final aggregated results:")
+    for exp in overall_results:
+        exp_conf = exp["experiment"]
+        agg = exp["aggregated"]
+        LOGGER.info(f"Experiment (Domain='{exp_conf['domain']}', Dataset='{exp_conf['dataset']}', Model='{exp_conf['model']}'):")
+        for metric, (mean_val, std_val) in agg.items():
+            LOGGER.info(f"    {metric}: Mean = {mean_val:.4f}, Std = {std_val:.4f}")
+
+    # Optionally, write overall_results to a file or further process them.
+    LOGGER.info("CurBench experiments completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
+```

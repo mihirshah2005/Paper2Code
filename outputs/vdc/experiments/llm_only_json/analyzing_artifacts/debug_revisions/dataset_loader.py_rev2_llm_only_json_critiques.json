@@ -1,0 +1,102 @@
+{
+  "all": [
+    {
+      "target_func_name": "DatasetLoader.__init__",
+      "severity_level": "medium",
+      "critique": "The initialization sets a random seed using either a configuration value or a fixed module-level value, but the logic does not clearly specify which configuration key controls this behavior. This ambiguity may lead to inconsistencies if the configuration file expects a different seed setting.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.load_data",
+      "severity_level": "medium",
+      "critique": "The method describes a deterministic selection of ImageNet classes (100 for ImageNet-100, 10 for ImageNet-Dog) without clarifying how these selections reconcile with any class subsets specified in the configuration file. This may break the intended configuration-driven design if users expect custom class selections.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "high",
+      "critique": "There is ambiguity regarding the ordering and exclusivity between poisoning (trigger injection) and noisy label modifications. The analysis mentions both mutually exclusive modifications and a potential hybrid setting without a clear, enforced operation order, which might lead to conflicts and inconsistent experimental setups.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "high",
+      "critique": "The logic for partitioning the training set into disjoint subsets for poisoning and noisy label injection lacks detail on handling edge cases. It is unclear what happens if the number of available samples in a class is insufficient for the desired modifications, potentially breaking reproducibility or causing runtime errors.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Data Augmentation Pipeline",
+      "severity_level": "medium",
+      "critique": "While a separate 'trigger-preserving' pipeline is mentioned to avoid aggressive augmentations on attacked samples, the mechanism for switching pipelines (e.g., through a metadata flag) is not explicitly defined. This gap can lead to accidental application of standard augmentations that may distort the injected trigger.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Utility/Trigger Injection Functions",
+      "severity_level": "low",
+      "critique": "The analysis assumes a set of utility functions in utils.py (like inject_badnets, inject_blended, etc.) with a specified interface. However, these interfaces are not fully defined or validated, which could result in integration issues if the implementations do not match the expected parameter input/output contracts.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The approach for noisy label injection, particularly for asymmetric noise (using a function like (current_label mod K) + 1), is vaguely defined and may not accurately mirror the original paper's procedure. This could lead to methodological inconsistencies.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.load_data",
+      "severity_level": "low",
+      "critique": "Although the process of logging class and sample selections is mentioned for reproducibility, the analysis does not specify how these logs are maintained or accessed for verification, which might hinder thorough post-hoc validation.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Overall Design",
+      "severity_level": "medium",
+      "critique": "The analysis does not address potential issues in distributed or parallel data loading scenarios. Without ensuring that all workers share the same random seed context, reproducibility across multi-worker setups might be compromised.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "DatasetLoader.__init__",
+      "severity_level": "medium",
+      "critique": "The initialization sets a random seed using either a configuration value or a fixed module-level value, but the logic does not clearly specify which configuration key controls this behavior. This ambiguity may lead to inconsistencies if the configuration file expects a different seed setting.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.load_data",
+      "severity_level": "medium",
+      "critique": "The method describes a deterministic selection of ImageNet classes (100 for ImageNet-100, 10 for ImageNet-Dog) without clarifying how these selections reconcile with any class subsets specified in the configuration file. This may break the intended configuration-driven design if users expect custom class selections.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "high",
+      "critique": "There is ambiguity regarding the ordering and exclusivity between poisoning (trigger injection) and noisy label modifications. The analysis mentions both mutually exclusive modifications and a potential hybrid setting without a clear, enforced operation order, which might lead to conflicts and inconsistent experimental setups.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "high",
+      "critique": "The logic for partitioning the training set into disjoint subsets for poisoning and noisy label injection lacks detail on handling edge cases. It is unclear what happens if the number of available samples in a class is insufficient for the desired modifications, potentially breaking reproducibility or causing runtime errors.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Data Augmentation Pipeline",
+      "severity_level": "medium",
+      "critique": "While a separate 'trigger-preserving' pipeline is mentioned to avoid aggressive augmentations on attacked samples, the mechanism for switching pipelines (e.g., through a metadata flag) is not explicitly defined. This gap can lead to accidental application of standard augmentations that may distort the injected trigger.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The approach for noisy label injection, particularly for asymmetric noise (using a function like (current_label mod K) + 1), is vaguely defined and may not accurately mirror the original paper's procedure. This could lead to methodological inconsistencies.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Overall Design",
+      "severity_level": "medium",
+      "critique": "The analysis does not address potential issues in distributed or parallel data loading scenarios. Without ensuring that all workers share the same random seed context, reproducibility across multi-worker setups might be compromised.",
+      "source": "llm-judge"
+    }
+  ]
+}

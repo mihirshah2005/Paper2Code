@@ -1,0 +1,57 @@
+Below is the revised logic analysis for dataset_loader.py that addresses the critiques regarding parameter selection in __init__, the consistent filtering mechanism for ImageNet subsets in load_data, and the clear handling of mutually exclusive versus hybrid dirty sample injections in inject_dirty_samples.
+
+──────────────────────────────
+1. DatasetLoader.__init__
+
+• Upon initialization, the DatasetLoader class receives a configuration dictionary (from config.yaml) containing all necessary parameters.  
+• For poisoning parameters—such as the option to inject 50 or 500 poisoned samples per class for CIFAR-10—the class now expects an additional, explicitly defined parameter (for example, "poisoning_level") in the configuration or as a separate argument.  
+  - This parameter may be set to a value like "low" or "high" (or directly 50 or 500) for CIFAR-10.  
+  - The __init__ method will validate that the value chosen lies within the accepted set of options (e.g., for CIFAR-10, only 50 and 500 are permitted).  
+  - Similar explicit selections will be verified for ImageNet-100 if multiple options are provided.  
+• This clear validation step ensures that the DatasetLoader’s internal state is consistent with the experimental setup and avoids ambiguity over which poisoning level is used.
+
+──────────────────────────────
+2. load_data
+
+• This function loads the datasets (CIFAR-10, ImageNet-100, and ImageNet-Dog) using torchvision.  
+• For CIFAR-10, the standard train/test splits and transforms (conversion to tensor, normalization, etc.) are applied.  
+• For ImageNet-100 and ImageNet-Dog, the following filtering mechanism is now adopted consistently:
+  - After loading data via ImageFolder, group samples by their class label.
+  - For each class in the training set, use a fixed random seed to perform random sampling—select exactly the required number of samples (e.g., 500 for training and 100 for testing for ImageNet-100, and 800/200 respectively for ImageNet-Dog).  
+  - By committing to a fixed random sampling method (rather than an inconsistent approach or simple slicing), reproducibility is maintained.
+• The resulting clean splits, with the exact number of samples per class, are stored in a structured dictionary (e.g., with keys "train" and "test") so that downstream modules receive consistent data.
+
+──────────────────────────────
+3. inject_dirty_samples
+
+• This function modifies the clean training data to inject dirty samples. Two types of corruptions are applied: poisoned sample injection (backdoor triggers) and noisy label injection.
+  
+A. Mutually Exclusive Injection by Default  
+  - The implementation now explicitly states that by default a sample selected for poisoning will not be considered for noisy label modification.  
+  - The process first groups training samples by class and then splits the samples into two mutually exclusive groups:
+     ▪ Group 1: Samples selected for poisoning (the number of samples per class is determined based on the validated selection from the config, such as 50 or 500 for CIFAR-10).
+     ▪ Group 2: All remaining samples, which are then eligible for noisy label injection.
+  - This ordering ensures no overlapping modifications occur, thereby eliminating the risk of a poisoned sample also having its label flipped via noise injection.
+
+B. Hybrid Dirty Samples (Optional Case)  
+  - If an experiment is designed to include hybrid dirty samples (i.e., both backdoor poisoning and noisy labels applied to the same sample), this should be enabled explicitly via a dedicated flag in the configuration.  
+  - When the hybrid flag is set, the code will follow a clearly defined order (for example, applying the poisoning trigger first, then performing the noisy label injection on the already poisoned sample) and will log this behavior.  
+  - Such behavior is clearly documented and separated from the default mutually exclusive modification routine so that experimental setups remain consistent and reproducible.
+
+C. Integration with Utility Functions  
+  - The injection function uses well-specified utility functions from utils.py (e.g., utils.inject_badnets_trigger(), utils.inject_sig_trigger(), etc.).  
+  - The analysis now clearly indicates that each backdoor attack type must have its dedicated injection utility with a defined API (inputs include the image and associated parameters).  
+  - If a required utility function is missing or its parameters are out-of-spec, the function will log an error message, ensuring that developers are alerted to any inconsistency with the paper’s experimental setup.
+
+• Finally, the function returns the modified training dataset—along with detailed metadata or logs describing which samples were altered and by which method—to ensure full traceability and reproducibility.
+
+──────────────────────────────
+Conclusion
+
+This revised analysis now resolves the previous ambiguities by:
+• Clearly defining how the poisoning parameter is selected and validated in __init__ using an explicit extra flag or parameter.
+• Committing to a consistent random sampling method (with a fixed seed) for filtering ImageNet-100 and ImageNet-Dog samples.
+• Outlining a well-defined processing order in inject_dirty_samples to guarantee that, by default, poisoning and noisy label injections remain mutually exclusive—while still allowing for a clearly documented hybrid mode if required.
+• Integrating with utility functions that implement the backdoor trigger injections in a clear, audited fashion.
+
+This logic analysis should now provide a robust blueprint for implementing dataset_loader.py in a way that maintains consistency with the paper and the experimental configuration.

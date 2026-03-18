@@ -1,0 +1,125 @@
+Below is the revised logic analysis for main.py that incorporates the additional details required by the latest critiques:
+
+──────────────────────────────
+1. Load and Parse Configuration
+
+• Read and parse the configuration file (config.yaml) into a Python dictionary.  
+  – This configuration includes all parameters for training (e.g., learning rate, batch size, training steps, EMA decay), model details (patch size, maximum token length, transformer specifics such as “2D RoPE”, “Masked MHSA”, and “SwiGLU”), diffusion settings (noise schedule type such as DDPM and number of sampling steps), data processing (resize area and augmentation), and the resolution extrapolation configuration (list of methods and scale factor formula).  
+  – With this central configuration, all subsequent modules operate consistently and reproducibly with the FiT paper specifications.
+
+──────────────────────────────
+2. Initialize the DatasetLoader
+
+• Instantiate DatasetLoader with the configuration.  
+  – Its responsibility is to read the dataset (e.g., ImageNet) and apply generic image transformations: resizing images so that the image area does not exceed 256×256, and applying horizontal flip augmentation.  
+  – Importantly, the DatasetLoader only returns raw image tensors in a PyTorch DataLoader; it does not handle model-specific preprocessing like VAE encoding or patchification.
+
+• Call load_data() to produce a DataLoader yielding batches of raw images.
+
+──────────────────────────────
+3. Instantiate the Model Component
+
+• Create the Model instance using model-specific parameters from the configuration. The Model class encapsulates:
+  – Integration with a pretrained VAE from “huggingface/stabilityai/sd-vae-ft-ema”.  
+     ▸ Call Model.load_pretrained_vae(vae_path) immediately after instantiation.
+     ▸ Crucially, once the pretrained VAE weights are loaded, they must be frozen (i.e. set to not update during training), ensuring that the VAE’s learned representations remain intact per the FiT methodology.
+  – VAE encoding of raw images, performed inside the Model pipeline (thus keeping DatasetLoader generic).  
+  – Patchification of VAE latent codes using the provided patch size (p = 2) to create variable-length token sequences. These sequences are padded dynamically to a fixed maximum length (L_max = 256).
+  – Construction of the FiT transformer backbone which integrates:
+     ▸ 2D RoPE (for positional embeddings) and, if applicable, its decoupled implementation.
+     ▸ Masked MHSA, including internal computation of an attention mask that assigns “real” tokens a neutral value (e.g., 0) and padded tokens negative infinity so they are ignored.
+     ▸ Replacement of the standard MLP in each FFN with a SwiGLU block as specified in the config.
+  – Encapsulation of resolution extrapolation logic to support methods such as PI, EI, NTK, YaRN, VisionNTK, and VisionYaRN.  
+     ▸ The method selection and parameterization (e.g., for YaRN using α=1, β=32) are determined by the configuration’s extrapolation section, along with the scale factor computed as max(max(H_test, W_test)/L_train, 1.0).
+
+──────────────────────────────
+4. Setup the Trainer and Commence Training
+
+• Instantiate the Trainer with:
+  – The Model instance.
+  – The DataLoader from DatasetLoader (providing raw images).
+  – The full configuration dictionary.
+
+• Inside Trainer.train, several key aspects must be carefully implemented:
+
+  A. Diffusion Noise Schedule and Loss Computation  
+     – Implement the DDPM-based noise schedule as specified in the configuration. For each training batch:
+         ▸ Sample a random diffusion timestep t for every image sample in the batch.
+         ▸ Generate noise for each latent token from a Gaussian distribution, where the variance is governed by the noise schedule parameters (e.g., alpha and beta values defined in the DDPM schedule).
+         ▸ Inject the generated noise into the latent representations obtained via the VAE encoder (after patchification) to simulate the forward diffusion process.
+         ▸ Compute the diffusion process loss by comparing the model’s prediction (typically the estimated noise) with the true generated noise, using a mean squared error (MSE) loss computed only over “real” (non-padded) tokens.
+
+  B. Attention Mask Computation  
+     – Within the forward pass of the transformer (executed by the Model), compute an attention mask that clearly distinguishes between real tokens and padded tokens.  
+         ▸ The mask is applied such that valid tokens contribute to the softmax (with neutral values like 0) and padded tokens are assigned a very negative value (e.g., -∞) to nullify their contributions.
+         ▸ This mask must be broadcast correctly across all transformer attention layers (Masked MHSA) to make sure that the loss and gradient flows only involve valid tokens.
+
+• Update model parameters using the AdamW optimizer (learning rate 1e-4, with zero weight decay) and update the EMA of weights with a decay rate of 0.9999.  
+• Enable periodic checkpoint saving and log training statistics such as loss values and token utilization.
+
+• Finally, invoke the train() method to begin training, ensuring that diffusion noise injection and mask application conform exactly to the FiT paper’s methodology.
+
+──────────────────────────────
+5. Evaluation and Inference
+
+• After training, instantiate the Evaluation class by providing:
+  – The trained Model instance (with pretrained VAE frozen and EMA weights loaded).
+  – An appropriate evaluation DataLoader (or the same DataLoader used for training, if applicable).
+  – The configuration dictionary.
+
+• In Evaluation.evaluate, carry out the following:
+
+  A. Diffusion Sampling and Image Generation  
+     – Load and use the EMA weights from the Model.
+     – Implement the inference procedure that begins by sampling a set of noisy latent tokens from a Gaussian distribution—matching the number required by the desired output resolution.
+     – For K = 250 diffusion steps (or as specified in configuration), use the model’s forward pass (which now also applies the diffusion denoising mechanism) to iteratively reduce noise.
+     – After completing the denoising iterations, “unpatchify” the latent tokens using a predefined positional map and pass them through the VAE decoder to reconstruct the final image.
+
+  B. Resolution Extrapolation Handling  
+     – Read the extrapolation methods from the configuration (extrapolation.methods). Based on the specified method(s) (e.g., PI, EI, NTK, YaRN, VisionNTK, VisionYaRN), select and parameterize the interpolation technique accordingly.  
+         ▸ For example, if “YaRN” is specified, parameterize the method with α=1, β=32, and apply the corresponding scaling.
+         ▸ Compute the scale factor as max(max(H_test, W_test)/L_train, 1.0) as provided in the configuration, to correctly adjust the positional embeddings for out-of-distribution resolutions.
+         ▸ This explicit selection ensures that the evaluation procedure adheres to the experimental setup in the FiT paper.
+
+  C. Metrics Computation  
+     – Use the generated images to compute evaluation metrics such as FID, sFID, Inception Score (IS), Precision, and Recall.  
+         ▸ Although the FiT paper references the TensorFlow ADM evaluation module for FID computation, make sure either an equivalent evaluation is carried out or document the differences clearly.
+  
+• Call evaluate() to perform inference and then log or print the computed metrics and (optionally) display sample generated images.
+
+──────────────────────────────
+6. Overall Module Interface and Integration
+
+• The main.py file will coordinate the following clearly defined module interfaces:
+   – DatasetLoader.load_data returns a DataLoader that yields raw image tensors (without any VAE encoding or patchification).
+   – Model.forward internally handles VAE encoding, patchification, transformer processing (including 2D RoPE, Masked MHSA, and SwiGLU), and the integration of any diffusion process steps.
+   – Model.load_pretrained_vae is responsible for loading and freezing pretrained VAE weights.
+   – Trainer.train implements the noise schedule, diffusion noise injection at every timestep, attention mask computation, and loss calculation over non-padded tokens.
+   – Evaluation.evaluate handles the inference pipeline, resolution extrapolation selection and parameterization, and metric calculations.
+  
+• These well-defined interfaces ensure that even if individual module implementations evolve, the overall integration remains consistent with the FiT methodology.
+
+──────────────────────────────
+7. Summary of Revised Program Flow
+
+The revised workflow in main.py is as follows:
+  1. Load the configuration from config.yaml.
+  2. Instantiate DatasetLoader and call load_data() to obtain a DataLoader of raw images.
+  3. Create the Model instance, including:
+     ▸ Calling load_pretrained_vae(vae_path) and freezing the VAE parameters.
+     ▸ Handling VAE encoding, patchification, and transformer processing with FiT modifications.
+  4. Instantiate Trainer with the Model, raw DataLoader, and configuration.  
+     ▸ Inside Trainer.train, implement detailed steps for the diffusion noise schedule (sampling noise per timestep, injecting noise into latent representations) and computing the loss based on valid tokens only (using attention masks).
+  5. After training, instantiate Evaluation with the Model, evaluation DataLoader, and configuration.  
+     ▸ In Evaluation.evaluate, execute the diffusion sampling process for image generation and clearly select, parameterize, and apply a resolution extrapolation method (based on the configuration’s methods and scale factor) before computing evaluation metrics.
+  6. Log and display final evaluation metrics along with sample images to confirm adherence to the FiT experimental setup.
+
+──────────────────────────────
+Note on Reproducibility and Fidelity
+
+• Freezing the pretrained VAE after loading is critical to preserve its learned representation, and this action is explicitly mentioned in Model.load_pretrained_vae.  
+• The diffusion noise scheduling process is clarified with detailed steps for sampling noise at each timestep and integrating it into the loss function, ensuring consistency with the FiT paper.  
+• The selection and parameterization of resolution extrapolation methods are now clearly driven by configuration parameters, thus removing any ambiguity in reproducing the experimental results.  
+• Finally, keeping each component’s responsibilities modular—and clearly defining their interfaces—ensures smooth integration and reproducibility of the FiT methodology.
+
+This revised logic analysis should now comprehensively address all the raised critiques for main.py while guiding a faithful implementation based on the FiT paper.

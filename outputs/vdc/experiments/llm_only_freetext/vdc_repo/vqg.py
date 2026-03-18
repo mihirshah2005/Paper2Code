@@ -1,0 +1,195 @@
+"""
+vqg.py
+
+This module implements the Visual Question Generation (VQG) class as part of the VDC system.
+It provides methods to generate two types of questions for a given label:
+  1. General questions based on fixed templates.
+  2. Label-specific questions generated via an API call to ChatGPT (gpt-3.5-turbo).
+
+The VQG class uses caching to avoid redundant API calls, applies robust error handling with
+exponential backoff for API requests, and logs warning messages when the available number of
+templates is fewer than configured.
+"""
+
+import logging
+import time
+import random
+from typing import List, Dict, Any
+
+import openai
+
+from utils import get_cached_response, cache_response, clean_text, init_logger
+
+# Configure the logger for this module.
+LOGGER = init_logger()
+
+
+class VQG:
+    """
+    Visual Question Generation (VQG) module for VDC.
+
+    Attributes:
+        general_templates (List[str]): A list of fixed general question templates.
+        general_count (int): The number of general questions to return.
+        label_specific_prompt_template (str): Prompt template used for label-specific question generation.
+        label_specific_count (int): The desired number of label-specific questions.
+        dataset_name (str): Name of the dataset (e.g., "CIFAR-10", "ImageNet-100", "ImageNet-Dog").
+        chatgpt_model (str): Model name for ChatGPT API (default "gpt-3.5-turbo").
+        max_retries (int): Maximum number of retries for API calls.
+        initial_backoff (float): Initial backoff interval in seconds for exponential backoff.
+    """
+
+    def __init__(self, templates: List[str], labelPrompts: Dict[str, Any]) -> None:
+        """
+        Initialize the VQG instance with fixed general question templates and label-specific prompt settings.
+
+        Args:
+            templates (List[str]): Fixed list of general question templates.
+            labelPrompts (Dict[str, Any]): Dictionary containing:
+                - "dataset": (str) Name of the dataset (default "CIFAR-10").
+                - "prompt_template": (str) Template for generating label-specific questions.
+                  The template should include placeholders '{num}' for number of questions and '{label}' for the label.
+                - "general_count": (int) Number of general questions to select (default 2).
+                - "label_specific_count": (int) Number of label-specific questions to generate (default 4).
+                - Optionally, "chatgpt_model": (str) ChatGPT model to use (default "gpt-3.5-turbo").
+        """
+        # Set default values if not provided in labelPrompts
+        self.dataset_name: str = labelPrompts.get("dataset", "CIFAR-10")
+        self.label_specific_prompt_template: str = labelPrompts.get(
+            "prompt_template",
+            "Please generate {num} visual questions for the label '{label}' to verify if the label is correct. "
+            "The questions should be phrased such that a correct image would likely yield a 'yes' answer."
+        )
+        self.general_count: int = labelPrompts.get("general_count", 2)
+        self.label_specific_count: int = labelPrompts.get("label_specific_count", 4)
+        self.general_templates: List[str] = templates if templates else [
+            "Describe the image briefly.",
+            "Describe the image in detail."
+        ]
+
+        self.chatgpt_model: str = labelPrompts.get("chatgpt_model", "gpt-3.5-turbo")
+        self.max_retries: int = 3
+        self.initial_backoff: float = 1.0
+
+        LOGGER.info("Initialized VQG for dataset '%s' with %d general questions and %d label-specific questions.",
+                    self.dataset_name, self.general_count, self.label_specific_count)
+
+    def generate_general_questions(self, label: str) -> List[str]:
+        """
+        Generate a list of general questions based on fixed templates.
+
+        Args:
+            label (str): The label of the image (not used in generation for general questions).
+
+        Returns:
+            List[str]: A list of general questions.
+        """
+        # Select a deterministic subset of the fixed general templates.
+        available_templates: List[str] = self.general_templates
+        if len(available_templates) < self.general_count:
+            LOGGER.warning("Requested %d general questions but only %d templates available.",
+                           self.general_count, len(available_templates))
+            selected_questions = available_templates.copy()
+        else:
+            # Deterministically select the first "general_count" templates.
+            selected_questions = available_templates[: self.general_count]
+        # Clean and return the questions.
+        cleaned_questions = [clean_text(q) for q in selected_questions]
+        LOGGER.info("Generated %d general questions for label '%s'.", len(cleaned_questions), label)
+        return cleaned_questions
+
+    def generate_label_specific_questions(self, label: str) -> List[str]:
+        """
+        Generate label-specific questions using the ChatGPT API.
+
+        This method first checks a cache for pre-generated questions. If not cached,
+        it constructs a prompt using the label-specific prompt template, calls the ChatGPT API
+        with a retry mechanism, and then processes the API response into a list of questions.
+
+        Args:
+            label (str): The label of the image for which to generate questions.
+
+        Returns:
+            List[str]: A list of label-specific questions.
+        """
+        cache_key: str = f"label_specific_{self.dataset_name}_{label}"
+        cached_result: str = get_cached_response(cache_key)
+        if cached_result:
+            # Assume the cached result is stored as a newline-separated string.
+            cached_questions: List[str] = [clean_text(q) for q in cached_result.split("\n") if q.strip()]
+            LOGGER.info("Retrieved %d cached label-specific questions for label '%s'.",
+                        len(cached_questions), label)
+            return cached_questions
+
+        # Construct the prompt using the template.
+        prompt: str = self.label_specific_prompt_template.format(num=self.label_specific_count, label=label)
+        LOGGER.info("Generating label-specific questions for label '%s' with prompt: %s", label, prompt)
+
+        attempt: int = 0
+        response_text: str = ""
+        backoff: float = self.initial_backoff
+
+        while attempt < self.max_retries:
+            try:
+                response = openai.ChatCompletion.create(
+                    model=self.chatgpt_model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant specialized in generating precise visual questions."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=150
+                )
+                # Parse the returned message.
+                response_text = response.choices[0].message.content.strip()
+                if response_text:
+                    LOGGER.info("Successfully generated label-specific questions for label '%s'.", label)
+                    break
+            except Exception as e:
+                attempt += 1
+                LOGGER.error("API call failed on attempt %d for label '%s' with error: %s", attempt, label, e)
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+
+        # If no valid response obtained after retries, use fallback.
+        if not response_text:
+            LOGGER.error("Failed to generate label-specific questions for label '%s' after %d attempts. Using fallback questions.",
+                         label, self.max_retries)
+            fallback_question = f"Is the object in the image a {label}?"
+            fallback_questions = [fallback_question for _ in range(self.label_specific_count)]
+            # Cache fallback result.
+            cache_response(cache_key, "\n".join(fallback_questions))
+            return [clean_text(q) for q in fallback_questions]
+
+        # Process the response text.
+        # Assume the response may contain numbered questions or separated by line breaks.
+        raw_questions = response_text.split("\n")
+        # Filter and clean the questions.
+        final_questions: List[str] = []
+        for line in raw_questions:
+            # Remove numbering if exists (e.g., "1. ", "2) " etc.)
+            cleaned_line = line.strip()
+            if not cleaned_line:
+                continue
+            # Remove any leading numbering characters.
+            if cleaned_line[0].isdigit():
+                # Find the first non-digit non-punctuation character.
+                split_parts = cleaned_line.split(maxsplit=1)
+                if len(split_parts) > 1:
+                    cleaned_line = split_parts[1]
+            cleaned_line = clean_text(cleaned_line)
+            if cleaned_line:
+                final_questions.append(cleaned_line)
+
+        # Ensure that we have at least the number of questions requested.
+        if len(final_questions) < self.label_specific_count:
+            LOGGER.warning("Only %d label-specific questions generated for label '%s', expected %d.",
+                           len(final_questions), label, self.label_specific_count)
+        else:
+            # In case more questions are generated, select the first "label_specific_count" items.
+            final_questions = final_questions[: self.label_specific_count]
+
+        # Cache the resulting questions as a newline separated string.
+        cache_response(cache_key, "\n".join(final_questions))
+        LOGGER.info("Generated %d label-specific questions for label '%s'.", len(final_questions), label)
+        return final_questions

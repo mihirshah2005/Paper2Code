@@ -1,0 +1,46 @@
+----------------------------------------
+[Required packages]
+- numpy==1.21.0
+- torch==1.9.0
+- torchvision==0.10.0
+- transformers==4.30.0
+- torch-geometric==2.0.4
+- scikit-learn==0.24.0
+- matplotlib==3.4.2
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['config.py', 'Config class to load and manage experiment configuration parameters (hyperparameters, dataset paths, training settings, curriculum method parameters). This file is imported by all other modules to ensure consistency.']
+- ['dataset_loader.py', 'DatasetLoader class handles loading and preprocessing of data for CV, NLP, and graph domains. Includes methods load_data() to download and split datasets, apply_noise() to inject label noise, and apply_imbalance() to create long-tailed distributions. Depends on torch, torchvision, transformers (for NLP), and torch-geometric.']
+- ['model.py', 'ModelManager class defines and builds backbone models based on domain. Contains methods to instantiate models (LeNet, ResNet-18, ViT for CV; LSTM, BERT, GPT2 for NLP; GCN, GAT, GIN for Graph). Uses PyTorch modules and Hugging Face Transformers. Adjusts input and output layers based on dataset properties.']
+- ['curriculum.py', 'CurriculumScheduler abstract class defines the interface for curriculum learning strategies. Concrete subclasses implement specific methods (e.g., Self-Paced Learning (SPL), TTCL, loss reweighting methods). Provides methods such as update_schedule(loss: float, epoch: int) to compute data weights or selection criteria. Imports necessary math and PyTorch functions.']
+- ['trainer.py', 'Trainer class encapsulates the training loop. Initializes the model, optimizer, loss function, and integrates the CurriculumScheduler to adjust training dynamics based on current loss and epoch. Responsible for running training epochs, logging training progress, and tracking GPU time/memory usage. Dependent on dataset_loader, model, curriculum, and config.']
+- ['evaluation.py', 'Evaluation class defines the evaluation logic. Implements methods to perform forward passes through the trained model to compute performance metrics (accuracy, F1 score, correlations, AUC) based on domain-specific criteria. Uses functions from scikit-learn and PyTorch. Outputs a summary dictionary of metrics.']
+- ['main.py', 'Main entry point that ties together configuration, data loading, model building, curriculum scheduler instantiation, training, and evaluation. Orchestrates experiment runs with multiple seeds for reproducibility and logs final outputs. Depends on all previously mentioned modules.']
+
+----------------------------------------
+[Task list]
+- config.py
+- dataset_loader.py
+- model.py
+- curriculum.py
+- trainer.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+A common configuration (in config.py) is shared across all modules to ensure consistent hyperparameters, random seed settings, and logging. Utility functions for data preprocessing (e.g., splitting, noise injection, imbalance creation) and reproducibility (e.g., seed setting) are shared across dataset_loader.py and trainer.py. All modules adhere to standard PyTorch module design for ease of integration.
+
+----------------------------------------
+[Anything UNCLEAR]
+Clarification is needed on the exact hyperparameter values for the curriculum learning scheduler (e.g., warm epochs, growth factors, meta-network architectures) and the standardized data format for NLP and graph datasets.
+

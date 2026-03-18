@@ -1,0 +1,304 @@
+"""
+trainer.py
+
+This module implements the Trainer class that retrains a ResNet-18 classifier on a purified dataset.
+It uses hyperparameters specified in the configuration file "config.yaml" to set up the training process,
+including optimizer defaults (momentum=0.9 and weight_decay=5e-4), learning rate scheduling (MultiStepLR),
+and logging of per-epoch training loss and accuracy.
+
+The learning rate scheduler is updated at the end of each epoch so that milestone epochs affect the subsequent epoch.
+The final model state is saved to "trained_model.pth".
+
+The Trainer class is defined as:
+    class Trainer:
+        + __init__(model: Any, train_dataset: torch.utils.data.Dataset, dataset_name: str, config: Optional[Dict[str, Any]] = None)
+        + train() -> None
+"""
+
+import os
+import logging
+import time
+from typing import Any, Dict, Optional, List
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import MultiStepLR
+from torch.utils.data import DataLoader, Dataset
+import torchvision.models as models
+import yaml
+
+# Import configuration and seed setting from utils
+from utils import load_config, set_random_seed
+
+# Set up logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+
+class Trainer:
+    """
+    Trainer class for training a classifier (ResNet-18) on the purified dataset.
+
+    Attributes:
+        model (nn.Module): The ResNet-18 classifier model.
+        train_dataset (Dataset): The purified training dataset.
+        dataset_name (str): Name of the dataset (e.g., "CIFAR-10", "ImageNet-100", "ImageNet-Dog").
+        config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        epochs (int): Number of training epochs.
+        learning_rate (float): Base learning rate.
+        batch_size (int): Batch size for training.
+        momentum (float): Momentum for the SGD optimizer (default 0.9 if not provided).
+        weight_decay (float): Weight decay for the optimizer (default 5e-4 if not provided).
+        lr_milestones (List[int]): Milestones (epochs) for learning rate decay.
+        gamma (float): Learning rate decay factor (default 0.1).
+        device (torch.device): Training device (cuda or cpu).
+        data_loader (DataLoader): DataLoader constructed from the purified training dataset.
+        criterion (nn.Module): Loss function (CrossEntropyLoss).
+        optimizer (optim.Optimizer): SGD optimizer.
+        scheduler (MultiStepLR): Learning rate scheduler.
+        history_loss (List[float]): Accumulated epoch losses.
+        history_accuracy (List[float]): Accumulated epoch accuracies.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        train_dataset: Dataset,
+        dataset_name: str,
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Initializes the Trainer with the ResNet-18 model, purified training data, and training hyperparameters.
+
+        Args:
+            model (nn.Module): The classifier model (e.g., ResNet-18).
+            train_dataset (Dataset): The purified training dataset.
+            dataset_name (str): The dataset identifier ("CIFAR-10", "ImageNet-100", or "ImageNet-Dog").
+            config (Optional[Dict[str, Any]]): Configuration dictionary loaded from config.yaml.
+                If None, the configuration is loaded from "config.yaml" in the current directory.
+        """
+        # Load configuration from config.yaml if not provided.
+        if config is None:
+            config_path: str = os.path.join(os.getcwd(), "config.yaml")
+            config = load_config(config_path)
+            logger.info(f"Configuration loaded from {config_path}.")
+
+        self.config: Dict[str, Any] = config
+
+        # Set random seed for reproducibility
+        set_random_seed(42)
+
+        # Extract training hyperparameters from configuration.
+        training_config: Dict[str, Any] = self.config.get("training", {})
+        self.epochs: int = training_config.get("epochs", 100)
+        self.learning_rate: float = training_config.get("learning_rate", 0.1)
+
+        # Retrieve batch size for the dataset; if not provided, use defaults.
+        batch_size_dict: Dict[str, int] = training_config.get("batch_size", {"CIFAR-10": 128, "ImageNet-100": 64, "ImageNet-Dog": 64})
+        self.batch_size: int = batch_size_dict.get(dataset_name, 64)
+
+        # Retrieve learning rate scheduler milestones from lr_decay_schedule.
+        lr_decay_schedule: Dict[str, List[Dict[str, Any]]] = training_config.get("lr_decay_schedule", {
+            "CIFAR-10": [{"epoch": 50}, {"epoch": 75}],
+            "ImageNet-100": [{"epoch": 30}, {"epoch": 60}],
+            "ImageNet-Dog": [{"epoch": 30}, {"epoch": 60}]
+        })
+        schedule_for_dataset: List[Dict[str, Any]] = lr_decay_schedule.get(dataset_name, [])
+        # Extract milestone values.
+        self.lr_milestones: List[int] = [int(item.get("epoch", 0)) for item in schedule_for_dataset]
+        # Gamma: decay factor; default to 0.1.
+        self.gamma: float = training_config.get("lr_decay_gamma", 0.1)
+
+        # Retrieve optimizer specific hyperparameters; use defaults if not provided.
+        self.momentum: float = training_config.get("momentum", 0.9)
+        self.weight_decay: float = training_config.get("weight_decay", 5e-4)
+
+        # Set device to GPU if available.
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(self.device)
+        self.model: nn.Module = model
+
+        # Create DataLoader for training dataset.
+        self.data_loader: DataLoader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+
+        # Initialize loss function.
+        self.criterion: nn.Module = nn.CrossEntropyLoss()
+
+        # Initialize optimizer (SGD) with parameters.
+        self.optimizer: optim.Optimizer = optim.SGD(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay
+        )
+
+        # Initialize learning rate scheduler.
+        self.scheduler: MultiStepLR = MultiStepLR(
+            self.optimizer,
+            milestones=self.lr_milestones,
+            gamma=self.gamma
+        )
+
+        # Log detailed configuration.
+        logger.info("Trainer initialized with the following hyperparameters:")
+        logger.info(f"Dataset: {dataset_name}")
+        logger.info(f"Epochs: {self.epochs}")
+        logger.info(f"Learning Rate: {self.learning_rate}")
+        logger.info(f"Batch Size: {self.batch_size}")
+        logger.info(f"Momentum: {self.momentum}")
+        logger.info(f"Weight Decay: {self.weight_decay}")
+        logger.info(f"LR Scheduler Milestones: {self.lr_milestones} (Gamma: {self.gamma})")
+        logger.info(f"Device: {self.device}")
+
+        # Initialize logging structures.
+        self.history_loss: List[float] = []
+        self.history_accuracy: List[float] = []
+
+    def train(self) -> None:
+        """
+        Trains the classifier on the purified training dataset.
+
+        The training loop performs the following steps for each epoch:
+          1. Set the model to training mode.
+          2. Iterate over DataLoader batches:
+             a. Load images and labels and move them to the device.
+             b. Zero optimizer gradients.
+             c. Forward pass through the model and compute the loss using CrossEntropy.
+             d. Backward pass and update model parameters.
+             e. Accumulate batch loss and correct predictions.
+          3. Compute average epoch loss and accuracy.
+          4. Log epoch metrics and current learning rate.
+          5. Step the learning rate scheduler (affecting subsequent epochs).
+          6. Save the trained model state when training completes.
+
+        The scheduler.step() is explicitly called at the end of each epoch so that any milestone (e.g., epoch 50)
+        affects only the following epoch, following standard PyTorch MultiStepLR usage.
+        """
+        total_epochs: int = self.epochs
+        logger.info("Starting training...")
+        for epoch in range(total_epochs):
+            self.model.train()
+            epoch_loss: float = 0.0
+            total_correct: int = 0
+            total_samples: int = 0
+
+            start_time: float = time.time()
+            for batch_idx, (images, labels) in enumerate(self.data_loader):
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                # Zero gradients.
+                self.optimizer.zero_grad()
+
+                # Forward pass.
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
+
+                # Backward pass and optimizer step.
+                loss.backward()
+                self.optimizer.step()
+
+                # Update loss and accuracy counters.
+                batch_size_actual = images.size(0)
+                epoch_loss += loss.item() * batch_size_actual
+                _, predicted = torch.max(outputs, dim=1)
+                total_correct += (predicted == labels).sum().item()
+                total_samples += batch_size_actual
+
+            # Compute average loss and accuracy for this epoch.
+            avg_loss: float = epoch_loss / total_samples if total_samples > 0 else 0.0
+            accuracy: float = total_correct / total_samples if total_samples > 0 else 0.0
+
+            # Log current learning rate from optimizer.
+            current_lr: float = self.optimizer.param_groups[0]['lr']
+            elapsed_time: float = time.time() - start_time
+            logger.info(
+                f"Epoch [{epoch + 1}/{total_epochs}] - Loss: {avg_loss:.4f}, Accuracy: {accuracy * 100:.2f}%, LR: {current_lr:.6f}, Time: {elapsed_time:.2f}s"
+            )
+
+            # Record metrics.
+            self.history_loss.append(avg_loss)
+            self.history_accuracy.append(accuracy)
+
+            # Step the learning rate scheduler.
+            self.scheduler.step()
+
+        # Save the final trained model.
+        save_path: str = os.path.join(os.getcwd(), "trained_model.pth")
+        torch.save(self.model.state_dict(), save_path)
+        logger.info(f"Training complete. Final model saved to {save_path}.")
+
+        # Optionally, log the full training history.
+        logger.info("Epoch Loss History: " + str(self.history_loss))
+        logger.info("Epoch Accuracy History: " + str(self.history_accuracy))
+
+
+if __name__ == "__main__":
+    # Demonstration of Trainer usage with a dummy purified dataset.
+    # This main block creates a dummy dataset and trains a ResNet-18 classifier for one epoch.
+    import numpy as np
+    from torch.utils.data import Dataset
+
+    class DummyDataset(Dataset):
+        """
+        A dummy dataset that returns random images and random labels.
+        For demonstration purposes only.
+        """
+        def __init__(self, num_samples: int, num_classes: int, image_size: int = 224) -> None:
+            self.num_samples = num_samples
+            self.num_classes = num_classes
+            self.image_size = image_size
+
+        def __len__(self) -> int:
+            return self.num_samples
+
+        def __getitem__(self, index: int):
+            # Generate a random image tensor with 3 channels.
+            image = torch.rand(3, self.image_size, self.image_size)
+            # Generate a random label between 0 and num_classes-1.
+            label = np.random.randint(0, self.num_classes)
+            return image, label
+
+    # Set up a dummy purified dataset. For example, using CIFAR-10 parameters (10 classes).
+    dummy_num_samples: int = 500
+    dummy_num_classes: int = 10
+    dummy_dataset = DummyDataset(num_samples=dummy_num_samples, num_classes=dummy_num_classes, image_size=224)
+
+    # Load configuration from config.yaml.
+    config_path_main = os.path.join(os.getcwd(), "config.yaml")
+    try:
+        config_main = load_config(config_path_main)
+    except Exception as exc:
+        logger.error(f"Failed to load configuration: {exc}")
+        config_main = {}
+
+    # Instantiate a ResNet-18 model for the number of classes.
+    resnet18_model: nn.Module = models.resnet18(pretrained=False)
+    # Adjust the final fully connected layer to match dummy_num_classes.
+    resnet18_model.fc = nn.Linear(resnet18_model.fc.in_features, dummy_num_classes)
+
+    # Select a dataset name as defined in config: here "CIFAR-10" is used.
+    dataset_name_main: str = "CIFAR-10"
+
+    # Instantiate Trainer.
+    trainer_instance = Trainer(
+        model=resnet18_model,
+        train_dataset=dummy_dataset,
+        dataset_name=dataset_name_main,
+        config=config_main
+    )
+
+    # Run training.
+    trainer_instance.train()

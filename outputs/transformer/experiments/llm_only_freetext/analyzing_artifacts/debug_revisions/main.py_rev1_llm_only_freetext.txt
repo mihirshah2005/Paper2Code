@@ -1,0 +1,90 @@
+Below is the detailed logic analysis for main.py. This module will serve as the entry point for the whole experiment and is responsible for the following tasks:
+
+1. Loading and Parsing the Configuration:
+   • Read the YAML configuration file (config.yaml) using a YAML parser.
+   • Validate that all necessary sections are present (training, model, data, inference, checkpoint).
+   • Extract hyperparameters such as:
+     – Optimizer details (β₁, β₂, ε)
+     – Learning rate schedule formula (including d_model factor and warmup_steps)
+     – Total training steps (100K for base, 300K for big)
+     – Batch size (approximate token count per batch)
+     – Dropout rate and label smoothing value
+     – Model configuration (number of layers, d_model, d_ff, num_heads, d_k, d_v)
+     – Dataset names and vocabulary sizes for translation and parsing tasks
+     – Inference settings (beam_size, length penalty, max_length_offset)
+     – Checkpointing intervals and averaging strategy
+
+2. Setting Up Logging and Experiment Metadata:
+   • Initialize logging (or print statements) to track key events:
+     – Configuration loading
+     – Dataset loading progress, training start/stop
+     – Checkpoint saving and averaging intervals, reporting step progress
+     – Evaluation results (BLEU scores for translation; F1 score for parsing)
+   • Optionally record the current GPU/seed settings to ensure the experiment is reproducible.
+
+3. Instantiating the Dataset Loader:
+   • Instantiate the DatasetLoader (from dataset_loader.py) using the configuration dictionary.
+   • Call the load_data() method.
+     – This method will:
+       ▪ Access the respective datasets (e.g., “WMT14_en_de”, “WMT14_en_fr” for translation and “WSJ_Penn_Treebank” for parsing).
+       ▪ Apply subword tokenization using SentencePiece (ensuring the vocabulary sizes from config: 37000 for En–De, 32000 for En–Fr, etc.).
+       ▪ Batch examples based on an approximate token count (25000 tokens per batch – source and target).
+   • Save the returned tuple (train_loader, val_loader, test_loader) for later use.
+
+4. Building the Transformer Model:
+   • Use the configuration to choose between the base or the big model parameters.
+   • Instantiate a TransformerModel (from model.py) by passing in the appropriate parameters:
+     – For the base model: num_layers = 6, d_model = 512, d_ff = 2048, num_heads = 8, d_k = 64, d_v = 64.
+     – For the big model: num_layers = 6, d_model = 1024, d_ff = 4096, num_heads = 16, etc.
+   • Ensure that the model will handle:
+     – Separate encoder and decoder stacks with multi-head attention and position-wise feed-forward networks.
+     – Sinusoidal positional encoding (by default) and the proper handling of masking in the decoder’s self-attention.
+     – Tying the input embeddings with the output projection layer, scaling the embeddings by √d_model.
+
+5. Setting Up the Trainer:
+   • Instantiate the Trainer (from trainer.py) by passing the TransformerModel instance along with the train_loader, val_loader, and configuration parameters.
+   • Inside the Trainer:
+     – The Adam optimizer is initialized with β₁=0.9, β₂=0.98, ε=1e-9.
+     – The custom learning rate scheduler is set up based on the formula: lrate = d_model^(–0.5) * min(step_num^(–0.5), step_num * warmup_steps^(–1.5)) with warmup_steps = 4000.
+     – Training is configured for either 100K steps (base) or 300K steps (big model).
+     – Dropout (rate 0.1) and label smoothing (0.1) are applied as per configuration.
+     – Checkpointing is scheduled based on the configured time interval (every 10 minutes) and averaged over the last 5 checkpoints for the base model or the last 20 for the big model.
+
+6. Running the Training Loop:
+   • Call the train() method on the Trainer.
+     – During training, for each batch the Trainer will:
+       ▪ Send the batch to the TransformerModel’s forward() method together with the appropriate mask.
+       ▪ Compute the loss (with label smoothing).
+       ▪ Update the model parameters via back-propagation using Adam.
+       ▪ Log metrics such as training perplexity and, if available, intermediate BLEU scores on the validation set.
+       ▪ Save checkpoints periodically for later averaging as specified.
+   • Confirm when training has completed.
+
+7. Setting Up and Executing Evaluation:
+   • After training, instantiate the Evaluation class (from evaluation.py), supplying:
+     – The trained model.
+     – The test_loader returned from DatasetLoader.
+     – The inference configuration (beam search settings: beam_size, length_penalty, and max_length_offset).
+   • Call the evaluate() method which will:
+     – Run inference on the test set using beam search decoding.
+     – For translation, compute BLEU scores; for parsing, compute F1 scores.
+   • Retrieve and log/print the evaluation metrics.
+
+8. Orchestrating the Experiment Workflow:
+   • Encapsulate the above steps in a Main class with:
+     – An __init__() method that handles configuration parsing and logging setup.
+     – A run_experiment() method that drives the whole flow:
+       ▪ Load datasets.
+       ▪ Initialize the model.
+       ▪ Train the model via the Trainer.
+       ▪ Evaluate the model via the Evaluation module.
+   • The main function (or __main__ block) creates an instance of Main and calls run_experiment().
+
+9. Additional Considerations:
+   • Handle command-line arguments if needed for choosing task (translation vs. parsing), model type (base vs. big), or specific checkpoints to load.
+   • Ensure that all modules (dataset_loader.py, model.py, trainer.py, evaluation.py) are imported correctly.
+   • Make sure that configuration management is centralized so that changes in config.yaml automatically flow through each module.
+   • Add sufficient logging and error checking to cover unclear cases such as missing dataset files or tokenizer issues.
+   • Document any design decisions (such as using SentencePiece for tokenization, checkpoint averaging strategy, etc.) so that the experiment remains reproducible.
+
+This logical decomposition of main.py ensures that each submodule is coordinated correctly and that the Transformer experiments follow the planned experimental setup from “Attention Is All You Need” while adhering strictly to values in the config.yaml file.

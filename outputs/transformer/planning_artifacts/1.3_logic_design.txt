@@ -1,0 +1,39 @@
+----------------------------------------
+[Required packages]
+- numpy==1.21.0
+- torch==1.9.0
+- sentencepiece==0.1.96
+- torchtext==0.10.0
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['dataset_loader.py', 'DatasetLoader class handles loading the WMT and WSJ datasets. It uses torchtext or HuggingFace datasets for data access, applies subword tokenization with SentencePiece, constructs vocabulary files, and creates PyTorch DataLoader objects for train, validation, and test splits. It also batches sentences based on approximate token counts.']
+- ['model.py', 'TransformerModel class defines the complete Transformer architecture. It includes separate Encoder and Decoder classes, multi-head attention modules, positional encoding (sinusoidal by default), and a position-wise feed-forward network. Additional helper classes include MultiHeadAttention and PositionwiseFeedForward. The module implements masking (for decoder self-attention) and ties input embeddings with the output projection layer.']
+- ['trainer.py', 'Trainer class manages the training loop, including initializing the optimizer (Adam with β1=0.9, β2=0.98, ε=1e-9), implementing the custom learning rate scheduler with warmup (4000 steps), training for the required number of steps (100K for base, 300K for big), logging metrics (perplexity, BLEU score), and checkpoint saving/averaging. This file depends on dataset_loader.py for data and model.py for the TransformerModel.']
+- ['evaluation.py', 'Evaluation class implements methods for running inference using beam search decoding. It uses the trained model to generate predictions on the test set, applying beam search with configurable beam size and length penalty. It also computes evaluation metrics (BLEU score for translation, F1 score for parsing, etc.).']
+- ['main.py', 'Main module acts as the entry point of the application. It loads configuration parameters, initializes DatasetLoader, creates the TransformerModel, sets up Trainer and Evaluation, and orchestrates the overall experiment workflow from training to evaluation. It glues together all modules and handles configuration management and logging.']
+
+----------------------------------------
+[Task list]
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Common utilities such as configuration parsing, logging functions, and hyperparameter definitions (e.g., model dimensions, dropout rates, learning rate scheduler parameters) will be shared across modules. These can be implemented in a separate config module or defined within main.py and then imported where needed.
+
+----------------------------------------
+[Anything UNCLEAR]
+Clarification needed on the recommended hardware configuration (GPU types and memory) for large-scale training, exact checkpoint averaging frequency and strategy, and detailed specifications for the subword tokenization method (BPE vs. word-piece) including how the vocabulary files should be structured.
+

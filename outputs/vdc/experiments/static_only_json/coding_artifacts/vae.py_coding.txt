@@ -1,0 +1,170 @@
+## Code: vae.py
+```python
+"""
+vae.py
+
+This module implements the Visual Answer Evaluation (VAE) class for the Versatile Data Cleanser (VDC) pipeline.
+The VAE class evaluates each answer from the VQA module by comparing it with an expected criterion using
+two strategies:
+  - For deterministic label-specific questions: A simple string matching is performed.
+  - For general questions: An evaluation prompt is constructed and sent to ChatGPT (gpt-3.5-turbo) via API call.
+
+The class returns a boolean value indicating whether the provided answer is consistent with expectations.
+All configuration values are loaded from config.yaml through the utils.load_config function.
+"""
+
+import re
+import hashlib
+from typing import Any, Dict, Optional
+
+import openai
+
+import logging
+
+from utils import load_config, get_logger, cache_api_response, get_cached_api_response
+
+
+class VAE:
+    """
+    VAE (Visual Answer Evaluation) class evaluates answers produced by the VQA module.
+
+    Attributes:
+        eval_config (Dict[str, Any]): Evaluation-specific configuration parameters.
+        threshold (float): Matching threshold (not used in this function but part of overall detection).
+        chatgpt_model (str): The ChatGPT API model to use for general questions evaluation.
+        eval_prompt_template (str): Template prompt for evaluating general questions.
+        logger (logging.Logger): Logger instance for debugging.
+    """
+
+    def __init__(self, eval_config: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Initializes the VAE instance.
+
+        Args:
+            eval_config (Optional[Dict[str, Any]]): Evaluation configuration dictionary.
+                If not provided, it is loaded from "config.yaml".
+        """
+        # Load configuration if not provided.
+        if eval_config is None:
+            eval_config = load_config("config.yaml")
+        self.eval_config: Dict[str, Any] = eval_config
+
+        # Set evaluation threshold (though decision on sample is made in VDCDetector)
+        self.threshold: float = float(self.eval_config.get("detection", {}).get("threshold", 0.5))
+        
+        # Retrieve ChatGPT model configuration for evaluation from API settings.
+        self.chatgpt_model: str = self.eval_config.get("api", {}).get("chatgpt", {}).get("model", "gpt-3.5-turbo")
+        
+        # Define a default evaluation prompt template for general questions.
+        # Placeholders: {answer} and {expected}
+        self.eval_prompt_template: str = self.eval_config.get("evaluation_prompt_template", 
+            "Assume you are a helpful and precise evaluation assistant. Given the answer: '{answer}' and the expected reference: '{expected}', "
+            "does the answer correctly capture the expected semantics? Please answer with a simple 'yes' or 'no'.")
+        
+        # Initialize logger.
+        self.logger = get_logger("VAE")
+
+    def _clean_text(self, text: str) -> str:
+        """
+        Cleans the provided text: convert to lowercase and remove punctuation.
+
+        Args:
+            text (str): Input text.
+
+        Returns:
+            str: Cleaned text.
+        """
+        text_lower = text.lower().strip()
+        # Remove punctuation using regex.
+        cleaned_text = re.sub(r"[^\w\s]", "", text_lower)
+        return cleaned_text
+
+    def _generate_cache_key(self, question_type: str, answer: str, expected: str) -> str:
+        """
+        Generates a unique cache key based on the evaluation parameters.
+
+        Args:
+            question_type (str): The type of question ("label-specific" or "general").
+            answer (str): The answer text.
+            expected (str): The expected answer or evaluation criterion.
+
+        Returns:
+            str: MD5 hash key as a unique identifier.
+        """
+        key_string: str = f"VAE_{question_type}_{answer}_{expected}"
+        key_hash: str = hashlib.md5(key_string.encode("utf-8")).hexdigest()
+        return key_hash
+
+    def evaluate_answer(self, answer: str, expected: str, question_type: str) -> bool:
+        """
+        Evaluates the given answer against an expected answer or criterion.
+        Uses two strategies:
+          - For 'label-specific' questions: performs deterministic string matching.
+          - For 'general' questions: uses ChatGPT API call with a crafted evaluation prompt.
+
+        Args:
+            answer (str): The answer text produced by the VQA module.
+            expected (str): The expected answer or evaluation criterion.
+            question_type (str): Indicates the type of question ("label-specific" or "general").
+
+        Returns:
+            bool: True if the answer is deemed correct, False otherwise.
+        """
+        # Handle label-specific questions via simple string matching.
+        if question_type == "label-specific":
+            cleaned_answer: str = self._clean_text(answer)
+            self.logger.debug(f"Label-specific evaluation: cleaned answer='{cleaned_answer}', expected='{expected.lower()}'")
+            
+            # Check for the keyword "yes" or "no" in the answer.
+            if "yes" in cleaned_answer:
+                return True
+            elif "no" in cleaned_answer:
+                return False
+            else:
+                # Ambiguous response: log warning and default to False.
+                self.logger.warning(f"Ambiguous label-specific answer: '{answer}'. Defaulting to False.")
+                return False
+
+        # Handle general questions via ChatGPT-based evaluation.
+        elif question_type == "general":
+            # Construct evaluation prompt using template.
+            prompt: str = self.eval_prompt_template.format(answer=answer, expected=expected)
+            self.logger.debug(f"General evaluation prompt: {prompt}")
+            # Generate a cache key for the current evaluation request.
+            cache_key: str = self._generate_cache_key(question_type, answer, expected)
+            cached_response: Optional[Any] = get_cached_api_response(cache_key)
+            if cached_response is not None:
+                response_text: str = cached_response
+                self.logger.debug("Using cached ChatGPT response for evaluation.")
+            else:
+                try:
+                    # Call ChatGPT API to evaluate the response.
+                    api_response = openai.ChatCompletion.create(
+                        model=self.chatgpt_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0
+                    )
+                    response_text = api_response.choices[0].message.content.strip()
+                    # Cache the API response.
+                    cache_api_response(cache_key, response_text)
+                except Exception as ex:
+                    self.logger.error(f"Error during ChatGPT API call in VAE: {ex}. Defaulting evaluation to False.")
+                    return False
+            
+            # Process the response text.
+            cleaned_response: str = self._clean_text(response_text)
+            self.logger.debug(f"ChatGPT evaluation response (cleaned): '{cleaned_response}'")
+            if "yes" in cleaned_response:
+                return True
+            elif "no" in cleaned_response:
+                return False
+            else:
+                # If the response is ambiguous, log and default to False.
+                self.logger.warning(f"Ambiguous general evaluation response: '{response_text}'. Defaulting to False.")
+                return False
+
+        else:
+            # Unknown question type; log error and default to False.
+            self.logger.error(f"Unrecognized question type: '{question_type}'. Expected 'label-specific' or 'general'.")
+            return False
+```

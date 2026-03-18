@@ -1,0 +1,109 @@
+Below is the revised and expanded logic analysis for evaluation.py that addresses the new critiques:
+
+──────────────────────────────
+1. Overview of Evaluation.diffusion_sampling
+
+This method is responsible for generating images via the diffusion process and must now clearly handle two issues:
+ • (a) Computing the latent grid dimensions without assuming a square grid and therefore handling non‐square image resolutions.
+ • (b) Explicitly invoking a positional embedding interpolation helper function that is defined (or to be defined) elsewhere in the code base.
+
+──────────────────────────────
+2. Handling Non-Square Latent Grid Computation
+
+Previous assumptions used L_train = sqrt(L_max), which is only valid for square images. To avoid ambiguity for non-square image resolutions, the revised design is as follows:
+
+a) Given a target output resolution (H_test, W_test) in pixels and a fixed patch size (p = 2 from config.model.patch_size), compute the latent grid dimensions independently:
+  • H_latent = ceil(H_test / patch_size)
+  • W_latent = ceil(W_test / patch_size)
+
+b) The total number of latent tokens is then token_count = H_latent × W_latent.
+
+c) During training, the model padded the token sequences to a fixed maximum length (L_max, provided in config.model.max_token_length). However, note that L_max is a sequence length value and may not represent a square grid in all cases. For proper scaling:
+  • If a specific training resolution (or latent dimensions H_train and W_train) is known from the training setup, then these values must be used (for example, if the training resolution is 160×320, then one calculates H_train = ceil(160 / patch_size) and W_train = ceil(320 / patch_size)).
+  • In the absence of explicit training dimensions, a default assumption may be made – for example, treating H_train and W_train as √L_max – but the code should document that this is a default for square images only.
+  • In general, compute separate scale factors for height and width:
+   – s_h = max(H_latent / H_train, 1.0)
+   – s_w = max(W_latent / W_train, 1.0)
+  • These scale factors are then used to adjust the positional embeddings during the diffusion updates.
+
+This explicit computation avoids assuming a square grid and clarifies how H_latent and W_latent are derived for arbitrary (non-square) image resolutions.
+
+──────────────────────────────
+3. Positional Embedding Interpolation – Helper Function Dependency
+
+The previous analysis assumed that “the model handles interpolation internally.” To remove ambiguity we now specify:
+
+a) The evaluation code must expect a dedicated positional embedding interpolation helper function. For example, the Model class (or an auxiliary module such as positional_interpolation.py) should expose a method with a clear contract, for example:
+  def interpolate_positional_embeddings(original_pe, target_shape, method, scale_factors) -> new_pe:
+    – original_pe: the original positional embeddings used during training.
+    – target_shape: a tuple (H_latent, W_latent) for the target latent grid.
+    – method: a string indicating the interpolation method to use (e.g., “PI”, “EI”, “NTK”, “YaRN”, “VisionNTK”, “VisionYaRN”) from config.extrapolation.methods.
+    – scale_factors: a tuple (s_h, s_w) computed as above.
+   – new_pe: the adjusted positional embeddings that have been interpolated to match the target latent grid shape.
+
+b) In evaluation.diffusion_sampling, before beginning the iterative denoising process (or at each iteration if required by the chosen interpolation algorithm), the code must call this helper function. The returned positional embeddings are then passed to the model’s forward() method.
+
+c) This dependency is now explicitly documented; if the helper is unavailable or not implemented, the evaluation process should raise a NotImplementedError, ensuring that the critical component is not omitted by chance.
+
+──────────────────────────────
+4. Revised Diffusion Sampling Process
+
+In summary, the step-by-step process in Evaluation.diffusion_sampling is as follows:
+
+1. Determine the target output resolution (H_test, W_test) as per the evaluation plan. These values may come from multiple testing conditions (in-distribution and out-of-distribution settings).
+
+2. Compute the latent grid dimensions:
+  – H_latent = ceil(H_test / patch_size)
+  – W_latent = ceil(W_test / patch_size)
+  – token_count = H_latent × W_latent
+
+3. Retrieve the corresponding training latent dimensions (H_train and W_train). This can either be obtained from a dedicated configuration parameter or computed from known training resolution values. If not explicitly provided, document that a default value (e.g., H_train = W_train = sqrt(L_max)) is applied, with a note that this is most accurate only for square images.
+
+4. Compute individual scale factors:
+  – s_h = max(H_latent / H_train, 1.0)
+  – s_w = max(W_latent / W_train, 1.0)
+
+5. Generate the initial latent tokens by sampling Gaussian noise with shape (token_count, feature_dim).
+
+6. If token_count > L_max (or if separate extrapolation is desired regardless), explicitly obtain recalibrated positional embeddings by calling:
+  new_pe = model.interpolate_positional_embeddings(original_pe, (H_latent, W_latent), chosen_method, (s_h, s_w))
+  where chosen_method is selected from config.extrapolation.methods.
+
+7. Run the diffusion sampling loop for the configured number of steps (e.g., 250 iterations), where in each iteration the model’s forward() method is called with:
+  – the current latent tokens,
+  – the (optionally updated) positional embeddings,
+  – any conditioning signals if available (see below).
+
+8. After the diffusion loop, “unpatchify” the latent tokens based on the computed H_latent and W_latent to reform the full latent grid.
+
+9. Use the pretrained VAE decoder (already loaded in the model) to decode the latent grid into the final image.
+
+──────────────────────────────
+5. Handling Conditional Generation
+
+As noted earlier, some evaluation cases may require conditional generation:
+  – The __init__ method now distinguishes conditional versus unconditional generation by checking for a conditioning flag or examining the dataloader output.
+  – During each forward() call in the diffusion sampling process, if conditioning information is available (for example, class labels or text embeddings), they are passed along as an additional argument to the model’s forward() method.
+  – This ensures that both conditional and unconditional diffusion are supported without ambiguity.
+
+──────────────────────────────
+6. Final Integration and Documentation
+
+The revised analysis now explicitly:
+
+• Computes the latent token grid dimensions on separate height and width bases, avoiding the oversimplification of assuming a square grid.
+• Specifies that separate scale factors (s_h and s_w) must be computed and used—thereby removing ambiguity when handling non-square resolutions.
+• Clearly identifies that positional embedding interpolation must be implemented in a dedicated helper function (e.g., model.interpolate_positional_embeddings) with a well-defined interface. The evaluation code must invoke this function and proceed only when valid positional embeddings are produced.
+• Documents the handling of conditional generation data so that the model’s forward pass can accept conditioning signals if required.
+
+This comprehensive revision should resolve the identified issues and ensure that the diffusion sampling routine in evaluation.py is both robust and well-integrated with the rest of the FiT implementation.
+
+──────────────────────────────
+Summary
+
+– Latent token count is now computed using non-square latent grid dimensions derived from target resolution and patch size.
+– Separate training dimensions (H_train and W_train) are used (or default values documented) to compute per-dimension scale factors.
+– A dedicated positional embedding interpolation helper function is explicitly required, with clear input/output specification.
+– Conditional generation support is clarified in __init__ and during sampling.
+
+This revised analysis provides the necessary clarity to implement evaluation.py without ambiguity or hidden dependencies.

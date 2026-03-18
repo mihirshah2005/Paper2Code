@@ -1,0 +1,111 @@
+Below is the detailed logic analysis for the dataset_loader.py module. This module is responsible for loading, splitting, and preprocessing data across the CV, NLP, and graph domains according to the experiment’s requirements. The analysis strictly follows the configuration (config.yaml), the experimental plan from the paper, and our design specifications.
+
+────────────────────────────
+1. Overall Role and Structure
+
+• The DatasetLoader class will be initialized with a configuration dictionary (loaded from config.yaml). This configuration contains reproducibility seeds and general training settings that must be respected throughout data handling.  
+• The main public methods are:
+  – __init__(config: dict): Stores configuration values and may set a default random seed (e.g., using the first seed in config["reproducibility"]["seeds"]).  
+  – load_data(): Loads the raw dataset and performs the train/validation/test splits according to the domain-specific requirements.  
+  – apply_noise(data, p: float): Injects label noise into the training set by randomly flipping labels with probability p.  
+  – apply_imbalance(data, r: int): Creates a long-tailed (imbalanced) training set for CV datasets by sub-sampling classes using an exponential decay function.
+
+────────────────────────────
+2. Parsing the Dataset Identifier
+
+• The load_data() method will accept (or internally use) a dataset identifier string that may include suffixes for noise and imbalance settings—for example:  
+  "cifar10" (standard), "cifar10-noise-0.4" (noise setting with p = 0.4), or "tinyimagenet-imbalance-50" (imbalance setting with factor r = 50).  
+• The method will parse this string (e.g., by splitting on "-" tokens) to determine:  
+  – The base dataset name (e.g., "cifar10", "cifar100", "tinyimagenet", "rte", etc.)  
+  – Whether noise needs to be applied (if the token “noise” is present) and the corresponding probability value.  
+  – Whether an imbalance setting is requested (if the token “imbalance” is present) and the imbalance factor (r).  
+• Note: Although the config.yaml does not explicitly specify noise or imbalance parameters, we will extract these from the dataset identifier string to stay consistent with the paper’s experimental settings.
+
+────────────────────────────
+3. Domain-Specific Data Loading and Splitting
+
+A. Computer Vision (CV) Datasets  
+ • Supported datasets: CIFAR-10, CIFAR-100, and Tiny-ImageNet.  
+ • For CIFAR-10 and CIFAR-100:  
+  – Use torchvision.datasets to download the datasets.  
+  – The original training set is split into training and validation sets using a 9:1 ratio. (For example, if there are 50,000 training samples, approximately 45,000 will be used for training and 5,000 for validation.)  
+  – The test set provided (if any) will be used as the final test split.  
+ • For Tiny-ImageNet:  
+  – Download and load using a custom loader (or adapted torchvision routines).  
+  – Since the official test labels are not available, the provided validation split is used as the test set. The original training split is again divided 9:1 into training and a held‐out validation set.
+
+B. Natural Language Processing (NLP) Datasets  
+ • Supported datasets: GLUE benchmark datasets (e.g., RTE, MRPC, STS-B, CoLA, SST-2, QNLI, QQP, MNLI) excluding WNLI.  
+ • Load these datasets using Hugging Face’s datasets library or a similar utility.  
+ • Since official test labels are not provided, use the validation set as the evaluation (test) split.  
+ • The train/validation split is usually provided by the dataset, so minimal custom splitting is required.
+
+C. Graph Datasets  
+ • Supported datasets: ogbg-molhiv (from the OGB collection) and additional graph datasets from TUDataset (e.g., MUTAG, PROTEINS, NCI1).  
+ • For ogbg-molhiv:  
+  – Use the official split (train/validation/test) provided by the OGB API.  
+ • For TUDataset datasets:  
+  – Load the complete dataset using torch_geometric.datasets.TUDataset.  
+  – Randomly split the dataset into training, validation, and test sets with an 8:1:1 ratio.  
+  – Use a fixed seed (from the config’s reproducibility settings) so that the splits remain consistent across runs.
+
+────────────────────────────
+4. Applying Label Noise (apply_noise)
+
+• Purpose: To simulate the “noise-p” setting where each data sample in the training set has its label flipped to a random incorrect label with probability p.  
+• Implementation Steps:  
+  – Iterate over the training data indices.  
+  – For each sample, generate a random number; if it is below p, then modify the sample’s label.
+  – For datasets such as torchvision’s CIFAR implementations, which typically store labels in an attribute such as dataset.targets, update that list directly.  
+  – Ensure that the noise injection is applied only to the training split rather than validation or test splits.
+
+────────────────────────────
+5. Creating Imbalanced Distributions (apply_imbalance)
+
+• Purpose: To simulate the “imbalance-r” setting for CV datasets by sub-sampling the training set so that class sample counts follow an exponential decay: n_c = n₀ × d^(c), where d is chosen as (1/r)^(1/(C-1)) (with C being the number of classes).  
+• Implementation Steps:  
+  – Confirm that the dataset is for the CV domain (imbalance should not be applied for NLP or graph datasets).  
+  – Identify the list of classes and group the training sample indices by class.  
+  – Assume that the dataset is originally balanced (i.e., each class has approximately the same number of samples, n₀).  
+  – Compute the decay factor d using d = (1/r)^(1/(C-1)), so that the imbalance factor r is preserved as n₀:n_(C-1).  
+  – For each class c (using the sorted order of class labels), calculate the desired number of samples = floor(n₀ × d^(c)).  
+  – Randomly select the calculated number of indices from the available indices for that class.  
+  – Create a new, imbalanced training dataset by wrapping the selected indices with torch.utils.data.Subset.  
+  – Return the updated training set and continue with the same validation and test splits.
+
+────────────────────────────
+6. Return Format
+
+• The load_data() method will finally return a dictionary with keys "train", "val", and "test". Each key maps to a PyTorch Dataset (or a wrapper such as Subset for imbalanced data).  
+• This return structure is critical because the rest of the training pipeline (in trainer.py and evaluation.py) expects standardized data loaders.
+
+────────────────────────────
+7. Reproducibility and Config Integration
+
+• Use the reproducibility seeds specified in config.yaml (e.g., the seed list [42, 666, 777, 888, 999]) to initialize the random generators used in data splitting, noise injection, and imbalance sampling.  
+• Although the config does not directly specify noise or imbalance parameters, the DatasetLoader will rely on the dataset identifier string to apply these settings. This ensures that all dataset preprocessing steps respect the experimental design described in the paper.
+
+────────────────────────────
+8. Dependencies and External Libraries
+
+• CV Datasets:  
+ – Import torch and torchvision (torchvision.datasets, torchvision.transforms).  
+• NLP Datasets:  
+ – Import libraries from the Hugging Face Transformers or datasets packages (to load GLUE).  
+• Graph Datasets:  
+ – Import torch_geometric.datasets for TUDataset and ogbg-molhiv.  
+• Additional:  
+ – Use torch.utils.data.Subset for creating subsets of datasets after applying imbalance.  
+ – Use Python’s random or numpy.random for consistent random number generation.
+
+────────────────────────────
+Summary
+
+The DatasetLoader module is designed to:
+ 1. Parse a dataset identifier string (e.g., "cifar10-noise-0.4") to determine the base dataset and whether noise or imbalance processing should be applied.
+ 2. Load datasets for CV, NLP, and graph domains using domain-appropriate libraries and splitting strategies (9:1 for CV training/validation, official splits for ogbg-molhiv, and 8:1:1 for TUDataset).
+ 3. Modify the training dataset by applying label noise via apply_noise(p) if required.
+ 4. For CV datasets, further apply long-tailed imbalance via apply_imbalance(r) by sub-sampling the training set in a class-wise exponential manner.
+ 5. Return a standardized dictionary containing the train, validation, and test datasets for downstream use by the Trainer and Evaluation modules.
+
+This comprehensive logic ensures that the dataset loading and preprocessing module aligns with the methodologies and experimental setups described in the CurBench paper while strictly following the design and configuration settings provided.

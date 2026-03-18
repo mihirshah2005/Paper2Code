@@ -1,0 +1,105 @@
+/*******************************************************
+ * Logic Analysis for main.py
+ *
+ * Overview:
+ * This file acts as the entry point to the FiT reproduction
+ * experiment. It orchestrates the entire pipeline by performing
+ * the following steps:
+ *
+ * 1. Load Configuration:
+ *    - Read the "config.yaml" file to extract all hyperparameters
+ *      and settings, such as training hyperparameters (learning rate,
+ *      batch size, training steps – use "training_steps_fit_b2" for FiT-B/2
+ *      or "training_steps_fit_xl2" for FiT-XL/2), model settings (patch_size,
+ *      max_token_length, transformer configuration, and pretrained VAE path),
+ *      diffusion parameters (number of sampling steps and noise schedule),
+ *      data settings (dataset name, maximum resize area, augmentation type),
+ *      and extrapolation methods.
+ *
+ * 2. Data Preparation:
+ *    - Instantiate the DatasetLoader class by passing the loaded config.
+ *    - Call DatasetLoader.load_data() to obtain a DataLoader instance.
+ *    - The DataLoader internally handles:
+ *         • Reading the image dataset (e.g., ImageNet),
+ *         • Applying image transformations such as resizing (ensuring that HW ≤ 256²)
+ *           while preserving the aspect ratio, and horizontal flip augmentation.
+ *         • Preprocessing for the FiT pipeline, including patchifying the latent
+ *           representations post-VAE encoding and dynamically padding token sequences
+ *           to a fixed maximum length (L_max = 256).
+ *
+ * 3. Model Initialization:
+ *    - Create an instance of the Model class using the model-related portion of the config.
+ *    - The model initialization will include:
+ *         • Setting the patch_size (p = 2) and max_token_length from the config.
+ *         • Configuring the transformer backbone to use "2D RoPE" for positional encoding,
+ *           "Masked MHSA" for attention, and "SwiGLU" for the FFN as specified.
+ *         • Loading the pretrained VAE checkpoint using
+ *           Model.load_pretrained_vae(config.model.pretrained_vae) with the provided path
+ *           ("huggingface/stabilityai/sd-vae-ft-ema").
+ *
+ * 4. Training Setup:
+ *    - Instantiate the Trainer class with arguments:
+ *         • The Model instance.
+ *         • The DataLoader (from DatasetLoader).
+ *         • The training config (learning rate, batch size, training steps, optimizer type,
+ *           EMA decay, etc.).
+ *    - The Trainer is responsible for executing the training loop where:
+ *         • For each batch, the forward pass is performed on the model.
+ *         • The diffusion process loss is computed strictly over valid (non-padding) tokens,
+ *           using a mask to ignore padded entries.
+ *         • The optimizer (AdamW with a constant learning rate and no weight decay) is updated,
+ *           and EMA of the weights is maintained with decay 0.9999.
+ *         • Training proceeds for a total of config.training.training_steps_fit_b2 (or
+ *           training_steps_fit_xl2 for larger models) iterations.
+ *         • Checkpoints are saved periodically via Trainer.save_checkpoint(epoch).
+ *
+ * 5. Evaluation:
+ *    - Once training completes, instantiate the Evaluation class with:
+ *         • The trained (and EMA updated) Model,
+ *         • The DataLoader (or a separate evaluation data loader if needed),
+ *         • The evaluation settings from the config (e.g., diffusion.num_sampling_steps,
+ *           extrapolation methods, evaluation metrics such as FID, sFID, IS, Precision, Recall).
+ *    - Call Evaluation.evaluate() to:
+ *         • Execute the inference pipeline.
+ *         • Begin with sampling noisy tokens (matching the target resolution’s token count)
+ *           and applying the diffusion denoising steps (250 DDPM iterations as per config).
+ *         • Apply positional embedding interpolation techniques for resolution
+ *           extrapolation if the target resolution is out-of-distribution.
+ *         • Decode the denoised latent tokens using the pretrained VAE decoder to generate images.
+ *         • Calculate evaluation metrics (using the TensorFlow ADM evaluation or equivalent
+ *           methods) and return a dictionary of metrics.
+ *
+ * 6. Orchestration:
+ *    - The "Main" class in main.py integrates these components:
+ *         a) Load the configuration from "config.yaml".
+ *         b) Instantiate DatasetLoader and load the dataset.
+ *         c) Instantiate the Model, load the pretrained VAE weights.
+ *         d) Instantiate Trainer, begin the training loop.
+ *         e) Upon completion of training, save checkpoints.
+ *         f) Instantiate Evaluation, run evaluation, and capture/print returned metrics.
+ *
+ * 7. Logging & Error Handling:
+ *    - Throughout the process, appropriate logging should be implemented to record:
+ *         • Training progress (loss metrics, token usage statistics, EMA updates).
+ *         • Checkpoint saving events.
+ *         • Evaluation results.
+ *    - Error handling should be added to catch configuration errors, data loading issues,
+ *      or model training/evaluation exceptions.
+ *
+ * 8. Integration Notes:
+ *    - Ensure that the modules dataset_loader.py, model.py, trainer.py, and evaluation.py
+ *      strictly follow the designed interfaces (e.g., method names and argument types).
+ *    - Use shared helper functions for tasks such as image patchification, token padding,
+ *      and construction of attention masks consistently across the project.
+ *
+ * Summary:
+ * main.py acts as the high-level executor that ties together:
+ *    • Configuration loading,
+ *    • Data loading and transformation,
+ *    • Model initialization (with pretrained VAE and FiT transformer specifics),
+ *    • Training via the Trainer,
+ *    • And final evaluation via the Evaluation module,
+ * ensuring that the FiT methodology and diffusion framework are faithfully implemented
+ * as described in the paper with the provided configuration settings.
+ *
+ *******************************************************/

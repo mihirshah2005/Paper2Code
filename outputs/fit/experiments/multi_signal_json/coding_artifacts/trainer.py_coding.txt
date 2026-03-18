@@ -1,0 +1,234 @@
+```python
+"""trainer.py
+
+This module implements the Trainer class responsible for training the FiT diffusion model.
+It integrates the diffusion process (DDPM noise schedule), timestep conditioning via sinusoidal embeddings,
+masked loss computation over token sequences (ignoring padded tokens), optimizer updates, EMA updates,
+and periodic checkpoint saving.
+
+Author: [Your Name]
+Date: [Today's Date]
+"""
+
+import os
+import math
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from tqdm import tqdm
+
+# Trainer class definition following the design and task specifications.
+class Trainer:
+    def __init__(self, model: nn.Module, dataloader: torch.utils.data.DataLoader, config: Dict[str, Any]) -> None:
+        """
+        Initializes the Trainer.
+        
+        Args:
+            model (nn.Module): An instance of the FiT model.
+            dataloader (torch.utils.data.DataLoader): DataLoader yielding training batches.
+            config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        """
+        self.model: nn.Module = model
+        self.dataloader: torch.utils.data.DataLoader = dataloader
+        self.config: Dict[str, Any] = config
+
+        # Set device.
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Optimizer: AdamW with configurable learning rate and weight decay.
+        lr: float = float(self.config.get("training", {}).get("learning_rate", 1e-4))
+        weight_decay: float = float(self.config.get("training", {}).get("weight_decay", 0.0))
+        self.optimizer: optim.Optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        # Determine total training steps based on model variant (FiT-B/2 vs. FiT-XL/2).
+        model_variant: str = self.config.get("model", {}).get("variant", "B/2")
+        if "XL" in model_variant.upper():
+            self.total_steps: int = int(self.config.get("training", {}).get("training_steps_fit_xl2", 1800000))
+        else:
+            self.total_steps: int = int(self.config.get("training", {}).get("training_steps_fit_b2", 400000))
+
+        # EMA decay factor and initialization of EMA state (copy of model parameters).
+        self.ema_decay: float = float(self.config.get("training", {}).get("ema_decay", 0.9999))
+        self.ema_state: Dict[str, torch.Tensor] = {
+            name: param.clone().detach() for name, param in self.model.state_dict().items()
+        }
+
+        # Checkpoint saving frequency (default 10,000 steps if not provided).
+        self.checkpoint_freq: int = int(self.config.get("training", {}).get("checkpoint_freq", 10000))
+
+        # Set up the diffusion noise schedule (DDPM).
+        # Total timesteps T for diffusion training. Default T=1000 if not specified.
+        self.T: int = int(self.config.get("diffusion", {}).get("T", 1000))
+        # Linear beta schedule from 0.0001 to 0.02.
+        self.beta: torch.Tensor = torch.linspace(0.0001, 0.02, self.T, device=self.device)
+        self.alpha: torch.Tensor = 1.0 - self.beta
+        self.alpha_bar: torch.Tensor = torch.cumprod(self.alpha, dim=0)  # Shape: [T]
+
+        # Global step counter.
+        self.global_step: int = 0
+
+    def get_timestep_embedding(self, timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
+        """
+        Create sinusoidal timestep embeddings.
+        
+        Args:
+            timesteps (torch.Tensor): Tensor of shape [B] containing timesteps.
+            embedding_dim (int): Dimension of the embedding.
+            
+        Returns:
+            torch.Tensor: Sinusoidal timestep embeddings of shape [B, embedding_dim].
+        """
+        # This implementation is adapted from common diffusion codebases.
+        half_dim: int = embedding_dim // 2
+        emb_scale: float = math.log(10000) / (half_dim - 1)
+        emb: torch.Tensor = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb_scale)
+        # timesteps: [B, 1] and emb: [half_dim] -> broadcast to [B, half_dim]
+        emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        if embedding_dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb  # [B, embedding_dim]
+
+    def update_ema(self) -> None:
+        """
+        Updates the Exponential Moving Average (EMA) state of the model parameters.
+        """
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    # Update EMA value as: ema = decay * ema + (1 - decay) * current_param
+                    self.ema_state[name] = self.ema_state[name] * self.ema_decay + param.detach() * (1 - self.ema_decay)
+
+    def save_checkpoint(self, step: int) -> None:
+        """
+        Saves a checkpoint of the current training state.
+        
+        Args:
+            step (int): The current global step number.
+        """
+        checkpoint: Dict[str, Any] = {
+            "model_state": self.model.state_dict(),
+            "ema_state": self.ema_state,
+            "optimizer_state": self.optimizer.state_dict(),
+            "global_step": step,
+        }
+        filename: str = f"checkpoint_step_{step}.pt"
+        torch.save(checkpoint, filename)
+        print(f"Checkpoint saved: {filename}")
+
+    def train(self) -> None:
+        """
+        Runs the training loop for the FiT model with the diffusion process.
+        
+        Steps:
+          - For each batch, sample a random timestep t for each sample.
+          - Compute the noise schedule cumulative product ᾱₜ.
+          - Sample Gaussian noise and compute the noisy latent tokens:
+              x_noisy = sqrt(ᾱₜ) * x_clean + sqrt(1 − ᾱₜ) * ε.
+          - Compute a sinusoidal timestep embedding.
+          - Forward pass: transform x_noisy tokens through token projection, add positional 
+            embeddings (2D RoPE) and timestep conditioning, and process through transformer blocks.
+          - Compute the MSE loss between the predicted noise (output) and the 
+            target noise (obtained via token projection on ε), weighted by the attention mask.
+          - Backpropagate, update optimizer, and update EMA.
+          - Log progress and periodically save checkpoints.
+        """
+        self.model.train()
+        tbar = tqdm(total=self.total_steps, desc="Training", unit="step")
+        dataloader_iter = iter(self.dataloader)
+
+        while self.global_step < self.total_steps:
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(self.dataloader)
+                batch = next(dataloader_iter)
+
+            # Determine if the batch contains preprocessed tokens or raw images.
+            if "tokens" in batch:
+                # Preprocessed latent token batch.
+                x_clean: torch.Tensor = batch["tokens"].to(self.device)  # [B, L, token_dim]
+                attn_mask: torch.Tensor = batch["attention_mask"].to(self.device)  # [B, L]
+                # If coordinates are not provided, create a dummy coordinate tensor.
+                B, L, _ = x_clean.shape
+                coords: torch.Tensor = torch.zeros((B, L, 2), device=self.device)
+            else:
+                # Raw image batch.
+                x_image: torch.Tensor = batch["image"].to(self.device)  # [B, C, H, W]
+                # Compute latent space from images.
+                latent: torch.Tensor = self.model._encode(x_image)  # [B, latent_channels, H_latent, W_latent]
+                # Patchify latent map. _patchify returns (tokens, attn_mask, coords).
+                x_clean, attn_mask, coords = self.model._patchify(latent)
+                x_clean = x_clean.to(self.device)
+                attn_mask = attn_mask.to(self.device)
+                coords = coords.to(self.device)
+
+            B = x_clean.size(0)
+            # Sample random timesteps for each sample: t ~ Uniform(0, T-1)
+            t: torch.Tensor = torch.randint(0, self.T, (B,), device=self.device).long()  # [B]
+            # Gather corresponding cumulative product (alpha_bar) for each timestep.
+            alpha_bar_t: torch.Tensor = self.alpha_bar[t].view(B, 1, 1)  # [B, 1, 1]
+            sqrt_alpha_bar_t: torch.Tensor = torch.sqrt(alpha_bar_t)
+            sqrt_one_minus_alpha_bar_t: torch.Tensor = torch.sqrt(1.0 - alpha_bar_t)
+            # Sample Gaussian noise epsilon with same shape as x_clean.
+            epsilon: torch.Tensor = torch.randn_like(x_clean)
+            # Compute the noisy latent tokens.
+            x_noisy: torch.Tensor = sqrt_alpha_bar_t * x_clean + sqrt_one_minus_alpha_bar_t * epsilon
+
+            # Forward pass through FiT transformer:
+            # 1. Project x_noisy tokens to transformer hidden space.
+            token_embeddings: torch.Tensor = self.model.token_proj(x_noisy)  # [B, L, hidden_dim]
+            # 2. Compute 2D RoPE positional embeddings from coordinates.
+            pos_embeddings: torch.Tensor = self.model._get_2d_rope_positional_embedding(coords)
+            # 3. Combine token embeddings with positional embeddings.
+            input_embed: torch.Tensor = token_embeddings + pos_embeddings
+
+            # 4. Compute sinusoidal timestep embedding.
+            t_embed: torch.Tensor = self.get_timestep_embedding(t, self.model.hidden_dim)  # [B, hidden_dim]
+            # Conditioning: add timestep embedding (expanded along token dimension).
+            input_embed = input_embed + t_embed.unsqueeze(1)  # [B, L, hidden_dim]
+
+            # 5. Forward pass through the stacked transformer blocks.
+            x_out: torch.Tensor = input_embed
+            for block in self.model.transformer_blocks:
+                x_out = block(x_out, attn_mask)
+            x_out = self.model.final_norm(x_out)  # [B, L, hidden_dim] predicted noise
+
+            # Compute target noise signal: use the same token projection on epsilon.
+            target_noise: torch.Tensor = self.model.token_proj(epsilon)  # [B, L, hidden_dim]
+
+            # Compute MSE loss over valid (non-padded) tokens.
+            mse_loss: torch.Tensor = (x_out - target_noise) ** 2  # [B, L, hidden_dim]
+            expanded_mask: torch.Tensor = attn_mask.unsqueeze(-1)  # [B, L, 1]
+            mse_loss = mse_loss * expanded_mask
+            # Normalize loss by the number of "real" tokens.
+            loss: torch.Tensor = mse_loss.sum() / expanded_mask.sum()
+
+            # Backpropagation and optimizer update.
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            # EMA update.
+            self.update_ema()
+
+            self.global_step += 1
+            tbar.update(1)
+            # Compute average number of real tokens per sample.
+            avg_tokens: float = attn_mask.sum(dim=1).float().mean().item()
+            tbar.set_postfix({"loss": f"{loss.item():.4f}", "step": self.global_step, "avg_tokens": f"{avg_tokens:.2f}"})
+
+            # Save checkpoint periodically.
+            if self.global_step % self.checkpoint_freq == 0:
+                self.save_checkpoint(self.global_step)
+
+            if self.global_step >= self.total_steps:
+                break
+
+        tbar.close()
+        print("Training completed.")
+```

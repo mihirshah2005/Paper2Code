@@ -1,0 +1,122 @@
+# main.py – Logic Analysis
+
+This file serves as the main entry point of our GDEM reproduction pipeline. Its responsibilities are to load the configuration, set up the necessary modules (DatasetLoader, Model, Trainer, Evaluation), and orchestrate the end-to-end flow of the experiment. Below is a detailed step‐by‐step logic analysis, aligned with the paper and our design specifications, in order to ensure reproducibility and fidelity to the original experimental methodology.
+
+──────────────────────────────
+1. Load Configuration
+
+• Read the configuration from "config.yaml".  
+  – Extract training parameters (epochs, learning_rate_feat, learning_rate_eigenvecs, tau1, tau2, optimizer, loss_weights, num_runs).  
+  – Get synthetic graph parameters (compression_ratio, r_k).  
+  – Retrieve evaluation configuration (GNN type details for spatial and spectral networks).  
+  – Obtain dataset details (name “Pubmed”, split_method “public”).
+
+──────────────────────────────
+2. Dataset Loading
+
+• Instantiate the DatasetLoader with the configuration.  
+  – Use DatasetLoader to load the specified graph dataset (here, "Pubmed") from files or online sources.  
+  – During the loading process, compute:  
+    - The adjacency matrix (A)  
+    - Node features (X)  
+    - Labels (Y)  
+    - Normalized Laplacian L, computed as L = I_N – D^(–½) A D^(–½)  
+    - Eigen-decomposition: truncated eigenvalues and eigenvectors (e.g., overall eigenvalues λ_i and corresponding eigenvectors u_i)  
+  – Select the K eigenvectors used for matching: choosing K₁ smallest and K₂ largest eigenvectors, where K₁ and K₂ are determined according to r_k and the selected number of synthetic nodes (set via the compression_ratio).  
+  – Package these into a GraphData structure that contains all required fields (adjacency, X, Y, L, eigenvalues, eigenvectors).
+
+──────────────────────────────
+3. Model Initialization
+
+• Instantiate the Model with parameters drawn from the configuration. This Model encapsulates the entire synthetic graph distillation process.
+  – The model will initialize synthetic node features X′ for the distilled graph.  
+    • This can be done either through simple random initialization or by leveraging a pre-trained MLP (as suggested in the paper) – the design permits either choice.  
+  – The synthetic eigenbasis U′_K is also initialized.  
+    • For initialization, we may use a random orthogonal (or SBM-based if available) method to ensure U′_K is orthonormal.
+  – The Model’s methods include:
+    • forward(): to compute synthetic graph representations and predicted properties.
+    • compute_loss(): to calculate the composite loss L_total = α * L_e + β * L_d + γ * L_o, where:
+      - L_e is the eigenbasis matching loss (comparing the projection matrices of the real eigenbasis U_K and synthetic eigenbasis U′_K using a Frobenius norm or similar metric),
+      - L_d is the discrimination constraint loss (computed using cosine similarity on category-level representations derived from the node features and (possibly) the real spectrum),
+      - L_o is the orthogonality regularization loss to enforce U′_K^T U′_K ≈ I.
+    • update_eigenbasis() and update_features() for parameter updates.
+    • reconstruct_graph() to generate the synthetic graph following the reconstruction formulas:
+          L′ = Σ_k λ_k (u′_k u′_k^T) and A′ = Σ_k (1 – λ_k)(u′_k u′_k^T)
+      
+──────────────────────────────
+4. Trainer Setup and Training Loop
+
+• Instantiate the Trainer using the Model instance, the loaded GraphData, and the configuration (especially training hyperparameters).  
+• The Trainer coordinates the training loop for T epochs (as defined in config.training.epochs, here 1500 epochs).  
+• Training specifics:
+  – In each epoch, perform a forward pass by calling model.forward(x) where x is the synthetic node features.  
+  – Compute losses by calling model.compute_loss() with inputs:
+    • The real graph eigenbasis (or projections computed from U_K),
+    • The synthetic eigenbasis U′_K,
+    • Real category-level representations,
+    • Synthetic category-level representations.
+  – Alternating update mechanism:  
+    • Based on config values tau1 and tau2 – here tau1 is 0 and tau2 is 5, so all iterations will update synthetic node features because t % (tau1 + tau2) will always be ≥ tau1.
+    • When the condition indicates an update for U′_K, call model.update_eigenbasis(gradients) with computed gradients.  
+    • Otherwise, update synthetic features via model.update_features(gradients).
+  – Use Adam optimizers (as specified by config.training.optimizer) with separate learning rates for features and eigenvectors.
+  – Log intermediate training metrics (loss values, possibly total variation measures) for debugging and later analysis.
+• Repeat the training cycle for num_runs (from config) and average the final performance metrics.
+
+──────────────────────────────
+5. Synthetic Graph Reconstruction
+
+• Once training converges, invoke the Model’s reconstruct_graph() method to construct the synthetic graph:
+  – Use the learned U′_K along with the replicated spectrum from the real graph (λ_k) to compute the Laplacian or adjacency matrix of the synthetic graph (A′).
+  – Validate that the constructed synthetic graph follows the theoretical formulations from the paper.
+
+──────────────────────────────
+6. Evaluation Phase
+
+• Instantiate the Evaluation module with the trained Model, the original GraphData, and the evaluation configuration (especially the GNN details for spatial and spectral architectures).  
+• Evaluation steps:
+  – Train a 2-layer GCN (with 256 hidden units) on the synthetic graph prepared in the previous step.
+  – Optionally, perform cross-architecture evaluation by training additional models (e.g., SGC, PPNP for spatial and ChebyNet, BernNet, GPR-GNN for spectral) as provided in the config.
+  – Evaluate the performance on the test split of the real graph (node classification accuracy), adhering to the experimental protocol described in the paper.
+  – Collect and log metrics such as average accuracy and standard deviation across runs.
+  
+──────────────────────────────
+7. Final Output and Logging
+
+• Print or log the final evaluation metrics (accuracy, loss curves, total variation metrics) to the console and/or output files.  
+• Report the final synthetic graph performance along with any observations (e.g., cross-architecture generalization performance).
+• Ensure that all configuration parameters and hyperparameters used in the experiment are recorded for reproducibility.
+• Perform any necessary cleanup before exiting.
+
+──────────────────────────────
+8. Dependencies and Flow Summary
+
+• Dependencies:  
+  – dataset_loader.py (for loading and preprocessing the dataset, computing eigen-decomposition)  
+  – model.py (defines the Model class encapsulating the loss definitions, forward pass, parameter updates, and graph reconstruction)  
+  – trainer.py (contains the training loop with alternating update logic and optimizer routines)  
+  – evaluation.py (implements the evaluation protocol using standard GNN architectures and computes performance metrics)
+
+• Execution Flow Summary (as per our call flow diagram):  
+  1. Main loads configurations from config.yaml.  
+  2. Main instantiates DatasetLoader; loads GraphData (with A, X, Y, L, eigenvalues, eigenvectors).  
+  3. Main creates a Model instance using configuration parameters (including synthetic graph hyperparameters and loss weights).  
+  4. Main instantiates Trainer with Model and GraphData; Trainer runs the training loop for the configured epochs, alternating updates based on tau1 and tau2.  
+  5. After training, Model.reconstruct_graph() is called to produce the final synthetic graph (A′, X′).  
+  6. Main then instantiates Evaluation with Model and GraphData; Evaluation trains a standard GNN (or multiple GNNs for cross-architecture analysis) on the synthetic graph and evaluates node classification performance on the test set of the real graph.  
+  7. Final evaluation results and logs are outputted.
+
+──────────────────────────────
+9. Considerations
+
+• The exact formulations of losses L_e and L_d must remain consistent with the paper’s approach. Since the paper does not fully specify the math details, we make reasonable assumptions (e.g., using Frobenius norm for eigenbasis matching and cosine-similarity for discrimination constraint) and document these choices clearly.  
+• The initialization method for U′_K may be simple random orthogonal initialization unless an SBM-based approach is implemented.  
+• With tau1 set to 0 and tau2 set to 5 in config, this implies that every update step will update the synthetic node features rather than the eigenbasis; note this and, if necessary, make adjustments based on further hyperparameter tuning.  
+• Logging and configuration CRUD operations must follow the parameters exactly as specified in config.yaml to ensure consistency and reproducibility across runs.
+
+──────────────────────────────
+Conclusion
+
+The main.py file, acting as the entry point, orchestrates the complete experimental pipeline—from loading the dataset to training the synthetic graph generator (GDEM) and evaluating its performance via various GNN architectures. By following the logic analysis above, every component (DatasetLoader, Model, Trainer, Evaluation) is coordinated in a sequential, reproducible, and modular manner, ensuring that our implementation adheres strictly to the methodologies, experimental setup, and evaluation criteria described in the paper "Graph Distillation with Eigenbasis Matching".
+
+This analysis provides the foundation needed before writing the actual implementation code.

@@ -1,0 +1,98 @@
+Below is a detailed logic analysis for model.py. This file implements the ModelManager class, which is responsible for instantiating and configuring the backbone models across domains (CV, NLP, and Graph) based on both the experiment’s configuration (from config.yaml) and dataset-specific properties (such as input dimensions and number of classes). The analysis ensures that the design from our mermaid diagram is strictly followed and that we use only the public methods outlined.
+
+────────────────────────────
+1. Class Overview
+
+• Class Name: ModelManager  
+  – Purpose: To build and return a PyTorch nn.Module instance that serves as the backbone model for a given experiment.  
+  – Responsibilities:  
+  – Read parameters from the provided configuration dictionary (loaded from config.yaml).  
+  – Select the proper architecture according to both the domain (CV, NLP, Graph) and the specific model name.  
+  – Modify the model’s input/output layers based on dataset properties (e.g., number of classes, image channels, feature dimensions).
+
+────────────────────────────
+2. Initialization (__init__)
+
+• __init__(self, config: dict)  
+ – Store the configuration dictionary (self.config) for later use.  
+ – The config parameters needed include the training settings (for CV, NLP, Graph models) such as the list of models; although the primary selection of a specific model may be determined by experiment code (e.g., main.py passing “ResNet-18” and domain “cv”) during build_model().
+ – Although some training hyperparameters (learning rate, epochs, etc.) belong in the training module, ModelManager will rely on the “models” fields in the configuration to decide what architectures to support.
+
+────────────────────────────
+3. Model Building Logic (build_model method)
+
+• build_model(self, domain: str, model_name: str, dataset_info: dict) → nn.Module  
+ – Inputs:  
+  • domain: A string indicating the domain (“cv”, “nlp”, or “graph”).  
+  • model_name: The specific model to instantiate (e.g., “LeNet”, “ResNet-18”, “ViT” for CV; “LSTM”, “BERT”, “GPT2” for NLP; “GCN”, “GAT”, “GIN” for Graph).  
+  • dataset_info: A dictionary providing dataset-specific properties such as:  
+   – num_classes: Define the output layer size (number of classes).  
+   – input_shape or num_channels (for CV) or input feature dimensions (for Graph).  
+ – Operation:  
+  • The method routes model instantiation based on the domain.
+   – For “cv”:  
+    – If model_name is “LeNet”:  
+     • Instantiate a simple convolutional network (custom or defined within this module).  
+     • Ensure the final fully connected layer has output dimension equal to dataset_info["num_classes"].  
+    – If model_name is “ResNet-18”:  
+     • Load torchvision’s resnet18 (using pretrained=False unless a change is needed) and then modify the final fully connected (fc) layer (i.e., model.fc) to nn.Linear(in_features, num_classes).  
+    – If model_name is “ViT”:  
+     • Instantiate a Vision Transformer model (using either torchvision’s implementation or a custom one), setting input image patch sizes as needed and replacing the classifier head with one that outputs dataset_info["num_classes"].
+   – For “nlp”:  
+    – If model_name is “LSTM”:  
+     • Build an LSTM-based classifier (a custom model) that includes an embedding layer, an LSTM module, and a final linear layer adapted to the number of output classes.  
+    – If model_name is “BERT”:  
+     • Use Hugging Face’s transformers library to load a pretrained BERT model for sequence classification (e.g., BertForSequenceClassification.from_pretrained(...)) with num_labels set to dataset_info["num_classes"].  
+    – If model_name is “GPT2”:  
+     • Similarly, load GPT2 for sequence classification (using GPT2ForSequenceClassification or AutoModelForSequenceClassification), ensuring the classification head is configured with num_labels equals dataset_info["num_classes"].  
+   – For “graph”:  
+    – If model_name is “GCN”:  
+     • Construct a GCN network using torch_geometric.nn modules (e.g., multiple GCNConv layers, optionally with a global pooling layer, then a linear layer with output size = num_classes).  
+    – If model_name is “GAT”:  
+     • Build a GAT network using GATConv layers, ensuring the final layer suits the task’s class count.  
+    – If model_name is “GIN”:  
+     • Instantiate a GIN-based model using GINConv layers with proper global aggregation and final linear layer matching dataset_info["num_classes"].
+ – Return Value: The fully constructed nn.Module instance ready for training.
+
+────────────────────────────
+4. Detailed Decision Points
+
+• Domain Detection:  
+ – The function begins by checking the domain parameter to decide which set of architectures to consider.
+
+• Dataset Adjustments:  
+ – The final classification layer is adjusted using dataset_info["num_classes"].  
+ – For CV models, additional modifications may include adapting the first layer if the input image channels differ from default (although the typical case is 3 channels).
+
+• Pretrained vs. From-Scratch:  
+ – For NLP models (BERT, GPT2), the implementation will use the pretrained weights from Hugging Face.  
+ – For the other models, initialization is done from scratch.
+
+• Modular Helper Functions (Optional Internal Methods):  
+ – Although the public API only allows build_model(), internally it may be beneficial to separate the logic into helper methods such as _build_cv_model(), _build_nlp_model(), and _build_graph_model() to keep each domain’s instantiation code clean and modular.
+
+────────────────────────────
+5. Integration with Other Modules
+
+• The returned model instance is used by Trainer (in trainer.py) to perform forward passes during training.  
+• ModelManager does not handle training hyperparameters (learning rate, optimizer, etc.), which are the concern of the training pipeline; its sole duty is to provide the proper architecture consistent with the dataset and domain as described in the paper.  
+• All model outputs conform to the standard PyTorch nn.Module interface ensuring compatibility with the training loop.
+
+────────────────────────────
+6. Use of Configuration (config.yaml)
+
+• The configuration file provides the following relevant details:  
+ – Under the “training” section for each domain, the list of supported models (e.g., "LeNet", "ResNet-18", "ViT" for CV).  
+ – Although the config does not directly list model-specific parameters (like layer sizes), it ensures that the experimental run is set up with a known list of architectures.  
+ – ModelManager will reference these configuration lists (or a specific selection passed at runtime) to enforce consistency with the experimental setup in CurBench.
+
+────────────────────────────
+7. Summary
+
+• The ModelManager class in model.py aligns with the overall project design by:
+ – Providing a unified interface (build_model()) to instantiate models across diverse domains (CV, NLP, Graph).  
+ – Using configuration parameters (from config.yaml) and dataset-specific properties to adjust model structures (input and output layers) as required.  
+ – Leveraging PyTorch, torchvision, Hugging Face Transformers, and torch_geometric packages appropriately to instantiate each model type.  
+ – Ensuring the returned model adheres to the PyTorch nn.Module interface so that it can be seamlessly integrated into the Trainer’s forward pass and curriculum learning pipeline.
+
+By following this analysis, the actual code in model.py will be modular, clear, and aligned with both the experimental design of CurBench and the provided configuration file, ensuring reproducibility and efficiency in building the backbone models.

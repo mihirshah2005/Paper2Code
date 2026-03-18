@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is a plain‐English review of the analysis with notes on potential issues:\n\n1. Dynamic Batching Details (Medium Severity)  \n • The writeup explains two strategies (sum‐based accumulation and maximum‐length estimation), but it isn’t entirely clear which one the code actually uses. In particular, the wording “L_max” is introduced without a clear statement of whether it applies to the source side, the target side, or both. This ambiguity in the batching strategy could lead to different batch s",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is a plain‐English review of the analysis with notes on potential issues:\n\n1. Dynamic Batching Details (Medium Severity)  \n • The writeup explains two strategies (sum‐based accumulation and maximum‐length estimation), but it isn’t entirely clear which one the code actually uses. In particular, the wording “L_max” is introduced without a clear statement of whether it applies to the source side, the target side, or both. This ambiguity in the batching strategy could lead to different batch s",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

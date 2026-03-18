@@ -1,0 +1,48 @@
+{
+  "all": [
+    {
+      "target_func_name": "inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The hybrid dirty sample injection procedure describes two alternative orders (poisoning first then noisy label or vice versa) without clearly specifying which order is the default or how this choice is set via configuration. This ambiguity may lead to inconsistent behavior if the configuration does not explicitly define the intended order.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample",
+      "severity_level": "low",
+      "critique": "The computation of the matching score as a weighted sum of binary votes lacks detailed explanation of the weight calibration. While equal weighting is stated as the default, the mechanism for potential future calibration adjustments is under-specified.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Evaluation (ASR generation)",
+      "severity_level": "medium",
+      "critique": "The procedure for generating the triggered test subset for ASR evaluation is ambiguous regarding the exact proportion or number of samples to modify and whether the same trigger injection parameters (especially the ordering when hybrid samples are involved) are consistently applied as in training. This could impact reproducibility and consistency with the original design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Visual Answer Evaluation (VAE) module",
+      "severity_level": "low",
+      "critique": "The VAE module's approach of using simple string matching (and a ChatGPT-based prompt for general questions) might be too simplistic given the variability of natural language responses. Additional details on handling edge cases or variations could help ensure robust evaluation, as expected by the original paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "API Rate-Limit Management",
+      "severity_level": "low",
+      "critique": "While the configuration mentions setting up caching or API rate-limit management systems, the specifics of error handling or fallback mechanisms for API failures (for both ChatGPT and Instruct-BLIP) are not detailed. This omission could affect system stability and reproducibility, albeit it is a minor concern relative to core functionality.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The hybrid dirty sample injection procedure describes two alternative orders (poisoning first then noisy label or vice versa) without clearly specifying which order is the default or how this choice is set via configuration. This ambiguity may lead to inconsistent behavior if the configuration does not explicitly define the intended order.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Evaluation (ASR generation)",
+      "severity_level": "medium",
+      "critique": "The procedure for generating the triggered test subset for ASR evaluation is ambiguous regarding the exact proportion or number of samples to modify and whether the same trigger injection parameters (especially the ordering when hybrid samples are involved) are consistently applied as in training. This could impact reproducibility and consistency with the original design.",
+      "source": "llm-judge"
+    }
+  ]
+}

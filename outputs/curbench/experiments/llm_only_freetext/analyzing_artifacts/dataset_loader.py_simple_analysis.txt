@@ -1,0 +1,108 @@
+Below is the revised logic analysis for dataset_loader.py. In this version, we not only detail the expected configuration keys and how they influence the behavior of the DatasetLoader class but also clearly explain how missing or malformed keys are handled—either by supplying default values or by raising explicit errors.
+
+────────────────────────────
+1. Constructor and Configuration Parsing
+────────────────────────────
+• When instantiating the DatasetLoader, a configuration dictionary (typically loaded from config.yaml) is passed in. This configuration is expected to include sections such as "training", "curriculum", "reproducibility", and "evaluation".  
+• The constructor explicitly parses domain-specific keys. For instance, for CV, keys (like "batch_size", "optimizer", "learning_rate", and "epochs") should be available under config.training.cv. Similarly, keys for NLP and graph experiments must also be present.  
+• Handling Missing/Malformed Keys:
+  – If a key is missing (for example, if config.training.cv.batch_size is not provided), the implementation will check for a default value (hard-coded default or from a fallback section in the YAML configuration).  
+  – In cases where a key is malformed (such as a non-numeric value for an expected numeric hyperparameter), the constructor should raise a descriptive error so the user is alerted to adjust the configuration.  
+• The constructor may also accept an optional dataset identifier string (e.g., "cifar10-noise-0.4" or "tinyimagenet-imbalance-50"). It then validates this identifier against a list of known dataset names and the associated experimental settings.  
+• All validated settings are stored in instance variables, ensuring that later methods (load_data(), apply_noise(), and apply_imbalance()) have clear and unambiguous parameters to work with.
+
+────────────────────────────
+2. Method: load_data()
+────────────────────────────
+Objective:
+• Load raw datasets according to the domain (CV, NLP, or graph), perform dataset splitting, and apply any experimental preprocessing (noise or imbalance) as dictated by the configuration and dataset identifier.
+
+Detailed Logic:
+a. Domain and Identifier Parsing:
+  – Parse the input dataset identifier (for example, “cifar10-noise-0.4”) to determine the core dataset name and whether noise ("noise-p") or imbalance ("imbalance-r") processing is needed.
+  – Identify the domain by matching the core name against known CV datasets (e.g., “cifar10”, “cifar100”, “tinyimagenet”), NLP tasks (e.g., GLUE tasks), or graph datasets (e.g., “ogbg-molhiv” or other TUDataset names).
+  – If the identifier is not recognized or is incomplete, the loader should raise a clear error message or, if possible, fallback to a default (for example, defaulting to the standard setting without noise/imbalance).
+  
+b. Loading the Dataset:
+  – For Computer Vision (CV):
+   • Use torchvision.datasets (or a custom loader for Tiny-ImageNet) to download and load datasets such as CIFAR-10, CIFAR-100, or Tiny-ImageNet.
+   • Split the training set into a new training set and a validation set with a 9:1 ratio, and choose the appropriate test set based on the dataset’s specification.
+  – For Natural Language Processing (NLP):
+   • Use Hugging Face’s datasets setup to load GLUE benchmark datasets (excluding problematic ones) and assign the validation set as the test set since test labels are not provided.
+  – For Graph datasets:
+   • For ogbg-molhiv, rely on the official split provided by OGB.
+   • For datasets from TUDataset, randomly split the data into an 8:1:1 ratio for training, validation, and test sets.
+  
+c. Preprocessing the Training Set:
+  – If the dataset identifier contains a noise parameter (indicated by “noise-p”), extract the noise probability (p) and call the apply_noise() method on the training split.
+  – If the identifier contains an imbalance parameter (indicated by “imbalance-r”) and the data domain is CV, extract the imbalance factor (r) and call apply_imbalance() on the training set.
+  – If multiple modifications are specified, define a clear order (for example, applying noise first before rebalancing) and document this ordering.
+  
+d. Return Value:
+  – Package the processed datasets into a dictionary with keys such as "train", "val", and "test", ready to be converted into PyTorch DataLoaders within the training module.
+
+────────────────────────────
+3. Method: apply_noise(data: Any, p: float)
+────────────────────────────
+Objective:
+• To add label noise to the training set by randomly altering the labels of a specified percentage of samples.
+
+Detailed Logic:
+a. Iteration and Random Decision:
+  – Loop through each sample in the training dataset.
+  – For each sample, generate a random number (using reproducible methods like numpy’s random generator set with the correct seed from config.reproducibility.seeds).
+  – If the random value is less than p, change the sample’s label.
+  
+b. Changing the Label:
+  – The new label is chosen uniformly at random from the available class labels, ensuring that it differs from the sample’s original label.
+  
+c. Return the Noisy Dataset:
+  – After processing all samples, return the modified dataset to be used during training.
+
+────────────────────────────
+4. Method: apply_imbalance(data: Any, r: int)
+────────────────────────────
+Objective:
+• To adjust the training data distribution to mimic a long-tailed (imbalanced) dataset by resampling class data according to an exponential decay function.
+
+Detailed Logic:
+a. Validate the Context:
+  – Confirm that this operation is only applied when the data domain is CV. For NLP or graph datasets, simply return the dataset unchanged.
+  – If the imbalance factor r is 1 (i.e., the dataset is balanced), return the original dataset.
+  
+b. Compute Target Counts:
+  – Determine the number of classes (C) in the dataset and assume the original training set is balanced.
+  – Compute the decay factor d from the relationship r = n₀/n₍C-1₎, typically taking d = (1/r)^(1/(C-1)).
+  – For each class c from 0 to C-1, calculate the target sample count n_c = n₀ * d^c (using appropriate rounding).
+  
+c. Resample the Dataset:
+  – For each class, randomly pick n_c samples from that class using a reproducible random sampling method.
+  – Merge the resampled data to create the imbalanced training set.
+  
+d. Return the Imbalanced Dataset:
+  – Provide the newly formed training set, now following a long-tailed distribution, for downstream use.
+
+────────────────────────────
+5. Error Handling and Reproducibility
+────────────────────────────
+• Throughout the methods, validate input parameters (such as ensuring p is between 0 and 1 and r is a positive integer).  
+• In the constructor and during dataset identifier parsing, if a required configuration key is missing or malformed, the implementation will either:
+  – Use a default value (if one has been defined in the code or configuration file), or
+  – Raise a clear and descriptive error that points to the missing or incorrect key.
+• Reproducibility is maintained by using the provided random seeds from config.reproducibility.seeds during all random operations (both in noise injection and data resampling).
+
+────────────────────────────
+6. Integration with Other Modules
+────────────────────────────
+• The processed datasets from load_data() are intended to be wrapped in torch DataLoaders by the Trainer module.
+• Consistent use of the configured parameters ensures that the DatasetLoader integrates seamlessly with ModelManager, Trainer, and Evaluation modules within the overall experiment framework.
+• The module makes use of torch, torchvision, Hugging Face utilities (if needed), torch_geometric, and numpy to support loading and preprocessing tasks across the three data domains.
+
+────────────────────────────
+7. Summary
+────────────────────────────
+The DatasetLoader class is responsible for:
+  – Parsing and validating the configuration provided at initialization, including handling any missing or malformed keys by supplying default values or raising errors.
+  – Loading raw datasets from CV, NLP, and graph sources, performing proper splits based on the experiment design, and parsing dataset identifiers to determine if noise or imbalance modification is needed.
+  – Applying noise injection (via apply_noise) and creating an imbalanced dataset (via apply_imbalance) in a reproducible manner.
+This revised analysis addresses the critiques by clearly specifying how default values and error messages are managed during configuration parsing, ensuring a robust and consistent implementation that can be seamlessly integrated into the rest of the experiment pipeline.

@@ -1,0 +1,172 @@
+{
+  "paper_name": "curbench",
+  "mode": "llm_only",
+  "feedback_format": "json",
+  "max_iterations": 3,
+  "total_prompt_tokens": 572722,
+  "total_completion_tokens": 150898,
+  "total_tokens": 723620,
+  "per_file_iterations": {
+    "config.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 5,
+        "low": 0,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 3,
+        "low": 2,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 2,
+        "low": 2,
+        "total_critiques": 5
+      }
+    ],
+    "dataset_loader.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 4,
+        "low": 4,
+        "total_critiques": 8
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 3,
+        "low": 4,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 5,
+        "low": 2,
+        "total_critiques": 7
+      }
+    ],
+    "model.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 3,
+        "low": 4,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 1,
+        "total_critiques": 4
+      }
+    ],
+    "curriculum.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 4,
+        "low": 1,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 2,
+        "low": 3,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 2,
+        "low": 4,
+        "total_critiques": 6
+      }
+    ],
+    "trainer.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 4,
+        "low": 2,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 7
+      }
+    ],
+    "evaluation.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 4,
+        "low": 1,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 2,
+        "low": 3,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      }
+    ],
+    "main.py": [
+      {
+        "iteration": 1,
+        "high": 0,
+        "medium": 2,
+        "low": 3,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 3,
+        "low": 1,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 2,
+        "total_critiques": 5
+      }
+    ]
+  }
+}

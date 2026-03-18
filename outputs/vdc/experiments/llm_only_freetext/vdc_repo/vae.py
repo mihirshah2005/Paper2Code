@@ -1,0 +1,220 @@
+"""
+vae.py
+
+This module implements the Visual Answer Evaluation (VAE) class for the VDC system.
+It provides methods to evaluate whether the answer returned by the VQA module is
+consistent with the expected semantic description for a given image label.
+It supports two evaluation modes:
+  1. "label-specific" questions: employs deterministic string matching with a refined disambiguation strategy.
+  2. "general" questions: constructs an evaluation prompt and uses the ChatGPT API (gpt-3.5-turbo) to obtain an assessment.
+
+The evaluation logic uses robust regex-based token detection to disambiguate cases
+where both "yes" and "no" tokens appear.
+"""
+
+import re
+import time
+import logging
+from typing import List, Optional, Dict, Any
+
+import openai
+from utils import clean_text
+
+# Initialize logger for this module.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    # Add a console handler if not already present.
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(console_handler)
+
+
+def regex_find_all(pattern: str, text: str) -> List[int]:
+    """
+    Return a list of starting indices for all non-overlapping occurrences of the regex pattern in the text.
+    
+    Args:
+        pattern (str): The regular expression pattern to search for.
+        text (str): The text in which to search.
+
+    Returns:
+        List[int]: A list of start indices where the pattern is found.
+    """
+    return [match.start() for match in re.finditer(pattern, text)]
+
+
+def index_of_first_occurrence(text: str, token: str) -> Optional[int]:
+    """
+    Return the index of the first occurrence of the token as a whole word in the text.
+    
+    Args:
+        text (str): The input text.
+        token (str): The token to search as a whole word.
+
+    Returns:
+        Optional[int]: The index of the first occurrence if found, otherwise None.
+    """
+    pattern = r"\b" + re.escape(token) + r"\b"
+    match = re.search(pattern, text)
+    return match.start() if match else None
+
+
+class VAE:
+    """
+    Visual Answer Evaluation (VAE) module for the VDC system.
+
+    This class provides a single method 'evaluate_answer' that returns a boolean indicating
+    whether the provided answer is semantically consistent with the expected answer, based on
+    the type of question (either "label-specific" or "general").
+
+    For "label-specific" questions, the evaluation is performed via direct string matching using regex.
+    For "general" questions, an evaluation prompt is constructed and sent to the ChatGPT API,
+    and the returned answer is then processed similarly.
+
+    Attributes:
+        api_model (str): ChatGPT model to use for evaluation (default: "gpt-3.5-turbo").
+        max_retries (int): Maximum number of retries for ChatGPT API calls (default: 3).
+        initial_backoff (float): Initial backoff delay in seconds for API retries (default: 1.0).
+    """
+
+    def __init__(self, eval_config: Dict[str, Any]) -> None:
+        """
+        Initialize the VAE instance with evaluation configuration.
+
+        Args:
+            eval_config (Dict[str, Any]): Evaluation-specific configuration dictionary.
+                Expected keys:
+                    - "api_model": (str) ChatGPT model to use. Default is "gpt-3.5-turbo".
+                    - "max_retries": (int) Maximum number of API call retries. Default is 3.
+                    - "initial_backoff": (float) Base backoff time in seconds. Default is 1.0.
+        """
+        self.api_model: str = eval_config.get("api_model", "gpt-3.5-turbo")
+        self.max_retries: int = int(eval_config.get("max_retries", 3))
+        self.initial_backoff: float = float(eval_config.get("initial_backoff", 1.0))
+        logger.info("Initialized VAE with API model '%s', max_retries=%d, initial_backoff=%.2f seconds.",
+                    self.api_model, self.max_retries, self.initial_backoff)
+
+    def evaluate_answer(self, answer: str, expected: str, question_type: str) -> bool:
+        """
+        Evaluate the provided answer for consistency with the expected content.
+        
+        The evaluation strategy depends on the question type:
+          - "label-specific": Uses deterministic regex matching to check for the presence of "yes" and "no"
+            tokens in the cleaned answer text, applying a disambiguation strategy if both appear.
+          - "general": Constructs an evaluation prompt and sends it to the ChatGPT API. The API is expected
+            to reply with "yes" or "no" only. The response is then processed similarly using regex.
+        
+        Args:
+            answer (str): The answer text provided by the VQA module.
+            expected (str): The expected semantic description associated with the image label.
+            question_type (str): The type of the question ("label-specific" or "general").
+        
+        Returns:
+            bool: True if the answer is considered correct (consistent), False otherwise.
+        """
+        # Clean the input answer text to standardize it.
+        cleaned_answer: str = clean_text(answer)
+        logger.info("Evaluating answer for question_type='%s'. Cleaned answer: '%s'", question_type, cleaned_answer)
+
+        if question_type.lower() == "label-specific":
+            # Use regex to find whole-word occurrences of 'yes' and 'no'
+            yes_positions: List[int] = regex_find_all(r"\byes\b", cleaned_answer)
+            no_positions: List[int] = regex_find_all(r"\bno\b", cleaned_answer)
+            logger.info("Label-specific evaluation: yes_positions=%s, no_positions=%s", yes_positions, no_positions)
+
+            if yes_positions and not no_positions:
+                return True
+            elif no_positions and not yes_positions:
+                return False
+            elif yes_positions and no_positions:
+                if len(yes_positions) > len(no_positions):
+                    return True
+                elif len(no_positions) > len(yes_positions):
+                    return False
+                else:
+                    # Counts are equal; disambiguate using first occurrence index.
+                    first_yes: Optional[int] = index_of_first_occurrence(cleaned_answer, "yes")
+                    first_no: Optional[int] = index_of_first_occurrence(cleaned_answer, "no")
+                    if first_yes is not None and first_no is not None:
+                        if first_yes < first_no:
+                            return True
+                        else:
+                            return False
+                    else:
+                        logger.warning("Ambiguous token positions in answer '%s'. Returning default False.", cleaned_answer)
+                        return False
+            else:
+                logger.warning("No clear 'yes' or 'no' tokens found in label-specific answer '%s'. Returning default False.", cleaned_answer)
+                return False
+
+        elif question_type.lower() == "general":
+            # Construct evaluation prompt for the ChatGPT API.
+            prompt: str = (
+                f"Assume you are a helpful assistant for evaluation. Does the answer: '{answer}' "
+                f"correspond to the expected description: '{expected}'? Respond with 'yes' or 'no' only."
+            )
+            logger.info("General evaluation prompt: %s", prompt)
+            attempt: int = 0
+            response_text: str = ""
+            backoff: float = self.initial_backoff
+
+            # Retry loop for API call.
+            while attempt < self.max_retries:
+                try:
+                    response = openai.ChatCompletion.create(
+                        model=self.api_model,
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant for evaluation."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.0,
+                        max_tokens=5
+                    )
+                    response_text = response.choices[0].message.content.strip()
+                    if response_text:
+                        logger.info("Received evaluation response: '%s'", response_text)
+                        break
+                except Exception as e:
+                    attempt += 1
+                    logger.error("ChatGPT API call error (attempt %d): %s", attempt, e)
+                    time.sleep(backoff)
+                    backoff *= 2  # Exponential backoff
+
+            if not response_text:
+                logger.error("Failed to obtain evaluation response from ChatGPT after %d attempts. Returning default False.", self.max_retries)
+                return False
+
+            # Clean and evaluate the ChatGPT response.
+            cleaned_response: str = clean_text(response_text)
+            logger.info("Cleaned ChatGPT response: '%s'", cleaned_response)
+            yes_resp_positions: List[int] = regex_find_all(r"\byes\b", cleaned_response)
+            no_resp_positions: List[int] = regex_find_all(r"\bno\b", cleaned_response)
+            logger.info("General evaluation: yes_resp_positions=%s, no_resp_positions=%s", yes_resp_positions, no_resp_positions)
+
+            if yes_resp_positions and not no_resp_positions:
+                return True
+            elif no_resp_positions and not yes_resp_positions:
+                return False
+            elif yes_resp_positions and no_resp_positions:
+                if len(yes_resp_positions) > len(no_resp_positions):
+                    return True
+                elif len(no_resp_positions) > len(yes_resp_positions):
+                    return False
+                else:
+                    first_yes_resp: Optional[int] = index_of_first_occurrence(cleaned_response, "yes")
+                    first_no_resp: Optional[int] = index_of_first_occurrence(cleaned_response, "no")
+                    if first_yes_resp is not None and first_no_resp is not None:
+                        if first_yes_resp < first_no_resp:
+                            return True
+                        else:
+                            return False
+                    else:
+                        logger.warning("Ambiguous token positions in general evaluation response '%s'. Returning default False.", cleaned_response)
+                        return False
+            else:
+                logger.warning("No clear 'yes' or 'no' in general evaluation response '%s'. Returning default False.", cleaned_response)
+                return False
+        else:
+            logger.error("Unrecognized question type '%s'. Returning default False.", question_type)
+            return False

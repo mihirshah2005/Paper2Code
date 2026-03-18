@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Overall, this logic analysis is very thorough and largely in line with the paper’s experimental design and configuration specifications. However, I did notice a few points that could be clarified or detailed further:\n\n1. Dynamic Batching Calculation – Medium Severity  \n The analysis explains that a token threshold of 25,000 tokens per side should be reached before forming a batch. Although it mentions using the sum of sentence lengths or the maximum length multiplied by the number of examples, t",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Overall, this logic analysis is very thorough and largely in line with the paper’s experimental design and configuration specifications. However, I did notice a few points that could be clarified or detailed further:\n\n1. Dynamic Batching Calculation – Medium Severity  \n The analysis explains that a token threshold of 25,000 tokens per side should be reached before forming a batch. Although it mentions using the sum of sentence lengths or the maximum length multiplied by the number of examples, t",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

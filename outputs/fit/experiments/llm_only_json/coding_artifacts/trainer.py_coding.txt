@@ -1,0 +1,197 @@
+```python
+"""trainer.py
+
+This module defines the Trainer class responsible for managing the entire training loop 
+for the FiT diffusion model. It handles data preparation, noise addition (following a DDPM-like
+schedule), forward pass through the transformer backbone, loss computation using masking
+to ignore padded tokens, parameter updates with AdamW, EMA updates, and periodic checkpointing.
+
+Usage:
+    trainer = Trainer(model, dataloader, config)
+    trainer.train()
+"""
+
+import os
+import copy
+from typing import Any, Dict
+
+import torch
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+
+class Trainer:
+    def __init__(self, model: Any, dataloader: DataLoader, config: Dict[str, Any]) -> None:
+        """
+        Initialize the Trainer with the model, dataloader, and configuration.
+        
+        Args:
+            model (Any): An instance of the Model class.
+            dataloader (DataLoader): DataLoader yielding training batches.
+            config (Dict[str, Any]): Configuration dictionary (from config.yaml).
+        """
+        self.config: Dict[str, Any] = config
+        self.model: Any = model
+        self.dataloader: DataLoader = dataloader
+
+        # Set device from torch settings.
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Determine training steps based on model variant.
+        training_config: Dict[str, Any] = self.config.get("training", {})
+        if hasattr(self.model, "variant"):
+            variant: str = getattr(self.model, "variant")
+            if variant == "B/2":
+                self.training_steps: int = training_config.get("training_steps_fit_b2", 400000)
+            elif variant == "XL/2":
+                self.training_steps: int = training_config.get("training_steps_fit_xl2", 1800000)
+            else:
+                print("Warning: Unrecognized model variant. Defaulting to training_steps_fit_b2.")
+                self.training_steps = training_config.get("training_steps_fit_b2", 400000)
+        else:
+            print("Warning: Model variant attribute not found. Defaulting to training_steps_fit_b2.")
+            self.training_steps = training_config.get("training_steps_fit_b2", 400000)
+
+        # Set up optimizer: AdamW with learning rate and weight decay from config.
+        self.learning_rate: float = training_config.get("learning_rate", 1e-4)
+        self.weight_decay: float = training_config.get("weight_decay", 0.0)
+        self.optimizer: AdamW = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+
+        # Set up EMA with decay from config.
+        self.ema_decay: float = training_config.get("ema_decay", 0.9999)
+        # Initialize EMA state as a deep copy of the model's state_dict.
+        self.ema_state: Dict[str, torch.Tensor] = copy.deepcopy(self.model.state_dict())
+
+        # Checkpointing interval (in training steps); set a default if not specified.
+        self.checkpoint_interval: int = training_config.get("checkpoint_interval", 1000)
+
+        # For tracking global training step.
+        self.global_step: int = 0
+
+    def train(self) -> None:
+        """
+        Execute the training loop until the target number of training steps is reached.
+        The loop iterates over batches from the DataLoader, performs noise injection,
+        forward pass, loss computation (using a mask on valid tokens), backpropagation,
+        EMA updates, and periodic checkpoint saving.
+        """
+        self.model.train()
+        pbar = tqdm(total=self.training_steps, desc="Training", unit="step")
+        
+        while self.global_step < self.training_steps:
+            for batch in self.dataloader:
+                # Move input images to device.
+                images: torch.Tensor = batch["image"].to(self.device)  # shape: [B, C, H, W]
+                batch_size: int = images.size(0)
+
+                # Fallback for latent codes:
+                # If batch contains precomputed latent codes (key "latent"), use them.
+                # Otherwise, re-encode images using the pretrained VAE encoder.
+                if "latent" in batch:
+                    latent: torch.Tensor = batch["latent"].to(self.device)
+                else:
+                    # Re-encode raw images through the model's VAE encoder.
+                    latent = self.model.vae_encoder(images)
+                
+                # Obtain tokenized latent sequences, binary mask, and positional coordinates using patchification.
+                tokens, mask, positions = self.model._patchify_and_pad(latent)
+                tokens = tokens.to(self.device)         # Shape: [B, L_max, token_dim]
+                mask = mask.to(self.device)             # Shape: [B, L_max] (1 for valid, 0 for padding)
+                positions = positions.to(self.device)   # Shape: [B, L_max, 2]
+
+                # Sample diffusion timesteps uniformly.
+                # For simplicity, assume timesteps in the range [0, 1000).
+                t = torch.randint(0, 1000, (batch_size,), device=self.device).long()
+
+                # Sample Gaussian noise of the same shape as tokens.
+                noise = torch.randn_like(tokens)
+
+                # Create noisy tokens by simply adding the sampled Gaussian noise.
+                noisy_tokens = tokens + noise
+
+                # Incorporate diffusion-conditioning using time embeddings.
+                time_emb = self.model.time_embed_layer(t)  # Shape: [B, hidden_size]
+                noisy_tokens = noisy_tokens + time_emb.unsqueeze(1)  # Broadcast addition.
+
+                # Forward pass through the transformer blocks.
+                transformer_input = noisy_tokens
+                for block in self.model.transformer_blocks:
+                    transformer_input = block(transformer_input, positions, mask)
+                transformer_output = self.model.norm_out(transformer_input)
+                predicted_noise = self.model.output_proj(transformer_output)  # Shape: [B, L_max, hidden_size]
+
+                # Compute element-wise MSE loss between predicted noise and the ground truth noise.
+                loss_elem = F.mse_loss(predicted_noise, noise, reduction="none")  # Shape: [B, L_max, hidden_size]
+                mask_expanded = mask.unsqueeze(-1)  # Shape: [B, L_max, 1]
+                masked_loss = loss_elem * mask_expanded  # Zero out contributions from padded tokens.
+                # Average loss over valid tokens; add a small epsilon to avoid division by zero.
+                loss = masked_loss.sum() / (mask_expanded.sum() + 1e-8)
+
+                # Backpropagation and optimizer update.
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                # Update EMA weights.
+                self._update_ema()
+
+                # Update global step and progress bar.
+                self.global_step += 1
+                pbar.update(1)
+
+                # Compute valid token ratio for logging.
+                valid_token_ratio = mask.sum().item() / mask.numel()
+
+                # Logging metrics every 100 steps.
+                if self.global_step % 100 == 0:
+                    pbar.set_postfix(
+                        {"Loss": f"{loss.item():.4f}", "Valid Token Ratio": f"{valid_token_ratio:.4f}"}
+                    )
+
+                # Save checkpoints periodically.
+                if self.global_step % self.checkpoint_interval == 0:
+                    self.save_checkpoint(self.global_step)
+
+                if self.global_step >= self.training_steps:
+                    break
+
+        pbar.close()
+        print("Training complete.")
+
+    def _update_ema(self) -> None:
+        """
+        Update the EMA (Exponential Moving Average) of model parameters.
+        For each parameter, the EMA is updated by:
+            ema_param = ema_decay * ema_param + (1 - ema_decay) * current_param
+        The EMA state is maintained as a dictionary (self.ema_state).
+        """
+        model_state = self.model.state_dict()
+        with torch.no_grad():
+            for key, param in model_state.items():
+                if key in self.ema_state:
+                    self.ema_state[key].mul_(self.ema_decay).add_(param, alpha=1 - self.ema_decay)
+                else:
+                    self.ema_state[key] = param.clone()
+
+    def save_checkpoint(self, step: int) -> None:
+        """
+        Save a checkpoint including the model state, optimizer state, and EMA state.
+        
+        Args:
+            step (int): The current global training step.
+        """
+        checkpoint = {
+            "global_step": step,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "ema_state": self.ema_state,
+        }
+        checkpoint_dir = os.path.join("checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved at step {step} to {checkpoint_path}")
+```

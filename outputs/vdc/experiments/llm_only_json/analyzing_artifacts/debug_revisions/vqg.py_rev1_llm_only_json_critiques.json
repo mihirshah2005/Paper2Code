@@ -1,0 +1,84 @@
+{
+  "all": [
+    {
+      "target_func_name": "__init__",
+      "severity_level": "medium",
+      "critique": "The initialization section assumes that a valid mapping from dataset names to label‑specific question counts always exists in the configuration. There is no fallback or error handling if an unknown dataset is provided, which could lead to runtime issues.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_general_questions",
+      "severity_level": "medium",
+      "critique": "The method proposes randomly sampling from a fixed set of question templates based on a count from config. This risks non‐determinism that could affect reproducibility. It would be better to have a deterministic selection (or seed the randomness) and handle the case where available templates are fewer than expected.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The caching strategy is outlined as checking for a cached response based solely on the label and question count. However, if the same label appears in different datasets (with potentially different numbers and types of questions) or if the prompt template changes, this could lead to collisions and incorrect reuse of cached results. The caching key should incorporate dataset identity and prompt template version.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The logic for parsing the ChatGPT API response is left very open-ended (newline-separated list or JSON-parsable string). Without a clear standard output format defined, there is a risk of mis-parsing responses, especially if the API output format varies. More explicit parsing rules and validation should be defined.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "While basic error logging for API call failures is mentioned, there is insufficient detail on how to recover from such failures. Relying solely on logging and returning an empty list or default questions might not be robust enough for downstream tasks, and a more explicit fallback or retry mechanism should be established.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_all_questions",
+      "severity_level": "low",
+      "critique": "The optional combined method that returns both general and label-specific questions is not part of the original specification. Although useful, its integration should ensure that errors or mismatches in one component do not silently compromise the combined result. Clear documentation on its intended usage is recommended.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "External Utilities Integration",
+      "severity_level": "medium",
+      "critique": "The implementation heavily relies on external utility functions (e.g., caching functions, ask_chatgpt). Their expected behavior and interfaces are not defined in the analysis, which could lead to integration issues if these components do not adhere to the assumed contracts. A clear specification or documentation for these utilities should be provided.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "__init__",
+      "severity_level": "medium",
+      "critique": "The initialization section assumes that a valid mapping from dataset names to label‑specific question counts always exists in the configuration. There is no fallback or error handling if an unknown dataset is provided, which could lead to runtime issues.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_general_questions",
+      "severity_level": "medium",
+      "critique": "The method proposes randomly sampling from a fixed set of question templates based on a count from config. This risks non‐determinism that could affect reproducibility. It would be better to have a deterministic selection (or seed the randomness) and handle the case where available templates are fewer than expected.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The caching strategy is outlined as checking for a cached response based solely on the label and question count. However, if the same label appears in different datasets (with potentially different numbers and types of questions) or if the prompt template changes, this could lead to collisions and incorrect reuse of cached results. The caching key should incorporate dataset identity and prompt template version.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The logic for parsing the ChatGPT API response is left very open-ended (newline-separated list or JSON-parsable string). Without a clear standard output format defined, there is a risk of mis-parsing responses, especially if the API output format varies. More explicit parsing rules and validation should be defined.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "While basic error logging for API call failures is mentioned, there is insufficient detail on how to recover from such failures. Relying solely on logging and returning an empty list or default questions might not be robust enough for downstream tasks, and a more explicit fallback or retry mechanism should be established.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "External Utilities Integration",
+      "severity_level": "medium",
+      "critique": "The implementation heavily relies on external utility functions (e.g., caching functions, ask_chatgpt). Their expected behavior and interfaces are not defined in the analysis, which could lead to integration issues if these components do not adhere to the assumed contracts. A clear specification or documentation for these utilities should be provided.",
+      "source": "llm-judge"
+    }
+  ]
+}

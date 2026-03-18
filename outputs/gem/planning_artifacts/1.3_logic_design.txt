@@ -1,0 +1,43 @@
+----------------------------------------
+[Required packages]
+- numpy==1.21.0
+- torch==1.9.0
+- scipy==1.7.0
+- networkx==2.6.3
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['dataset_loader.py', 'DatasetLoader class handles loading graph datasets from files or online sources. It computes the normalized Laplacian matrix, performs or calls an eigen-decomposition (using scipy for truncated eigenvalues/eigenvectors), and packages the results into a GraphData structure containing adjacency, node features, labels, laplacian, eigenvalues, and eigenvectors. Dependencies: numpy, scipy, networkx.']
+- ['model.py', "Model class implements the synthetic graph distillation mechanism. It initializes synthetic node features and an eigenbasis (U'_K), defines the forward() method for computing synthetic graph properties, computes loss components (L_e for eigenbasis matching, L_d for discrimination constraint, L_o for orthogonality regularization), and provides a method to reconstruct the synthetic graph (reconstruct_graph) from the learned synthetic eigenbasis and the real graph spectrum. Dependencies: torch and numpy."]
+- ['trainer.py', 'Trainer class orchestrates the training loop for the model. It alternates updates between synthetic eigenbasis and synthetic node features based on configured intervals (tau1 and tau2). It calls model methods to compute forward passes, losses, and applies optimizer steps using Adam. Responsibilities include logging of losses and intermediate metrics (e.g., total variation) for debugging and monitoring. Dependencies: model.py, torch.']
+- ['evaluation.py', 'Evaluation class implements the evaluation protocol. It takes the distilled synthetic graph, trains standard GNN architectures (e.g., a 2-layer GCN) on the synthetic graph, and evaluates performance on the test split of the real graph (node classification accuracy). It also supports cross-architecture evaluation by instantiating different GNNs. Dependencies: torch, dataset_loader.py for GraphData.']
+- ['main.py', 'Main entry point of the application. It loads configuration, instantiates DatasetLoader to load the dataset, initializes the Model, sets up the Trainer to run the training loop, and finally calls the Evaluation module to report performance metrics. It defines the overall execution flow and the CRUD operations for configuration objects and logging results. Dependencies: dataset_loader.py, model.py, trainer.py, evaluation.py.']
+
+----------------------------------------
+[Task list]
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Shared configuration variables (e.g., learning rates, epochs, tau1/tau2, hyperparameters for loss weights α, β, γ) are maintained in a common config dictionary. Utility functions for eigen-decomposition, orthogonal initialization, and logging metrics (including total variation) are shared between dataset_loader.py and trainer.py. The GraphData structure serves as a common data container passed between modules.
+
+----------------------------------------
+[Anything UNCLEAR]
+Clarification is needed on the following points:
+1. The exact mathematical formulations for the eigenbasis matching loss (L_e) and the discrimination constraint loss (L_d) as they are not completely specified in the paper.
+2. The recommended initialization method for the synthetic eigenbasis (whether to use a stochastic block model based approach or simple random orthogonal initialization).
+3. Detailed hyperparameter values for alternating update scheduling (tau1, tau2) and number of training epochs per dataset.
+4. The expected format and source of the input graph datasets.
+

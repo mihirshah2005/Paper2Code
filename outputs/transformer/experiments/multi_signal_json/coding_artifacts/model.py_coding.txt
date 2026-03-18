@@ -1,0 +1,422 @@
+```python
+"""model.py
+
+This module contains the implementation of the Transformer model as presented in "Attention Is All You Need".
+It defines the complete encoder-decoder architecture with multi-head attention, position-wise feed-forward networks,
+and sinusoidal positional encodings. The TransformerModel ties input embeddings with the output projection layer.
+It reads hyperparameters from a configuration dictionary (typically parsed from config.yaml).
+
+Classes:
+    PositionalEncoding: Implements sinusoidal positional encoding.
+    MultiHeadAttention: Implements scaled dot-product attention with multiple heads.
+    PositionwiseFeedForward: Implements the two-layer feed-forward network with ReLU.
+    EncoderLayer: A single transformer encoder layer with self-attention and feed-forward sub-layers.
+    Encoder: Stack of encoder layers.
+    DecoderLayer: A single transformer decoder layer with masked self-attention, encoder-decoder attention, and feed-forward sub-layers.
+    Decoder: Stack of decoder layers.
+    TransformerModel: The complete encoder-decoder model.
+
+Author: [Your Name]
+Date: [Current Date]
+"""
+
+import math
+from typing import Optional, Dict, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class PositionalEncoding(nn.Module):
+    """Implements the sinusoidal positional encoding function."""
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
+        """
+        Args:
+            d_model: Dimensionality of the embeddings.
+            dropout: Dropout rate applied after adding positional encoding.
+            max_len: Maximum expected sequence length.
+        """
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Create constant 'pe' matrix with values dependent on position and i
+        pe = torch.zeros(max_len, d_model, dtype=torch.float)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        # Compute the div_term: exp(-log(10000) * 2i/d_model)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) *
+                             -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        pe = pe.unsqueeze(0)  # shape (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, d_model)
+        Returns:
+            Tensor of same shape with positional encodings added.
+        """
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len]
+        return self.dropout(x)
+
+
+class MultiHeadAttention(nn.Module):
+    """Multi-head scaled dot-product attention."""
+    def __init__(self, d_model: int, num_heads: int, d_k: int, d_v: int, dropout: float = 0.1) -> None:
+        """
+        Args:
+            d_model: Dimensionality of the model.
+            num_heads: Number of attention heads.
+            d_k: Dimensionality of queries and keys per head.
+            d_v: Dimensionality of values per head.
+            dropout: Dropout rate applied to attention probabilities.
+        """
+        super(MultiHeadAttention, self).__init__()
+        self.d_model: int = d_model
+        self.num_heads: int = num_heads
+        self.d_k: int = d_k
+        self.d_v: int = d_v
+
+        # Linear projections for queries, keys, and values.
+        self.linear_q = nn.Linear(d_model, num_heads * d_k)
+        self.linear_k = nn.Linear(d_model, num_heads * d_k)
+        self.linear_v = nn.Linear(d_model, num_heads * d_v)
+
+        # Final linear layer.
+        self.linear_out = nn.Linear(num_heads * d_v, d_model)
+
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            query: Tensor of shape (batch_size, query_len, d_model).
+            key: Tensor of shape (batch_size, key_len, d_model).
+            value: Tensor of shape (batch_size, key_len, d_model).
+            mask: Optional tensor for masking with shape broadcastable to (batch_size, num_heads, query_len, key_len).
+        Returns:
+            Tensor of shape (batch_size, query_len, d_model).
+        """
+        batch_size = query.size(0)
+
+        # Linear projections and split into heads.
+        q = self.linear_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)  # (B, num_heads, Q, d_k)
+        k = self.linear_k(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)    # (B, num_heads, K, d_k)
+        v = self.linear_v(value).view(batch_size, -1, self.num_heads, self.d_v).transpose(1, 2)  # (B, num_heads, K, d_v)
+
+        # Scaled dot-product attention.
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # (B, num_heads, Q, K)
+
+        if mask is not None:
+            # Expect mask shape to be broadcastable to scores.
+            scores = scores + mask
+
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        context = torch.matmul(attn, v)  # (B, num_heads, Q, d_v)
+
+        # Concatenate heads and apply final linear projection.
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.d_v)
+        output = self.linear_out(context)
+        return output
+
+
+class PositionwiseFeedForward(nn.Module):
+    """Implements the position-wise feed-forward network."""
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1) -> None:
+        """
+        Args:
+            d_model: Dimensionality of the model.
+            d_ff: Dimensionality of the inner-layer.
+            dropout: Dropout rate.
+        """
+        super(PositionwiseFeedForward, self).__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (..., d_model).
+        Returns:
+            Tensor of shape (..., d_model).
+        """
+        return self.linear2(self.dropout(F.relu(self.linear1(x))))
+
+
+class EncoderLayer(nn.Module):
+    """A single layer of the Transformer encoder."""
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 dropout: float, d_k: int, d_v: int) -> None:
+        """
+        Args:
+            d_model: Dimensionality of the model.
+            num_heads: Number of attention heads.
+            d_ff: Dimensionality of the feed-forward layer.
+            dropout: Dropout rate.
+            d_k: Dimensionality of queries/keys per head.
+            d_v: Dimensionality of values per head.
+        """
+        super(EncoderLayer, self).__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, d_k, d_v, dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, d_model).
+            mask: Optional mask tensor broadcastable to (batch_size, num_heads, seq_len, seq_len).
+        Returns:
+            Tensor of shape (batch_size, seq_len, d_model).
+        """
+        # Self-attention sub-layer with residual connection and layer normalization.
+        attn_output = self.self_attn(x, x, x, mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        # Feed-forward sub-layer with residual connection and layer normalization.
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_output))
+        return x
+
+
+class Encoder(nn.Module):
+    """Stack of Transformer encoder layers."""
+    def __init__(self, num_layers: int, d_model: int, num_heads: int,
+                 d_ff: int, dropout: float, d_k: int, d_v: int) -> None:
+        """
+        Args:
+            num_layers: Number of encoder layers.
+            d_model: Dimensionality of the model.
+            num_heads: Number of attention heads.
+            d_ff: Dimensionality of the feed-forward layer.
+            dropout: Dropout rate.
+            d_k: Dimensionality of queries/keys per head.
+            d_v: Dimensionality of values per head.
+        """
+        super(Encoder, self).__init__()
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, d_ff, dropout, d_k, d_v)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, src: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            src: Tensor of shape (batch_size, src_seq_len, d_model).
+            mask: Optional mask tensor.
+        Returns:
+            Tensor of shape (batch_size, src_seq_len, d_model).
+        """
+        for layer in self.layers:
+            src = layer(src, mask)
+        return src
+
+
+class DecoderLayer(nn.Module):
+    """A single layer of the Transformer decoder."""
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 dropout: float, d_k: int, d_v: int) -> None:
+        """
+        Args:
+            d_model: Dimensionality of the model.
+            num_heads: Number of attention heads.
+            d_ff: Dimensionality of the feed-forward layer.
+            dropout: Dropout rate.
+            d_k: Dimensionality of queries/keys per head.
+            d_v: Dimensionality of values per head.
+        """
+        super(DecoderLayer, self).__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, d_k, d_v, dropout)
+        self.enc_dec_attn = MultiHeadAttention(d_model, num_heads, d_k, d_v, dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor,
+                tgt_mask: Optional[torch.Tensor] = None,
+                memory_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Target tensor of shape (batch_size, tgt_seq_len, d_model).
+            memory: Encoder outputs of shape (batch_size, src_seq_len, d_model).
+            tgt_mask: External mask for target tokens (e.g., padding mask) with shape (batch_size, tgt_seq_len)
+                      where 1 indicates valid positions and 0 indicates masked positions.
+            memory_mask: Optional mask for encoder-decoder attention.
+        Returns:
+            Tensor of shape (batch_size, tgt_seq_len, d_model).
+        """
+        batch_size, tgt_len, _ = x.size()
+        device = x.device
+
+        # Create the causal mask for the target sequence.
+        causal_mask = torch.triu(torch.ones((tgt_len, tgt_len), device=device), diagonal=1)
+        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf')).masked_fill(causal_mask == 0, float(0.0))
+        # Expand causal mask to (1, tgt_len, tgt_len) for broadcasting.
+        causal_mask = causal_mask.unsqueeze(0)  # shape: (1, tgt_len, tgt_len)
+
+        # If an external target mask is provided (e.g., padding mask), convert it.
+        # Assume tgt_mask is of shape (batch_size, tgt_len) with 1 for valid tokens.
+        if tgt_mask is not None:
+            # Convert to float mask: valid positions -> 0.0, masked positions -> -inf.
+            ext_mask = (1.0 - tgt_mask.float()) * float('-inf')  # shape: (batch_size, tgt_len)
+            # Expand external mask to shape (batch_size, tgt_len, tgt_len) by duplicating it along the query dimension.
+            ext_mask = ext_mask.unsqueeze(1).expand(batch_size, tgt_len, tgt_len)
+            # Merge causal mask with external mask.
+            merged_mask = causal_mask + ext_mask  # Broadcast causal_mask over batch dimension.
+        else:
+            merged_mask = causal_mask.expand(batch_size, tgt_len, tgt_len)
+
+        # First sub-layer: masked self-attention with merged mask.
+        self_attn_output = self.self_attn(x, x, x, mask=merged_mask.unsqueeze(1))
+        x = self.norm1(x + self.dropout(self_attn_output))
+
+        # Second sub-layer: encoder-decoder attention.
+        enc_dec_output = self.enc_dec_attn(x, memory, memory, mask=memory_mask)
+        x = self.norm2(x + self.dropout(enc_dec_output))
+
+        # Third sub-layer: position-wise feed-forward network.
+        ffn_output = self.ffn(x)
+        x = self.norm3(x + self.dropout(ffn_output))
+        return x
+
+
+class Decoder(nn.Module):
+    """Stack of Transformer decoder layers."""
+    def __init__(self, num_layers: int, d_model: int, num_heads: int,
+                 d_ff: int, dropout: float, d_k: int, d_v: int) -> None:
+        """
+        Args:
+            num_layers: Number of decoder layers.
+            d_model: Dimensionality of the model.
+            num_heads: Number of attention heads.
+            d_ff: Dimensionality of the feed-forward layer.
+            dropout: Dropout rate.
+            d_k: Dimensionality of queries/keys per head.
+            d_v: Dimensionality of values per head.
+        """
+        super(Decoder, self).__init__()
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout, d_k, d_v)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor,
+                tgt_mask: Optional[torch.Tensor] = None,
+                memory_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Target tensor of shape (batch_size, tgt_seq_len, d_model).
+            memory: Encoder outputs of shape (batch_size, src_seq_len, d_model).
+            tgt_mask: External mask for target tokens of shape (batch_size, tgt_seq_len).
+            memory_mask: Optional mask for encoder-decoder attention.
+        Returns:
+            Tensor of shape (batch_size, tgt_seq_len, d_model).
+        """
+        for layer in self.layers:
+            x = layer(x, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
+        return x
+
+
+class TransformerModel(nn.Module):
+    """Complete Transformer encoder-decoder model with shared embeddings."""
+    def __init__(self, config: Dict[str, Any],
+                 vocab_size: int = 37000,
+                 task: str = "translation",
+                 model_type: str = "base") -> None:
+        """
+        Args:
+            config: Configuration dictionary (from config.yaml).
+            vocab_size: Size of the vocabulary.
+            task: Task type ("translation" or "parsing").
+            model_type: Model variant ("base" or "big").
+        """
+        super(TransformerModel, self).__init__()
+
+        # Retrieve model hyperparameters from configuration.
+        model_config: Dict[str, Any] = config.get("model", {}).get(model_type, {})
+        self.num_layers: int = model_config.get("num_layers", 6)
+        self.d_model: int = model_config.get("d_model", 512)
+        self.d_ff: int = model_config.get("d_ff", 2048)
+        self.num_heads: int = model_config.get("num_heads", 8)
+        self.d_k: int = model_config.get("d_k", 64)
+        self.d_v: int = model_config.get("d_v", 64)
+        self.dropout_rate: float = config.get("training", {}).get("dropout_rate", 0.1)
+
+        # Shared embedding layer (for both source and target).
+        self.embed: nn.Embedding = nn.Embedding(vocab_size, self.d_model)
+        # Scale factor for embeddings.
+        self.scale: float = math.sqrt(self.d_model)
+
+        # Positional encoding.
+        self.pos_encoding: PositionalEncoding = PositionalEncoding(self.d_model, dropout=self.dropout_rate)
+
+        # Encoder and Decoder stacks.
+        self.encoder: Encoder = Encoder(
+            num_layers=self.num_layers,
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            d_ff=self.d_ff,
+            dropout=self.dropout_rate,
+            d_k=self.d_k,
+            d_v=self.d_v
+        )
+        self.decoder: Decoder = Decoder(
+            num_layers=self.num_layers,
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            d_ff=self.d_ff,
+            dropout=self.dropout_rate,
+            d_k=self.d_k,
+            d_v=self.d_v
+        )
+
+        # Final output projection layer.
+        self.out_proj: nn.Linear = nn.Linear(self.d_model, vocab_size)
+        # Tie the weights of the output projection with the embedding matrix.
+        self.out_proj.weight = self.embed.weight
+
+    def forward(self,
+                src: torch.Tensor,
+                tgt: torch.Tensor,
+                src_mask: Optional[torch.Tensor] = None,
+                tgt_mask: Optional[torch.Tensor] = None,
+                memory_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            src: Source tensor of shape (batch_size, src_seq_len).
+            tgt: Target tensor of shape (batch_size, tgt_seq_len).
+            src_mask: Optional mask for source sequence with shape (batch_size, src_seq_len) where 1 indicates valid tokens.
+            tgt_mask: Optional mask for target sequence with shape (batch_size, tgt_seq_len) where 1 indicates valid tokens.
+            memory_mask: Optional mask for encoder-decoder attention.
+        Returns:
+            Logits tensor of shape (batch_size, tgt_seq_len, vocab_size).
+        """
+        # Embed and scale the source tokens.
+        src_emb = self.embed(src) * self.scale  # (B, src_seq_len, d_model)
+        src_emb = self.pos_encoding(src_emb)
+        # Encoder forward pass.
+        memory = self.encoder(src_emb, mask=src_mask.unsqueeze(1).unsqueeze(2) if src_mask is not None else None)
+
+        # Embed and scale the target tokens.
+        tgt_emb = self.embed(tgt) * self.scale  # (B, tgt_seq_len, d_model)
+        tgt_emb = self.pos_encoding(tgt_emb)
+        # Decoder forward pass.
+        decoder_output = self.decoder(
+            tgt_emb,
+            memory,
+            tgt_mask=tgt_mask,
+            memory_mask=memory_mask
+        )
+        # Project decoder output to vocabulary dimensions.
+        logits = self.out_proj(decoder_output)
+        return logits
+```

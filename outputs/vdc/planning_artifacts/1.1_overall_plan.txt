@@ -1,0 +1,192 @@
+Below is a detailed roadmap that outlines all the key aspects you will need to reproduce the experiments and the proposed VDC (Versatile Data Cleanser) method. This roadmap addresses the methodology, experimental details (datasets, hyperparameters, evaluation metrics), and outlines the internal modules to be built. Any unclear aspects are also explicitly highlighted for further consideration.
+
+──────────────────────────────
+1. OVERALL SYSTEM PIPELINE
+
+• Input: A labeled image sample (xᵢ, yᵢ) from your dataset.
+  
+• VDC consists of three consecutive modules:
+  – Visual Question Generation (VQG)
+  – Visual Question Answering (VQA)
+  – Visual Answer Evaluation (VAE) with a vote-based ensemble
+     
+• Pipeline flow:
+  a. For each sample, generate a set of questions using the VQG module. Two kinds of questions are used:
+     • General Questions: Template-based (e.g., “Describe the image briefly.”)
+     • Label-Specific Questions: Automatically generated using an LLM (e.g., ChatGPT with prompts from Appendix D/E)
+  b. Pass the image and each question to the VQA module. This module uses a multimodal large language model (Instruct-BLIP) to obtain answers.
+  c. Evaluate each answer in the VAE module:
+     • For label-specific questions, use simple string matching (e.g., check presence of “yes” or “no” as a clue).
+     • For general questions—since simple string matching is insufficient—invoke an evaluator LLM (ChatGPT with a designed prompt) to judge whether the answer aligns with the expected semantics.
+  d. Compute a matching score sᵢ = (Number of correct evaluations) / (Total number of questions Nq).
+  e. If sᵢ is below a predefined threshold (α = 0.5), mark the sample as “dirty” (i.e., having visual-linguistic inconsistency).
+
+──────────────────────────────
+2. IMPLEMENTATION DETAILS & MODULE BREAKDOWN
+
+A. Data Preparation & Dirty Sample Generation
+
+   • Datasets:
+     – CIFAR-10: Use standard training and test splits.
+     – ImageNet-100: Randomly select 100 classes (500 train/100 test per class).
+     – ImageNet-Dog: Select 10 dog classes (800 train/200 test per class).
+     
+   • Dirty Samples:
+     – Poisoned Samples (Backdoor Attacks):
+       ▪ Implement several backdoor attack schemes by modifying images and changing their labels.
+       ▪ Attacks include visible triggers (e.g., BadNets: a 3×3 white square triggered in CIFAR-10 at the lower-right corner; for ImageNet, scale appropriately) and invisible triggers (e.g., SIG with ∆ = 20, frequency f = 6).
+       ▪ Other attacks (Blended, TrojanNN, SSBA, WaNet) follow the settings described:
+         • Blended: Use a “Hello Kitty” trigger image blended with ratio 0.1.
+         • TrojanNN: Use a predefined Apple logo as the trigger mask.
+         • SSBA: Requires a U-Net + spatial transformer setup (if computationally heavy, consider a simplified simulation).
+         • WaNet: Use elastic warping as described.
+         
+       ▪ Poisoning ratios:
+         • CIFAR-10: 50 and 500 poisoned samples per class.
+         • ImageNet-100: 5 and 50 poisoned samples per class.
+         • ImageNet-Dog: 80 poisoned samples per class.
+         
+     – Noisy Labels:
+       ▪ Symmetric Noise: Randomly flip the label uniformly to one of the other (K–1) labels.
+       ▪ Asymmetric Noise: Flip the true label to the “next” class (using modulo arithmetic: (i mod K) + 1).
+       ▪ Noisy ratio η is set to 0.4, as in the paper.
+       
+     – Hybrid Dirty Samples:
+       ▪ Consider datasets that include both poisoned samples and noisy labels.
+       
+   • Uncertainties:
+     – Some trigger generation details (especially SSBA and WaNet) might need further clarifications or a simplified implementation.
+     
+B. Visual Question Generation (VQG) Module
+
+   • Two types of questions:
+     – General Questions:
+       ▪ Use a fixed set of pre-defined templates (e.g., “Describe the image briefly.”, “Describe the image in detail.”). These can be hard-coded or stored in a configuration file.
+     – Label-Specific Questions:
+       ▪ Use an LLM (ChatGPT via GPT-3.5-turbo API) to autogenerate questions tailored for each label.
+       ▪ Use the provided prompts (from Appendix D/E) to generate for each label. For example, for ImageNet-Dog, a prompt like “Please generate visual questions to identify if the breed of the dog in the image is correct. For label ‘Chihuahua’, provide questions regarding specific attributes.”
+       ▪ The paper uses 6 label-specific questions for ImageNet-100 and 4 for CIFAR-10 and ImageNet-Dog.
+       
+   • Implementation suggestions:
+     – In practice, to minimize API calls during development, you might want to pre-generate and cache these questions and store them in a file (e.g., JSON) for reproducibility.
+     
+C. Visual Question Answering (VQA) Module
+
+   • Use Instruct-BLIP as the MLLM to answer the generated questions.
+     – Ensure the model is set up to take an image and a text question as input.
+     – Preprocess images according to the model’s requirements (e.g., resizing, normalization).
+     – The VQA module returns an answer text Rⱼ for each generated question Qⱼ.
+     
+   • Uncertainties:
+     – How to best handle multiple answers per sample if the VQA output is non-deterministic. Consistency might be enforced by setting fixed seeds or averaging over multiple runs.
+     
+D. Visual Answer Evaluation (VAE) Module
+
+   • For each question, compare the obtained response (Rⱼ) with the expected answer (Aⱼ):
+     – For label-specific questions with deterministic expected answers, use simple string-based evaluation:
+       ▪ If the answer text contains “yes” → mark as True; if “no” then False.
+       ▪ Note: You might want to do lowercase conversion, strip punctuation, etc.
+     – For general questions (where the answer might be long or not directly comparable), use an evaluation strategy:
+       ▪ Either call ChatGPT with a prompt that, given the generated answer and the expected (or reference) answer, outputs a binary judgment (“yes” or “no”). Example prompt: “Assume you are a helpful assistant. Given this caption and label, do they refer to the same semantic content? Answer yes or no.”
+       ▪ If calling ChatGPT is too time-consuming, consider using a heuristic similarity measure (though note that the paper explicitly used ChatGPT for evaluation).
+       
+   • Calculate the matching score for each sample:
+       sᵢ = (Number of questions evaluated as “correct”) / (Total number of questions Nq)
+       
+   • Mark sample as dirty if sᵢ < α, where α = 0.5.
+   
+   • Uncertainties:
+     – Consistency of ChatGPT evaluation may vary between API calls; note possible variability in evaluation outputs.
+     
+E. Vote-Based Ensemble and Decision
+
+   • For each sample, having over Nq questions, a “vote” is taken per question.
+   • The final matching score is simply the proportion of “yes” evaluations.
+   • Decision: if matching score < 0.5 → sample is marked as dirty and is removed from the dataset.
+
+──────────────────────────────
+3. EXPERIMENTAL SETTINGS & EVALUATION
+
+A. Evaluation Metrics
+   • For detection performance:
+     – True Positive Rate (TPR): The fraction of actual dirty samples that are correctly detected.
+     – False Positive Rate (FPR): The fraction of clean samples that are mistakenly flagged as dirty.
+     
+   • For verifying the usefulness of purification:
+     – Retrain a classifier (ResNet-18) on the cleaned (purified) datasets.
+     – Report Attack Success Rate (ASR): The rate at which poisoned/triggers cause misclassification.
+     – Report Clean Accuracy (ACC): Overall accuracy on clean samples.
+     
+B. Hyperparameters for Purification and Retraining
+   • VDC parameters:
+     – Threshold α = 0.5.
+     – Number of questions per sample:
+       ▪ General questions: 2 (for all datasets)
+       ▪ Label-specific questions: 6 for ImageNet-100; 4 for CIFAR-10 and ImageNet-Dog.
+       
+   • Classifier training (ResNet-18):
+     – CIFAR-10: 100 epochs; batch size = 128; initial learning rate = 0.1; decay by factor of 10 after 50th and 75th epochs.
+     – ImageNet-100 and ImageNet-Dog: 100 epochs; batch size = 64; initial learning rate = 0.1; decay at 30th and 60th epochs.
+     – Use SGD optimizer.
+     
+   • Dirty sample generation parameters:
+     – Use specified poisoning ratios and noisy ratios. For example, noisy ratio η = 0.4, and use the specified number of poisoned samples per class as described.
+     
+C. Ablation Studies
+   • Experiment with using only general questions vs. only label-specific vs. both.
+   • Vary the number of questions to evaluate tradeoffs between detection accuracy and inference time.
+   • Optionally, try replacing Instruct-BLIP with another MLLM (e.g., Otter) to assess impact.
+   
+D. Uncertainties and Considerations
+   • API Access and Latency: Since the method relies on ChatGPT and Instruct-BLIP inference, ensure you have proper API quota and consider caching responses for reproducibility.
+   • Prompt Sensitivity: The exact wording of prompts (for both question generation and answer evaluation) may impact performance. You may need to experiment with a few variants.
+   • Backdoor Generation: The details for some backdoor attacks (SSBA, WaNet) might be complex. If replication is challenging, one may initially implement the simpler ones (BadNets, Blended, SIG) and later extend.
+
+──────────────────────────────
+4. CODE ARCHITECTURE & ROADMAP
+
+Propose a modular code structure (to be developed later in Python using libraries such as PyTorch, HuggingFace Transformers, and OpenAI API):
+
+• Module: data_loader.py
+   – Load CIFAR-10, ImageNet-100, ImageNet-Dog
+   – Include functions to inject noisy labels and backdoor triggers (implement separate functions for each attack type).
+
+• Module: vqg.py (Visual Question Generation)
+   – Code to generate general questions (from a pre-defined list).
+   – Code to interface with ChatGPT API (or use cached outputs) for generating label-specific questions.
+   – Allow configuration for different number of questions based on dataset.
+
+• Module: vqa.py (Visual Question Answering)
+   – Set up the Instruct-BLIP model.
+   – Function that accepts an image and a question, and returns the answer text.
+   – Ensure proper image preprocessing.
+
+• Module: vae.py (Visual Answer Evaluation)
+   – Define functions to evaluate the answer:
+     ▪ For deterministic matching using string matching.
+     ▪ For general questions, code to form evaluation prompt and call ChatGPT API.
+   – Compute the vote score and final decision.
+
+• Module: detection.py
+   – Integrate VQG, VQA, and VAE modules.
+   – Process each sample, accumulate the matching score, and flag as dirty if below threshold α.
+   – Save or log detection results for later analysis (TPR, FPR calculations).
+
+• Module: training.py
+   – Code to retrain a ResNet-18 classifier on the purified dataset.
+   – Implement training and validation loops with the specified hyperparameters.
+   – Log ASR and ACC on test sets.
+
+• Module: utils.py
+   – Helper functions: image preprocessing, trigger overlay, logging, and result visualization.
+
+──────────────────────────────
+5. FINAL REMARKS & OPEN QUESTIONS
+
+• Ensure that you track seeds for reproducibility given the reliance on stochastic LLM outputs.
+• Document each step clearly and log evaluation metrics at each stage.
+• The accuracy of ChatGPT (and other LLMs) responses might vary over time; consider fixing a particular API version or caching responses.
+• Some of the details for trigger injection (especially for attacks like SSBA and WaNet) are left at a high level in the paper. You might need to research additional literature or experiment with simpler alternatives.
+
+──────────────────────────────
+This comprehensive plan should help you structure the final implementation while ensuring key details from the paper’s methodology and experimental setup are faithfully reproduced. Once the modules are in place, you will be well positioned to write and debug the final code.

@@ -1,0 +1,60 @@
+{
+  "all": [
+    {
+      "target_func_name": "evaluate_classifier",
+      "severity_level": "high",
+      "critique": "There is no explicit handling of division‐by‐zero scenarios. For example, if there are no clean samples (or attacked samples) in the dataset, computing ACC or ASR could result in a runtime error.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate_detection",
+      "severity_level": "high",
+      "critique": "Similar to the classifier evaluation, there is no safeguard against division by zero when calculating TPR (if TP+FN is zero) or FPR (if FP+TN is zero), which could break the evaluation.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate_detection",
+      "severity_level": "low",
+      "critique": "The interface check for the detector only uses hasattr(detector, 'detect_sample') without verifying that the attribute is callable. A non-callable attribute with that name would still pass the check but cause failures later.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate_classifier",
+      "severity_level": "medium",
+      "critique": "The error handling for samples missing the expected dirty flag is ambiguous. Logging a warning is mentioned, but it is not clear whether these samples should be skipped, treated as clean, or trigger an error. This ambiguity could lead to inconsistent evaluation metrics.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate",
+      "severity_level": "medium",
+      "critique": "The combined evaluation function’s behavior is not fully specified when a detector instance is not provided. It is unclear how the resulting metrics dictionary should be structured in such cases, which might lead to confusion downstream in the analysis pipeline.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "evaluate_classifier",
+      "severity_level": "high",
+      "critique": "There is no explicit handling of division‐by‐zero scenarios. For example, if there are no clean samples (or attacked samples) in the dataset, computing ACC or ASR could result in a runtime error.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate_detection",
+      "severity_level": "high",
+      "critique": "Similar to the classifier evaluation, there is no safeguard against division by zero when calculating TPR (if TP+FN is zero) or FPR (if FP+TN is zero), which could break the evaluation.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate_classifier",
+      "severity_level": "medium",
+      "critique": "The error handling for samples missing the expected dirty flag is ambiguous. Logging a warning is mentioned, but it is not clear whether these samples should be skipped, treated as clean, or trigger an error. This ambiguity could lead to inconsistent evaluation metrics.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "evaluate",
+      "severity_level": "medium",
+      "critique": "The combined evaluation function’s behavior is not fully specified when a detector instance is not provided. It is unclear how the resulting metrics dictionary should be structured in such cases, which might lead to confusion downstream in the analysis pipeline.",
+      "source": "llm-judge"
+    }
+  ]
+}

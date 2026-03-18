@@ -1,0 +1,102 @@
+Below is the revised logic analysis for main.py. This analysis has been updated to clarify how often the curriculum scheduler is updated and to explicitly define the nesting order between seed iterations and experiment configuration runs.
+
+────────────────────────────
+1. Load Configuration and Set Global Parameters
+
+• Use the Config class (from config.py) to load the experiment configuration from config.yaml. This configuration contains all hyperparameters (e.g., batch size, learning rates, epochs), curriculum learning settings (e.g., warmup_epochs, schedule_epochs, growth_rate), and the list of reproducibility seeds.
+
+• Log the loaded configuration and set global settings (e.g., device, logging options).
+
+────────────────────────────
+2. Define Experiment Loop Structure
+
+• Define an outer loop over the experiment configurations. Each experiment configuration may correspond to a particular combination of:
+  – Domain (CV, NLP, Graph)
+  – Dataset variant (standard, noise‑with a specified noise probability, and imbalance‑with a specified imbalance factor)
+  – Model type (e.g., “LeNet”, “ResNet‑18”, “ViT” for CV or “LSTM”, “BERT”, “GPT2” for NLP, etc.)
+  – Curriculum method specification (which curriculum scheduler is used).
+
+• For each experiment configuration (for example, training ResNet‑18 on “CIFAR‑10‑noise‑0.4” with the Self-Paced Learning scheduler), use an inner loop to iterate over the reproducibility seeds (the seed list provided in config.yaml: [42, 666, 777, 888, 999]).  
+  – In each iteration:
+   a. Set the random seed (for Python, NumPy, and PyTorch) to guarantee reproducibility.
+   b. Log which seed is currently active.
+   c. Execute the entire experiment process (i.e., data loading, model instantiation, training, and evaluation).  
+  – After running all seeds for a given configuration, aggregate the results (compute average and standard deviation) for that experiment setup.
+
+────────────────────────────
+3. Data Loading and Preprocessing
+
+• Instantiate the DatasetLoader with the configuration and the current experiment parameters (e.g., dataset identifier such as “cifar10”, “cifar10-noise-0.4”, “tinyimagenet-imbalance-50”).
+  – Call load_data() to download (or access cached copies), split the dataset into training, validation, and test sets, and then apply preprocessing.
+  – Use apply_noise() for injecting label noise and apply_imbalance() to create a long-tailed distribution as required.
+  – Obtain a dictionary containing the data loaders (or raw data splits).
+
+────────────────────────────
+4. Model Building
+
+• Instantiate the ModelManager with the configuration. Based on the selected domain and model (as specified in the experiment configuration), call build_model() to:
+  – Construct the backbone model, adjusting input or output layers based on the dataset properties.
+  – Load pretrained weights if the model is BERT or GPT2, or initialize from scratch otherwise.
+
+────────────────────────────
+5. Curriculum Scheduler Instantiation and Clarifying Update Frequency
+
+• Instantiate the CurriculumScheduler using the configuration.  
+  – To resolve prior ambiguity, note that the trainer will update the curriculum scheduler at a well‐defined frequency.  
+  – By default, the update_schedule(loss, epoch) will be called for every mini‐batch (for fine-grained dynamic adjustment). However, a configuration parameter (or within the scheduler’s logic) may override this to support an epoch‐level update if the specific curriculum learning method requires only periodic adjustments.  
+  – Document and log the chosen update frequency mode so that it is unambiguous for integrators.
+
+────────────────────────────
+6. Training Loop Integration
+
+• Instantiate the Trainer with the following arguments:
+  – The built model.
+  – The data dictionary (train, validation, test).
+  – The curriculum scheduler instance.
+  – The full configuration settings.
+• In the Trainer.train() method:
+  – For each epoch, loop through mini-batches.
+  – For every mini-batch, perform a forward pass, compute the loss, and then invoke the curriculum scheduler’s update_schedule(loss, current_epoch) method.  
+   ○ (If operating under the “every mini-batch” regime, update based on each batch’s loss; if configuration dictates an “epoch-level” update, call update_schedule once per epoch.)
+  – Perform backpropagation, weight updates, and log the training progress.
+  – Also log complexity metrics (training time and maximum GPU memory usage) as dictated in the configuration.
+  – At the end of each epoch, optionally update any learning schedule parameters if using an epoch-level curriculum adjustment.
+  – Ensure consistency between how frequently the curriculum scheduler is updated and the requirements of the particular curriculum method being employed.
+
+────────────────────────────
+7. Evaluation
+
+• After training completion, instantiate the Evaluation module with:
+  – The trained model.
+  – The data dictionary.
+  – The configuration parameters.
+• Call Evaluation.evaluate() to perform forward passes on the test set and calculate domain-specific metrics:
+  – For CV tasks: accuracy.
+  – For NLP tasks: accuracy, F1, Spearman, and Matthews.
+  – For graph tasks: AUC.
+• Record any additional complexity metrics (e.g., recorded training time, peak GPU usage) if record_complexity is set true.
+
+────────────────────────────
+8. Aggregation and Reporting
+
+• For each experiment configuration, the inner seed loop produces individual results.
+  – Aggregate these results over the seeds (compute the average and standard deviation).
+  – Log or save the aggregated results in a structured format (e.g., similar to Table 3 in the paper) for later analysis or plotting.
+• The overall main.py script may then iterate over all experiment configurations and produce a final summary of performance and complexity.
+
+────────────────────────────
+Summary of the Revised Logic Flow
+
+1. Load configuration from config.yaml and log settings.  
+2. Outer loop: iterate over each experiment configuration (domain/model/dataset/curriculum strategy).  
+3. Inner loop: for each configuration, iterate over reproducibility seeds:
+  a. Set seed.
+  b. Load & preprocess data.
+  c. Build model.
+  d. Instantiate curriculum scheduler and specify update frequency (default: every mini-batch—with override option).
+  e. Run Trainer.train() (integrating curriculum updates at the defined frequency).
+  f. Run evaluation and store results.
+4. Aggregate results across seeds for each experiment configuration and report the averages and standard deviations.  
+5. Finalize by logging a comprehensive summary for all experimental runs.
+
+This revised analysis resolves the earlier ambiguities by clearly stipulating that the curriculum scheduler’s update frequency is configurable (with a default to per mini-batch but allowing epoch-level calls if needed) and by structuring the experiment loop so that the outer loop iterates over experiment configurations and the inner loop iterates over the reproducibility seeds.

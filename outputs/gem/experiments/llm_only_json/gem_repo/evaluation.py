@@ -1,0 +1,339 @@
+"""
+evaluation.py
+
+This module implements the Evaluation class which conducts the evaluation of the
+synthesized (distilled) graph produced via GDEM by training candidate GNN models
+on the synthetic graph and testing their performance on the real graph.
+
+The evaluation process performs the following steps:
+  1. Reconstructs the synthetic graph by calling model.reconstruct_graph() and
+     extracting synthetic node features from model.forward().
+  2. Generates synthetic labels (Y_synth) using the distribution of the real graph’s labels.
+  3. Normalizes the synthetic adjacency matrix.
+  4. Instantiates candidate GNN models (e.g., a spatial GCN and a spectral SGC) via a
+     uniform candidate model factory. All candidate models expose a forward() method
+     with the interface (features, adjacency).
+  5. Trains each candidate model on the synthetic graph using CrossEntropyLoss and Adam
+     for a fixed number of epochs.
+  6. Evaluates each candidate model on the real graph (using provided test indices)
+     and computes node classification accuracy.
+  7. Logs diagnostic metrics such as Total Variation (TV) of synthetic features.
+  
+Configuration parameters for evaluation (from config.yaml under key 'evaluation') and
+default hyperparameters are used to set model architectures and training hyperparameters.
+"""
+
+import os
+import logging
+from typing import Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+import yaml
+
+# Import the Model class from model.py and the GraphData structure from dataset_loader.py.
+from model import Model
+from dataset_loader import GraphData  # GraphData: a dataclass with attributes like adjacency, node_features, labels, laplacian, eigenvalues, eigenvectors, split_indices
+
+# Set up module-level logger.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.hasHandlers():
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+
+def normalize_adj(adj: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize an adjacency matrix by adding self-loops and applying symmetric normalization.
+    Equivalently: A_norm = D^(-0.5) (A + I) D^(-0.5)
+    
+    Args:
+        adj (torch.Tensor): Adjacency matrix of shape [N, N].
+
+    Returns:
+        torch.Tensor: Normalized adjacency matrix.
+    """
+    I = torch.eye(adj.size(0), device=adj.device)
+    adj_with_loops = adj + I
+    rowsum = torch.sum(adj_with_loops, dim=1)
+    d_inv_sqrt = torch.pow(rowsum, -0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
+    D_inv_sqrt = torch.diag(d_inv_sqrt)
+    return D_inv_sqrt @ adj_with_loops @ D_inv_sqrt
+
+
+def generate_synthetic_labels(real_labels: np.ndarray, num_synth_nodes: int) -> np.ndarray:
+    """
+    Generate synthetic labels for the synthetic graph nodes by sampling from the
+    distribution of the real graph’s labels.
+
+    Args:
+        real_labels (np.ndarray): Array of real graph labels.
+        num_synth_nodes (int): Number of synthetic nodes.
+
+    Returns:
+        np.ndarray: Array of synthetic labels of length num_synth_nodes.
+    """
+    unique, counts = np.unique(real_labels, return_counts=True)
+    probabilities = counts / counts.sum()
+    np.random.seed(42)
+    return np.random.choice(unique, size=num_synth_nodes, p=probabilities)
+
+
+def calculate_accuracy(predictions: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Calculate the classification accuracy given predictions and true labels.
+
+    Args:
+        predictions (torch.Tensor): Logits or predictions of shape [num_samples, num_classes].
+        labels (torch.Tensor): Ground-truth labels of shape [num_samples].
+
+    Returns:
+        float: Accuracy measured as a fraction in [0,1].
+    """
+    _, predicted = torch.max(predictions, dim=1)
+    correct = (predicted == labels).sum().item()
+    accuracy = correct / float(labels.size(0))
+    return accuracy
+
+
+# Define candidate models to be used for evaluation.
+
+class GCN(nn.Module):
+    """
+    A simple 2-layer Graph Convolutional Network (GCN) for spatial graph learning.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, n_layers: int = 2) -> None:
+        super(GCN, self).__init__()
+        # For a 2-layer GCN
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # First layer: aggregate and apply activation.
+        x = torch.mm(adj, x)
+        x = self.fc1(x)
+        x = F.relu(x)
+        # Second layer: aggregate and output logits.
+        x = torch.mm(adj, x)
+        x = self.fc2(x)
+        return x
+
+
+class SGC(nn.Module):
+    """
+    A simple Simplified Graph Convolution (SGC) model for spectral-style graph learning.
+    """
+    def __init__(self, input_dim: int, output_dim: int) -> None:
+        super(SGC, self).__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        x = torch.mm(adj, x)
+        x = self.linear(x)
+        return x
+
+
+def candidate_model_factory(eval_config: dict, input_dim: int, output_dim: int) -> Dict[str, nn.Module]:
+    """
+    Factory function that instantiates candidate GNN models based on the evaluation configuration.
+    
+    Args:
+        eval_config (dict): Evaluation configuration dictionary.
+        input_dim (int): Dimensionality of input features.
+        output_dim (int): Number of classes (output dimensions).
+
+    Returns:
+        Dict[str, nn.Module]: Dictionary mapping candidate model names to their instances.
+    """
+    candidate_models: Dict[str, nn.Module] = {}
+    spatial_cfg = eval_config.get("gnn", {}).get("spatial", {})
+    n_layers = spatial_cfg.get("n_layers", 2)
+    hidden_units = spatial_cfg.get("hidden_units", 256)
+    candidate_models["GCN"] = GCN(input_dim, hidden_units, output_dim, n_layers)
+
+    spectral_cfg = eval_config.get("gnn", {}).get("spectral", {})
+    # For SGC, only input and output dimensions are needed.
+    candidate_models["SGC"] = SGC(input_dim, output_dim)
+
+    logger.info("Candidate models instantiated: %s", list(candidate_models.keys()))
+    return candidate_models
+
+
+class Evaluation:
+    """
+    Evaluation class for cross-architecture generalization.
+    
+    The Evaluation module trains candidate models on the synthetic graph produced by the distillation
+    model and then evaluates them on the real graph test set.
+    """
+    def __init__(self, model: Model, data: GraphData, eval_config: dict) -> None:
+        """
+        Initialize the Evaluation instance.
+
+        Args:
+            model (Model): A trained instance of the GDEM Model.
+            data (GraphData): Real graph data loaded via DatasetLoader.
+            eval_config (dict): Evaluation configuration parameters.
+        """
+        self.model = model
+        self.data = data
+        self.eval_config = eval_config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Evaluation hyperparameters for candidate model training.
+        # Defaults: 200 epochs and learning rate of 0.01.
+        self.eval_epochs: int = int(eval_config.get("eval_epochs", 200))
+        self.eval_lr: float = float(eval_config.get("eval_lr", 0.01))
+
+        logger.info("Evaluation initialized on device %s with eval_epochs=%d and eval_lr=%f",
+                    self.device, self.eval_epochs, self.eval_lr)
+
+    def evaluate(self) -> Dict[str, Dict[str, float]]:
+        """
+        Perform the evaluation process.
+        
+        Steps:
+          1. Reconstruct the synthetic graph (synthetic adjacency and obtain synthetic features).
+          2. Generate synthetic labels.
+          3. Normalize the synthetic adjacency.
+          4. Instantiate and train candidate models on the synthetic graph.
+          5. Evaluate the trained candidate models on the real graph using test split.
+          6. Log diagnostic metrics such as Total Variation (TV) of synthetic features.
+        
+        Returns:
+            dict: A dictionary mapping candidate model names to performance metrics (accuracy).
+        """
+        # === Reconstruct Synthetic Graph ===
+        # Retrieve synthetic node features X_synth from the distillation model.
+        self.model.eval()
+        with torch.no_grad():
+            model_out = self.model.forward()
+            X_synth: torch.Tensor = model_out["X_synth"]  # Shape: [N_synth, feature_dim]
+        N_synth, feature_dim = X_synth.size()
+        logger.info("Synthetic node features obtained with shape: %s", X_synth.shape)
+
+        # Extract the corresponding real eigenvalues (first N_synth values) and convert to torch.Tensor.
+        real_eigenvalues_np = self.data.eigenvalues[:N_synth]
+        real_eigenvalues = torch.tensor(real_eigenvalues_np, dtype=torch.float32, device=self.device)
+        # Reconstruct synthetic adjacency (A_prime) and synthetic Laplacian (L_prime).
+        A_prime, L_prime = self.model.reconstruct_graph(real_eigenvalues)
+        # Ensure A_prime is float tensor and moved to device.
+        A_prime = A_prime.to(self.device).float()
+        logger.info("Synthetic adjacency matrix reconstructed with shape: %s", A_prime.shape)
+
+        # === Diagnostic: Compute Total Variation (TV) of synthetic features ===
+        # Total Variation (TV) approximated as Frobenius norm of (L_prime @ X_synth).
+        TV_synth = torch.norm(torch.matmul(L_prime, X_synth), p='fro').item()
+        logger.info("Synthetic graph Total Variation (TV): %.4f", TV_synth)
+
+        # === Generate Synthetic Labels ===
+        Y_synth_np = generate_synthetic_labels(self.data.labels, N_synth)
+        Y_synth = torch.tensor(Y_synth_np, dtype=torch.long, device=self.device)
+        logger.info("Synthetic labels generated with shape: %s", Y_synth.shape)
+
+        # Normalize synthetic adjacency for candidate model training.
+        A_synth_norm = normalize_adj(A_prime)
+        logger.info("Synthetic adjacency normalized.")
+
+        # === Candidate Model Factory and Instantiation ===
+        num_classes: int = int(np.max(self.data.labels)) + 1
+        candidate_models: Dict[str, nn.Module] = candidate_model_factory(
+            self.eval_config, input_dim=feature_dim, output_dim=num_classes
+        )
+        # Move candidate models to the evaluation device.
+        for name, model_cand in candidate_models.items():
+            candidate_models[name] = model_cand.to(self.device)
+
+        # === Training Candidate Models on the Synthetic Graph ===
+        loss_fn = nn.CrossEntropyLoss()
+        candidate_results: Dict[str, Dict[str, float]] = {}
+        for model_name, cand_model in candidate_models.items():
+            optimizer = Adam(cand_model.parameters(), lr=self.eval_lr)
+            cand_model.train()
+            logger.info("Training candidate model: %s", model_name)
+            for epoch in range(self.eval_epochs):
+                optimizer.zero_grad()
+                outputs = cand_model(X_synth, A_synth_norm)
+                loss = loss_fn(outputs, Y_synth)
+                loss.backward()
+                optimizer.step()
+                if epoch % 20 == 0 or epoch == self.eval_epochs - 1:
+                    logger.debug("Candidate %s - Epoch %d: Loss = %.4f", model_name, epoch, loss.item())
+            # After training, set the candidate model into evaluation mode.
+            cand_model.eval()
+
+            # === Evaluation on the Real Graph ===
+            # Convert real graph data to torch tensors.
+            X_real = torch.tensor(self.data.node_features, dtype=torch.float32, device=self.device)
+            A_real = torch.tensor(self.data.adjacency, dtype=torch.float32, device=self.device)
+            A_real_norm = normalize_adj(A_real)
+            Y_real = torch.tensor(self.data.labels, dtype=torch.long, device=self.device)
+
+            # Use test indices from split_indices if available, else evaluate on all nodes.
+            if "test" in self.data.split_indices:
+                test_indices = torch.tensor(self.data.split_indices["test"], dtype=torch.long, device=self.device)
+            else:
+                test_indices = torch.arange(Y_real.size(0), device=self.device)
+
+            with torch.no_grad():
+                real_outputs = cand_model(X_real, A_real_norm)  # Shape: [N_real, num_classes]
+                # Select only test nodes.
+                real_outputs_test = real_outputs[test_indices]
+                Y_real_test = Y_real[test_indices]
+                accuracy = calculate_accuracy(real_outputs_test, Y_real_test)
+                logger.info("Candidate %s evaluated on real graph with accuracy: %.4f", model_name, accuracy)
+                candidate_results[model_name] = {"accuracy": accuracy}
+
+        # Aggregate diagnostic information.
+        candidate_results["diagnostics"] = {"synthetic_total_variation": TV_synth}
+        return candidate_results
+
+
+if __name__ == "__main__":
+    # Main entry point for standalone evaluation.
+    # Load configuration from 'config.yaml'
+    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    if not os.path.exists(config_path):
+        logger.error("Configuration file 'config.yaml' not found.")
+        exit(1)
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    # Load dataset using DatasetLoader.
+    from dataset_loader import DatasetLoader
+    dataset_loader = DatasetLoader(config)
+    graph_data: GraphData = dataset_loader.load_data()
+
+    # Instantiate the distillation model.
+    # In practice, the distillation model should be trained already.
+    synth_graph_cfg = config.get("synth_graph", {})
+    compression_ratio = synth_graph_cfg.get("compression_ratio", 0.15)
+    num_synth_nodes = max(1, int(round(compression_ratio * graph_data.adjacency.shape[0])))
+    model_params = {
+        "num_synth_nodes": num_synth_nodes,
+        "feature_dim": graph_data.node_features.shape[1],
+        "loss_weights": config.get("training", {}).get("loss_weights", {"alpha": 1.0, "beta": 1.0, "gamma": 1.0}),
+        "learning_rate_eigenvecs": config.get("training", {}).get("learning_rate_eigenvecs", 0.01),
+        "learning_rate_feat": config.get("training", {}).get("learning_rate_feat", 1e-05),
+        "r_k": synth_graph_cfg.get("r_k", 0.9)
+    }
+    trained_model = Model(model_params)
+    # In an actual experiment, load trained_model state from a checkpoint.
+    logger.info("Distillation model instantiated for evaluation (ensure it is trained).")
+
+    eval_config = config.get("evaluation", {})
+    evaluator = Evaluation(trained_model, graph_data, eval_config)
+    results = evaluator.evaluate()
+    logger.info("Final Evaluation Results: %s", results)
+    print("Evaluation Results:")
+    for cand, metrics in results.items():
+        print(f"{cand}: {metrics}")

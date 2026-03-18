@@ -1,0 +1,66 @@
+{
+  "all": [
+    {
+      "target_func_name": "__init__",
+      "severity_level": "medium",
+      "critique": "The logic relies on a fallback default (e.g., 4 questions) when an unknown dataset identifier is provided. This approach is not explicitly tied to the configuration file or the original paper’s specifications, risking unintended behavior if strict dataset-to-question count mappings were expected.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_general_questions",
+      "severity_level": "medium",
+      "critique": "Switching to a deterministic selection strategy (e.g., fixed seed or sorted selection) may reduce the variability of generated questions. If the original paper intended a degree of randomness for diversity, this deterministic approach could contradict the intended methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "high",
+      "critique": "While a robust caching key is proposed (incorporating dataset identifier, label, expected number of questions, and prompt version), the function signature only accepts a 'label' parameter without an explicit dataset identifier. This disconnect could lead to cache collisions or misidentification in multi‑dataset contexts, thereby breaking the planned design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The fallback method for handling unexpected API responses (e.g., splitting by newlines) and for API failures (returning pre‐defined default questions) is not concretely defined. This vagueness might result in inconsistent outputs that deviate from the original paper’s approach to dynamic question generation.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "API Response Parsing",
+      "severity_level": "low",
+      "critique": "Although the plan includes explicit parsing of the ChatGPT API response with validation of a JSON array, the alternative fallback parsing (using newline splitting) may be unreliable if the response format significantly deviates. This area may need more robust error handling.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "External Utilities Integration",
+      "severity_level": "low",
+      "critique": "The module presumes the existence of external utilities (e.g., ask_chatgpt and caching functions) with specific interfaces. As these components are undefined within the module, integration issues could arise if their actual implementations do not conform precisely to the assumed contracts.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "__init__",
+      "severity_level": "medium",
+      "critique": "The logic relies on a fallback default (e.g., 4 questions) when an unknown dataset identifier is provided. This approach is not explicitly tied to the configuration file or the original paper’s specifications, risking unintended behavior if strict dataset-to-question count mappings were expected.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_general_questions",
+      "severity_level": "medium",
+      "critique": "Switching to a deterministic selection strategy (e.g., fixed seed or sorted selection) may reduce the variability of generated questions. If the original paper intended a degree of randomness for diversity, this deterministic approach could contradict the intended methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "high",
+      "critique": "While a robust caching key is proposed (incorporating dataset identifier, label, expected number of questions, and prompt version), the function signature only accepts a 'label' parameter without an explicit dataset identifier. This disconnect could lead to cache collisions or misidentification in multi‑dataset contexts, thereby breaking the planned design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The fallback method for handling unexpected API responses (e.g., splitting by newlines) and for API failures (returning pre‐defined default questions) is not concretely defined. This vagueness might result in inconsistent outputs that deviate from the original paper’s approach to dynamic question generation.",
+      "source": "llm-judge"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is a plain‐text critique of the analysis with notes on which parts (and their associated functions) are affected and how severe each issue is:\n\n1. Alternating Update Schedule Clarification (High/Medium)  \n • The analysis correctly points out that with τ₁ = 0 and τ₂ = 5 the branch that would update the synthetic eigenbasis (U′_K) is never entered. However, it would be helpful to explicitly state if this behavior is expected or if it may be a configuration error. If it is unintended, this is",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is a plain‐text critique of the analysis with notes on which parts (and their associated functions) are affected and how severe each issue is:\n\n1. Alternating Update Schedule Clarification (High/Medium)  \n • The analysis correctly points out that with τ₁ = 0 and τ₂ = 5 the branch that would update the synthetic eigenbasis (U′_K) is never entered. However, it would be helpful to explicitly state if this behavior is expected or if it may be a configuration error. If it is unintended, this is",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

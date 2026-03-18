@@ -1,0 +1,291 @@
+"""
+evaluation.py
+
+This module defines the Evaluation class to conduct inference and evaluation of the FiT model.
+It implements the diffusion-based sampling procedure (with a simplified DDIM-like update),
+applies positional embedding extrapolation for resolution extrapolation, reconstructs images
+via the pretrained VAE decoder, and computes evaluation metrics (FID, sFID, IS, Precision, and Recall).
+All configuration parameters (e.g., number of sampling steps, extrapolation methods, target resolutions)
+are read from the provided configuration dictionary (loaded from config.yaml).
+
+Author: Your Name
+Date: YYYY-MM-DD
+"""
+
+import math
+from typing import Any, Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+
+# Import the build_1d_rope helper from model.py for computing 1D rotary embeddings
+from model import build_1d_rope
+
+
+def compute_fid(images: torch.Tensor) -> float:
+    """
+    Dummy implementation to compute Fre'chet Inception Distance (FID).
+    In a full implementation, this should compute the FID between generated images and reference statistics.
+    """
+    return 10.0
+
+
+def compute_sfid(images: torch.Tensor) -> float:
+    """
+    Dummy implementation to compute sFID.
+    """
+    return 5.0
+
+
+def compute_inception_score(images: torch.Tensor) -> float:
+    """
+    Dummy implementation to compute the Inception Score (IS).
+    """
+    return 20.0
+
+
+def compute_precision(images: torch.Tensor) -> float:
+    """
+    Dummy implementation to compute improved Precision.
+    """
+    return 0.5
+
+
+def compute_recall(images: torch.Tensor) -> float:
+    """
+    Dummy implementation to compute improved Recall.
+    """
+    return 0.5
+
+
+def get_extrapolated_pos_embeddings(coords: torch.Tensor, embed_dim: int, scale_factor: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute extrapolated 2D rotary positional embeddings by adjusting the patch grid coordinates.
+    
+    Args:
+        coords: Tensor of shape [B, T, 2] representing patch grid coordinates.
+        embed_dim: The transformer embedding dim.
+        scale_factor: The scaling factor computed as max(max(H_test, W_test)/sqrt(max_token_length), 1.0).
+    
+    Returns:
+        A tuple (pos_cos, pos_sin) each of shape [B, T, embed_dim].
+    """
+    B, T, _ = coords.shape
+    d_total: int = embed_dim
+    d_half: int = d_total // 2
+    # Modify coordinates by dividing their values by the scale factor.
+    row_pos: torch.Tensor = coords[..., 0] / scale_factor  # Shape: [B, T]
+    col_pos: torch.Tensor = coords[..., 1] / scale_factor  # Shape: [B, T]
+
+    pos_cos_list: List[torch.Tensor] = []
+    pos_sin_list: List[torch.Tensor] = []
+    device = coords.device
+
+    for b in range(B):
+        row_pos_b: torch.Tensor = row_pos[b]  # [T]
+        col_pos_b: torch.Tensor = col_pos[b]  # [T]
+        # Compute 1D RoPE for row and col separately.
+        row_cos, row_sin = build_1d_rope(row_pos_b, d_half, base=10000.0)  # Each: [T, d_half]
+        col_cos, col_sin = build_1d_rope(col_pos_b, d_half, base=10000.0)  # Each: [T, d_half]
+        pos_cos_b: torch.Tensor = torch.cat([row_cos, col_cos], dim=-1)  # [T, embed_dim]
+        pos_sin_b: torch.Tensor = torch.cat([row_sin, col_sin], dim=-1)  # [T, embed_dim]
+        pos_cos_list.append(pos_cos_b)
+        pos_sin_list.append(pos_sin_b)
+    pos_cos: torch.Tensor = torch.stack(pos_cos_list, dim=0)  # [B, T, embed_dim]
+    pos_sin: torch.Tensor = torch.stack(pos_sin_list, dim=0)
+    return pos_cos, pos_sin
+
+
+class Evaluation:
+    """
+    Evaluation class responsible for running diffusion sampling through the FiT model,
+    applying resolution extrapolation via positional embedding modifications, reconstructing images,
+    and computing evaluation metrics.
+    
+    Methods:
+      - evaluate() -> dict: Generates images for various resolutions and extrapolation methods, computes metrics,
+          and returns a dictionary of results.
+    """
+    def __init__(self, model: nn.Module, dataloader: torch.utils.data.DataLoader, config: Dict[str, Any]) -> None:
+        """
+        Initialize the Evaluation instance.
+        
+        Args:
+            model (nn.Module): The FiT model instance.
+            dataloader (DataLoader): DataLoader for evaluation data (if needed for metric computation).
+            config (Dict[str, Any]): Configuration dictionary (from config.yaml).
+        """
+        self.model: nn.Module = model
+        self.dataloader = dataloader
+        self.config: Dict[str, Any] = config
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Diffusion sampling parameters
+        self.num_sampling_steps: int = int(self.config.get("diffusion", {}).get("num_sampling_steps", 250))
+        
+        # Extrapolation settings: list of methods (e.g. "PI", "EI", "NTK", "YaRN", "VisionNTK", "VisionYaRN").
+        self.extrapolation_methods: List[str] = self.config.get("extrapolation", {}).get("methods", ["PI"])
+        # max_token_length from model configuration and L_train computed as sqrt(max_token_length)
+        self.max_token_length: int = int(self.config.get("model", {}).get("max_token_length", 256))
+        self.L_train: float = math.sqrt(self.max_token_length)
+        
+        # Evaluation metric settings
+        self.eval_metrics: List[str] = self.config.get("evaluation", {}).get("metrics", ["FID", "sFID", "IS", "Precision", "Recall"])
+        # Number of samples to generate per resolution per method (set default to 4 if not provided)
+        self.num_samples: int = int(self.config.get("evaluation", {}).get("num_samples", 4))
+        
+        # Define default test resolutions (in-distribution and out-of-distribution) as per the paper
+        self.test_resolutions: Dict[str, Tuple[int, int]] = {
+            "256x256": (256, 256),
+            "160x320": (160, 320),
+            "128x384": (128, 384),
+            "320x320": (320, 320),
+            "224x448": (224, 448),
+            "160x480": (160, 480)
+        }
+        
+        # Fixed latent downscale factor from the pretrained VAE (consistent with dataset_loader)
+        self.latent_downscale: int = 8
+
+    def sample_images(self, target_resolution: Tuple[int, int], method: str) -> torch.Tensor:
+        """
+        Generate images using a simplified diffusion sampling loop with fixed positional embeddings.
+        
+        The method computes extrapolated positional embeddings if required by the chosen extrapolation method.
+        A latent noise tensor is iteratively refined for num_sampling_steps iterations and then decoded
+        via the pretrained VAE decoder to yield the final images.
+        
+        Args:
+            target_resolution: Tuple (H_test, W_test) specifying the target output image resolution.
+            method: The extrapolation method to use (e.g., "PI", "EI", "NTK", "YaRN", "VisionNTK", "VisionYaRN").
+        
+        Returns:
+            A tensor of generated images (decoded by the model's VAE decoder).
+        """
+        self.model.eval()
+        B: int = self.num_samples
+        # Retrieve embedding and patch settings from the model
+        embed_dim: int = getattr(self.model, "embed_dim", 512)
+        patch_size: int = getattr(self.model, "patch_size", 2)
+        max_tokens: int = self.max_token_length  # Use configured fixed token length
+        
+        # Create a square grid of patch coordinates.
+        side: int = int(math.sqrt(max_tokens))
+        if side * side != max_tokens:
+            side = math.ceil(math.sqrt(max_tokens))
+            max_tokens = side * side  # Adjust if needed.
+        # Generate grid coordinates with values in range [0, side-1]
+        grid_y, grid_x = torch.meshgrid(torch.arange(side, device=self.device),
+                                        torch.arange(side, device=self.device),
+                                        indexing='ij')
+        grid: torch.Tensor = torch.stack([grid_y, grid_x], dim=-1).float()  # Shape: [side, side, 2]
+        grid = grid.view(-1, 2)  # Shape: [max_tokens, 2]
+        # Ensure the grid length equals max_token_length by padding or truncating if necessary.
+        if grid.shape[0] > self.max_token_length:
+            grid = grid[:self.max_token_length, :]
+        elif grid.shape[0] < self.max_token_length:
+            pad_len = self.max_token_length - grid.shape[0]
+            pad = torch.zeros(pad_len, 2, device=self.device)
+            grid = torch.cat([grid, pad], dim=0)
+        # Expand grid for the batch.
+        coords: torch.Tensor = grid.unsqueeze(0).expand(B, -1, -1)  # [B, max_tokens, 2]
+        
+        # Compute the scale factor using the formula: scale_factor = max(max(H_test, W_test)/L_train, 1.0)
+        H_test, W_test = target_resolution
+        scale_factor: float = max(max(H_test, W_test) / self.L_train, 1.0)
+        
+        # Depending on the chosen method, compute extrapolated positional embeddings.
+        if method.lower() in [m.lower() for m in self.extrapolation_methods]:
+            pos_cos, pos_sin = get_extrapolated_pos_embeddings(coords, embed_dim, scale_factor)
+        else:
+            # If no extrapolation is applied, use the model's standard compute_2d_rope.
+            pos_cos, pos_sin = self.model.compute_2d_rope(coords)
+        
+        # Create an attention mask: all tokens are valid (value 1) so mask becomes zeros.
+        validity_mask: torch.Tensor = torch.ones(B, self.max_token_length, device=self.device)
+        attn_mask: torch.Tensor = (1.0 - validity_mask) * (-1e4)  # Shape: [B, max_tokens]
+        
+        # Initialize latent tokens as Gaussian noise.
+        x_latent: torch.Tensor = torch.randn(B, self.max_token_length, embed_dim, device=self.device)
+        
+        # Diffusion sampling loop (simplified DDIM-like iterative update).
+        num_steps: int = self.num_sampling_steps
+        step_size: float = 1.0 / num_steps
+        for step in tqdm(range(num_steps), desc=f"Sampling for {H_test}x{W_test} with method {method}", ncols=80):
+            x_temp: torch.Tensor = x_latent
+            # Pass through the transformer backbone using fixed positional embeddings.
+            for block in self.model.transformer_blocks:
+                x_temp = block(x_temp, pos_cos, pos_sin, attn_mask)
+            x_temp = self.model.final_norm(x_temp)
+            # Update latent tokens by subtracting a fraction of the predicted noise.
+            x_latent = x_latent - step_size * x_temp
+        
+        # Decode the final latent tokens to obtain images.
+        with torch.no_grad():
+            generated_images: torch.Tensor = self.model.decode(x_latent)
+        return generated_images
+
+    def evaluate(self) -> Dict[str, Any]:
+        """
+        Run the evaluation procedure by generating images for each target resolution and each extrapolation method.
+        Compute evaluation metrics on the generated images and return a dictionary of results.
+        
+        Returns:
+            A dictionary mapping each resolution and method to its computed metrics.
+        """
+        results: Dict[str, Any] = {}
+        # Loop over all predefined test resolutions.
+        for res_label, resolution in self.test_resolutions.items():
+            results[res_label] = {}
+            # Loop over each extrapolation method specified in the configuration.
+            for method in self.extrapolation_methods:
+                print(f"Evaluating resolution {res_label} with extrapolation method {method}...")
+                generated_images: torch.Tensor = self.sample_images(resolution, method)
+                # Compute evaluation metrics using dummy implementations.
+                fid: float = compute_fid(generated_images)
+                sfid: float = compute_sfid(generated_images)
+                inception_score: float = compute_inception_score(generated_images)
+                precision: float = compute_precision(generated_images)
+                recall: float = compute_recall(generated_images)
+                # Store the computed metrics in the results dictionary.
+                results[res_label][method] = {
+                    "FID": fid,
+                    "sFID": sfid,
+                    "IS": inception_score,
+                    "Precision": precision,
+                    "Recall": recall
+                }
+                print(f"Results for {res_label} with {method}: FID: {fid}, sFID: {sfid}, IS: {inception_score}, Precision: {precision}, Recall: {recall}")
+        return results
+
+
+if __name__ == "__main__":
+    # For standalone testing purposes, load the configuration, dataset, and model.
+    import yaml
+    from dataset_loader import DatasetLoader
+    from model import Model
+    from torch.utils.data import DataLoader
+
+    # Load configuration from config.yaml
+    config_path: str = "config.yaml"
+    with open(config_path, "r") as f:
+        config: Dict[str, Any] = yaml.safe_load(f)
+
+    # Initialize the dataset loader and create a DataLoader.
+    dataset_loader = DatasetLoader(config)
+    data_loader: DataLoader = dataset_loader.load_data()
+
+    # Instantiate the FiT model.
+    model = Model(config)
+    
+    # Note: It is assumed that the model already utilizes EMA weights.
+    # In a full implementation, EMA weights should be loaded or updated prior to evaluation.
+    
+    # Instantiate the Evaluation class.
+    evaluator = Evaluation(model, data_loader, config)
+    eval_results: Dict[str, Any] = evaluator.evaluate()
+    print("Final Evaluation Results:")
+    print(eval_results)

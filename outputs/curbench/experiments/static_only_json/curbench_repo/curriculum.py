@@ -1,0 +1,176 @@
+"""
+curriculum.py
+
+This module defines the CurriculumScheduler abstract base class and a concrete example implementation,
+SelfPacedLearningScheduler, for curriculum learning strategies. This serves as the pluggable component
+for curriculum learning within the training pipeline. All curriculum methods must implement at least
+the update_schedule(loss: float, epoch: int) method to provide a dynamic weighting or threshold criterion
+based on the current training loss and epoch.
+
+The configuration for curriculum learning is read from the shared configuration (config.yaml) under the
+"curriculum" key. Default values are provided if the configuration parameters (warmup_epochs, schedule_epochs,
+growth_rate) are not set.
+
+Classes:
+    CurriculumScheduler(ABC): Abstract base class defining the curriculum learning interface.
+    SelfPacedLearningScheduler(CurriculumScheduler): A sample concrete implementation based on Self-Paced Learning (SPL).
+"""
+
+import logging
+from abc import ABC, abstractmethod
+import math
+from typing import Dict
+
+import torch
+
+
+class CurriculumScheduler(ABC):
+    """
+    Abstract base class for curriculum learning strategies.
+
+    Initialization:
+        Reads curriculum configuration parameters from the provided configuration dictionary.
+        Expected configuration keys under "curriculum" include:
+            - warmup_epochs: Number of epochs before curriculum adjustments begin. (Default: 5)
+            - schedule_epochs: Frequency (in epochs) at which threshold updates occur. (Default: 10)
+            - growth_rate: Multiplicative factor by which the threshold grows at each scheduled step. (Default: 1.1)
+
+    Methods:
+        update_schedule(loss: float, epoch: int) -> float:
+            Abstract method that, given the current loss and epoch, computes and returns a curriculum
+            factor (e.g., a threshold or weight) used to guide training.
+        initialize():
+            Optional method for additional initialization steps if needed.
+        reset():
+            Optional method for resetting internal state between experiments or epochs.
+    """
+
+    def __init__(self, config: Dict) -> None:
+        """
+        Initialize the CurriculumScheduler with hyperparameters from the configuration.
+
+        Args:
+            config (Dict): Experiment configuration dictionary.
+        """
+        curriculum_config = config.get("curriculum", {})
+        # Set default hyperparameters if not provided.
+        self.warmup_epochs: int = (
+            int(curriculum_config.get("warmup_epochs"))
+            if curriculum_config.get("warmup_epochs") is not None
+            else 5
+        )
+        self.schedule_epochs: int = (
+            int(curriculum_config.get("schedule_epochs"))
+            if curriculum_config.get("schedule_epochs") is not None
+            else 10
+        )
+        self.growth_rate: float = (
+            float(curriculum_config.get("growth_rate"))
+            if curriculum_config.get("growth_rate") is not None
+            else 1.1
+        )
+        # Initialize logger
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(
+            "CurriculumScheduler initialized with warmup_epochs=%d, schedule_epochs=%d, growth_rate=%.2f",
+            self.warmup_epochs,
+            self.schedule_epochs,
+            self.growth_rate,
+        )
+        # Initialize internal state (e.g., current threshold or weight)
+        self.current_factor: float = 0.0
+
+    @abstractmethod
+    def update_schedule(self, loss: float, epoch: int) -> float:
+        """
+        Update the curriculum schedule based on the provided loss and epoch.
+        This method must be implemented by concrete subclasses. The returned value
+        represents a curriculum factor (e.g., sample selection threshold or loss weight)
+        to be used during training.
+
+        Args:
+            loss (float): The current training loss.
+            epoch (int): The current epoch number.
+
+        Returns:
+            float: The computed curriculum factor.
+        """
+        raise NotImplementedError("Subclasses must implement the update_schedule method.")
+
+    def initialize(self) -> None:
+        """
+        Optional method to perform any additional initialization steps, such as
+        setting up extra network components for meta-learning. By default, this method does nothing.
+        """
+        pass
+
+    def reset(self) -> None:
+        """
+        Optional method to reset internal state between experiment runs or epochs.
+        By default, resets the current curriculum factor.
+        """
+        self.current_factor = 0.0
+        self.logger.info("CurriculumScheduler state reset.")
+
+
+class SelfPacedLearningScheduler(CurriculumScheduler):
+    """
+    A sample concrete implementation of CurriculumScheduler based on Self-Paced Learning (SPL).
+    In this strategy, a dynamic threshold is maintained; initially, only "easy" samples with loss below
+    the threshold are used, and the threshold is gradually increased to allow more challenging samples
+    as training progresses.
+
+    The threshold is set to an initial value (default 0.5) during warmup epochs. After the warmup period,
+    the threshold increases multiplicatively every 'schedule_epochs' using the provided growth_rate.
+    """
+
+    def __init__(self, config: Dict) -> None:
+        """
+        Initializes the SelfPacedLearningScheduler instance.
+
+        Args:
+            config (Dict): Experiment configuration dictionary.
+        """
+        super().__init__(config)
+        curriculum_config = config.get("curriculum", {})
+        # Set initial threshold; default value is 0.5 if not provided.
+        self.initial_threshold: float = (
+            float(curriculum_config.get("initial_threshold"))
+            if curriculum_config.get("initial_threshold") is not None
+            else 0.5
+        )
+        self.current_factor = self.initial_threshold
+        self.logger.info(
+            "SelfPacedLearningScheduler initialized with initial_threshold=%.2f",
+            self.initial_threshold,
+        )
+
+    def update_schedule(self, loss: float, epoch: int) -> float:
+        """
+        Updates the sample selection threshold based on the current epoch.
+        For epochs below warmup_epochs, the threshold remains constant.
+        For subsequent epochs, the threshold increases multiplicatively every schedule_epochs.
+
+        Args:
+            loss (float): The current training loss (unused in this simple SPL implementation).
+            epoch (int): The current epoch number.
+
+        Returns:
+            float: The updated threshold value.
+        """
+        if epoch < self.warmup_epochs:
+            self.current_factor = self.initial_threshold
+        else:
+            # Compute the number of completed schedule periods after warmup.
+            schedule_periods = (epoch - self.warmup_epochs) // (self.schedule_epochs if self.schedule_epochs > 0 else 1)
+            self.current_factor = self.initial_threshold * (self.growth_rate ** schedule_periods)
+        self.logger.info("Epoch %d: SPL threshold updated to %.4f", epoch, self.current_factor)
+        return self.current_factor
+
+    def reset(self) -> None:
+        """
+        Resets the scheduler's state to its initial conditions.
+        """
+        super().reset()
+        self.current_factor = self.initial_threshold
+        self.logger.info("SelfPacedLearningScheduler reset to initial threshold %.4f", self.initial_threshold)

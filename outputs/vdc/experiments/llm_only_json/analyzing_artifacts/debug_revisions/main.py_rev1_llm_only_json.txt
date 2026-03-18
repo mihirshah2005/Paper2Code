@@ -1,0 +1,82 @@
+Below is the logic analysis that you would include (as comments or documentation) in main.py. This analysis outlines the step‐by‐step orchestration of the entire experiment pipeline based on the paper’s methodology, the provided plan/design, and the configuration file.
+
+──────────────────────────────
+Logic Analysis for main.py
+
+1. Configuration Loading and Initialization
+   • Read the configuration from “config.yaml” (using a YAML parser) to obtain all experimental settings.  
+     – Under “training”: epochs, optimizer ("SGD"), learning_rate (0.1), batch_size (different for CIFAR-10, ImageNet-100, ImageNet-Dog), and learning rate decay schedule.  
+     – Under “detection”: the threshold (0.5), number of general questions (2), and label-specific questions count per dataset.
+     – Under “dirty_sample_generation”: noisy_ratio (0.4) and poisoning samples per class for each dataset.  
+     – Under “api”: details for ChatGPT (gpt-3.5-turbo) and Instruct-BLIP (for VQA).
+
+2. Dataset Loading and Dirty Sample Injection
+   • Instantiate the DatasetLoader by passing the configuration settings.
+   • Call DatasetLoader.load_data() to load the training and testing splits for the chosen dataset (e.g., CIFAR-10, ImageNet-100, or ImageNet-Dog).  
+     – Ensure proper preprocessing (resizing, normalization) as required by the downstream models.
+   • Next, call DatasetLoader.inject_dirty_samples(data) to simulate dirty samples:
+     – Inject poisoned samples using backdoor triggers (using the parameters from config.dirty_sample_generation.poisoning).
+     – Introduce noisy labels with the noisy ratio (0.4) defined in configuration.
+     – (If hybrid dirty samples are needed, the injection routines should combine both strategies.)  
+   • The result is a modified training dataset that now includes “dirty” samples.
+
+3. Detector Module Initialization
+   • Instantiate the Visual Question Generation (VQG) module:
+     – Pass it the pre-defined general question templates and label-specific prompt templates.  
+     – The number of label-specific questions is read from config.detection.label_specific_questions for the chosen dataset.
+   • Instantiate the Visual Question Answering (VQA) module:
+     – Use the model configuration from “api.instruct_blip” (i.e., choose “Instruct-BLIP” as the multimodal model).
+     – Ensure that the image preprocessing required by Instruct-BLIP is applied.
+   • Instantiate the Visual Answer Evaluation (VAE) module:
+     – Configure it with evaluation parameters (e.g., using string matching for deterministic label-specific questions, and for general questions, setting up the ChatGPT API prompt as described).
+   • With these three modules ready, instantiate the VDCDetector by passing VQG, VQA, VAE, and the detection threshold (0.5 from config.detection.threshold).
+
+4. Dirty Sample Detection and Dataset Purification
+   • Loop over each sample (image and its label) in the training dataset:
+     – For each sample, call VDCDetector.detect_sample(image, label) which will internally:
+       ▪ Ask VQG to generate the union of general and label-specific questions.
+       ▪ For each question, call VQA.answer_question(image, question) to produce an answer.
+       ▪ Then evaluate each answer through VAE.evaluate_answer(answer, expected_answer, question_type).  
+         • For label-specific questions, a simple string “yes/no” matching is used.
+         • For general questions, call ChatGPT with a pre-defined evaluation prompt to decide if the answer is consistent.
+       ▪ Compute the matching score as the ratio of “correct” evaluations to the total number of questions.
+       ▪ Decide that the sample is “clean” if matching score ≥ 0.5; otherwise, flag it as “dirty.”
+   • After processing all training samples, filter out (remove) those flagged as dirty to obtain a purified training dataset.
+     – It is important to log the number of dirty samples detected so that metrics like TPR and FPR can later be computed.
+
+5. Classifier Training on the Purified Dataset
+   • Initialize the Trainer module:
+     – Pass in the classifier model (ResNet-18 as specified in config.models.classifier) and the purified training dataset.
+     – Provide hyperparameters from the configuration (epochs = 100, batch_size from the respective dataset, learning_rate = 0.1, and learning rate decay schedule).
+     – The Trainer is responsible for setting up the training loop (using SGD) and updating the learning rate after the defined epochs.
+   • Call Trainer.train() to retrain the classifier on the purified dataset.
+
+6. Model Evaluation
+   • Instantiate the Evaluation module with:
+     – The trained classifier from the Trainer module.
+     – The test dataset loaded earlier by DatasetLoader.
+   • Call Evaluation.evaluate() to compute and return evaluation metrics:
+     – Detection metrics such as True Positive Rate (TPR) and False Positive Rate (FPR) for the dirty sample detection.
+     – Post-purification metrics for the classifier including Attack Success Rate (ASR) on poisoned samples and Clean Accuracy (ACC) on clean test samples.
+   • Print or log the evaluation metrics to summarize the outcomes.
+
+7. Orchestration and Final Remarks
+   • The main function orchestrates the overall experiment:
+     – It ties together the data loading/injection, the VDC detector pipeline, the training of a classifier on the purified dataset, and the final evaluation.
+     – Save logs, models, and metrics for reproducibility.
+   • Address any API rate limiting or caching concerns (e.g., caching ChatGPT responses to avoid redundant API calls, especially during label-specific question generation and answer evaluation).
+   • Ensure that random seeds are set consistently via helper functions from utils.py to guarantee reproducibility across runs.
+
+──────────────────────────────
+Summary
+The main.py entry-point will:
+   – Load configurations from config.yaml.
+   – Load and prepare the dataset, including dirty sample injection.
+   – Initialize the VQG, VQA, and VAE modules, and combine them into a VDCDetector.
+   – Process each training sample with the VDCDetector to create a purified (i.e., clean) training dataset.
+   – Retrain a ResNet-18 classifier using the purified data.
+   – Finally, evaluate the classifier and detection performance (TPR, FPR, ASR, ACC) on the test set.
+This design ensures that each experimental component (data preparation, detection, training, and evaluation) follows the original methodology described in the paper while strictly adhering to the provided design and configuration details.
+
+──────────────────────────────
+This comprehensive analysis in main.py will guide the actual implementation, ensuring that all modules interact correctly and that experimental parameters from config.yaml are consistently used throughout the pipeline.

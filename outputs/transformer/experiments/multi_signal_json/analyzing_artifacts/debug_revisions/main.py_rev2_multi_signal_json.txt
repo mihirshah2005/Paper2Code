@@ -1,0 +1,63 @@
+Below is the revised logic analysis for main.py. In this updated version, we make explicit decisions about whether to run training from scratch or load a pretrained model, and we also clearly separate evaluation settings for translation versus parsing tasks by using a task mode switch (for example, via a configuration parameter or command-line argument).
+
+─────────────────────────────  
+1. Load and Parse Configuration  
+ • Read the YAML configuration file (config.yaml) to extract all hyperparameters and settings.  
+ • In addition to model, training, data, and inference parameters, include a configuration (or command-line flag) that specifies the “mode” of operation (e.g., "train" vs. "eval") and the “task” to run (e.g., "translation" or "parsing").  
+ • Initialize logging, set random seeds, and configure device settings for reproducibility.
+
+─────────────────────────────  
+2. Initialize DatasetLoader  
+ • Create an instance of DatasetLoader, passing the full configuration, including dataset names and vocabulary sizes.  
+ • The DatasetLoader interacts with torchtext or HuggingFace datasets and utilizes SentencePiece for subword tokenization (applying BPE for English–German using a vocabulary of 37,000 tokens and word-piece for English–French with 32,000 tokens).  
+ • Call load_data() to obtain DataLoader objects for the training, validation, and test splits. Note that if the task is parsing, a different dataset (WSJ_Penn_Treebank) and vocabulary size (16K or 32K) will be used.
+
+─────────────────────────────  
+3. Instantiate the TransformerModel  
+ • Read the “model” section of the configuration to select parameters for either the “base” (default: 6 layers, d_model = 512, 8 attention heads, etc.) or the “big” model (as defined in the config).  
+ • Initialize the TransformerModel with these parameters. This module implements the full encoder–decoder architecture with multi-head attention (including masking for the decoder and sinusoidal positional encodings) and ties embeddings as specified in the paper.
+
+─────────────────────────────  
+4. Conditional Branch: Training vs. Pretrained Model Loading  
+ • Examine the operation mode (e.g., a key such as config["mode"]) to decide whether to:
+  a. Train the model from scratch, or  
+  b. Load a pretrained checkpoint for evaluation.
+ • If the mode indicates training (e.g., "train"):
+  – Create the Trainer instance and proceed to run trainer.train() over the desired number of steps (100,000 for base or 300,000 for big) using the Adam optimizer with the custom learning rate scheduler (β₁=0.9, β₂=0.98, ε=1e-9, warmup_steps=4000).  
+  – The Trainer will also log training metrics (loss, perplexity, etc.) and save checkpoints at intervals defined in the configuration (every 10 minutes), with averaged checkpoint selection (last 5 for base or last 20 for big) at the end of training.
+ • Else if the mode indicates evaluation (e.g., "eval"):
+  – Skip the training loop and instead load the latest (or specified) pretrained checkpoint for evaluation.
+
+─────────────────────────────  
+5. Set Up Evaluation with Task-Specific Settings  
+ • Read a “task” field or similar switch from the configuration to determine whether the evaluation is for "translation" or "parsing".  
+ • Create an instance of the Evaluation class with the loaded or trained TransformerModel, the test DataLoader, and the configuration.  
+ • Inside the Evaluation module:
+  – For translation tasks, apply the evaluation settings as defined:
+   ▪ Beam search with beam_size = 4, length_penalty = 0.6, and maximum output length given as input_length + 50.
+  – For parsing tasks, switch the evaluation parameters:
+   ▪ Beam search with beam_size = 21, length_penalty = 0.3, and maximum output length given as input_length + 300.
+ • This clear branch ensures that the appropriate inference methods, metric calculations (e.g., BLEU for translation, F1 for parsing), and decoding settings are used based on the task being executed.
+
+─────────────────────────────  
+6. Orchestrate the Overall Experiment Flow  
+ • The main module calls modules in this sequence:
+  a. Load configuration and determine the operation mode ("train" vs. "eval") and selected task ("translation" or "parsing").  
+  b. Use DatasetLoader to load the appropriate data split based on the task.  
+  c. Instantiate the TransformerModel with the model parameters (base or big) from the configuration.  
+  d. If mode is "train":
+   – Create the Trainer, run trainer.train(), and save averaged checkpoints.  
+  e. Else if mode is "eval":
+   – Load the pretrained model checkpoint.  
+  f. Create the Evaluation instance and call evaluation.evaluate() to obtain metrics.
+ • Log the final evaluation results (e.g., BLEU scores or F1 scores) for reporting and further analysis.
+
+─────────────────────────────  
+7. Wrap-Up and Logging  
+ • Ensure that all exceptions are handled and that logging statements clearly indicate which branch of the workflow (training vs. evaluation, translation vs. parsing) is being executed.  
+ • Log key events (e.g., start of training, checkpoint saving, evaluation metrics), and dispose of resources (e.g., close DataLoaders) appropriately.
+
+─────────────────────────────  
+Conclusion
+
+This revised logic analysis for main.py explicitly delineates the branching decision between training from scratch and loading a pretrained model, as well as clearly separating evaluation settings for translation versus parsing based on a task mode switch in the configuration. With these modifications, the main module will correctly orchestrate the end-to-end experiment flow—load configuration, decide on the operational mode, initialize modules, execute training or load checkpoints, and perform task-specific evaluation—ensuring clarity and reducing the risk of misconfiguration or unintended behavior.

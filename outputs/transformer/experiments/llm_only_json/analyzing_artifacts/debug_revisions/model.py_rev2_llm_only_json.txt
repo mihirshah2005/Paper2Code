@@ -1,0 +1,116 @@
+Below is the revised logic analysis for model.py. In this version, additional explicit details have been added regarding the handling and combination of various masks in the forward pass and regarding embedding weight tying, including conditional support for separate source and target vocabularies.
+
+─────────────────────────────  
+1. OVERALL STRUCTURE
+
+• The main class TransformerModel (a subclass of nn.Module) serves as the entry point. It incorporates:  
+ – A shared input embedding layer for both encoder and decoder (with tied weights to the final output projection by default).  
+  ○ Note: Since source and target vocabularies may differ across tasks, the implementation should support conditional weight tying. For cases where the vocabularies are distinct (a configuration flag or parameter), separate embedding layers should be used, and weight tying would then be omitted.  
+ – A positional encoding module that computes sinusoidal positional encodings using the formulas from the paper.  
+ – An Encoder stack and a Decoder stack composed of “num_layers” identical layers as defined in the config (e.g., 6 for the base model).
+
+• The forward() method accepts source token sequences and target token sequences, along with associated masks for padding and sequence ordering. It returns unnormalized logits over the vocabulary.
+
+─────────────────────────────  
+2. EMBEDDING, POSITIONAL ENCODING & WEIGHT TYING
+
+• Input Embeddings:  
+ – The model converts source (and target) token indices to vector embeddings.  
+ – The embeddings are scaled by √(d_model).  
+ – Positional encodings (sinusoidal by default) are computed and added elementwise to the token embeddings.  
+
+• Weight Tying Considerations:  
+ – By default, a single embedding layer is shared between the encoder and decoder, and its weights are tied to the final linear projection (output layer).  
+ – However, if the task involves different vocabularies (as can be the case in some translation tasks), the design should allow for separate embedding matrices (for source vs. target) and deactivate weight tying. This behavior can be controlled via a configuration flag.
+
+─────────────────────────────  
+3. ENCODER AND DECODER MODULES
+
+A. Encoder  
+ • The Encoder sub-module instantiates “num_layers” encoder layers.  
+ • Each encoder layer comprises:  
+  1. Multi-head self-attention using the MultiHeadAttention helper class.  
+   – It performs linear projections (for Q, K, V) for each head.  
+   – Computes scaled dot-product attention as:  
+    Attention(Q, K, V) = softmax((QKᵀ / √d_k) + mask) * V  
+   – Here, the mask includes any padding masks for the source sequence.  
+   – The mask is expected to have shape [batch_size, 1, 1, src_seq_len] (or a compatible shape) so that it can be broadcasted across all attention heads and query positions.  
+  2. Residual connection and layer normalization follow the attention computation.  
+  3. A position-wise feed-forward network (via PositionwiseFeedForward) follows with two linear layers (d_model → d_ff and d_ff → d_model), with ReLU and dropout.  
+  4. A final residual connection and layer normalization are applied.
+
+B. Decoder  
+ • The Decoder sub-module similarly instantiates “num_layers” decoder layers.  
+ • Each decoder layer contains three sub-layers:  
+  1. Masked multi-head self-attention:  
+   – In addition to a padding mask (to ignore padded tokens), this layer applies a subsequent (or future) mask to prevent a position from attending to future tokens.  
+   – The subsequent mask is typically a lower-triangular matrix with shape [target_seq_len, target_seq_len] that is combined (e.g., via elementwise logical AND) with the target padding mask.  
+   – The combined mask is then broadcasted to the shape [batch_size, num_heads, target_seq_len, target_seq_len].  
+  2. Encoder-decoder attention:  
+   – Here, queries come from the decoder’s output of the previous sub-layer, while keys and values are the encoder outputs.  
+   – A source padding mask is applied to ignore padding positions in the encoder outputs.  
+  3. Position-wise feed-forward network, similar to the encoder, applied with its own residual and normalization steps.
+
+─────────────────────────────  
+4. HANDLING MASKS IN THE FORWARD PASS
+
+• The forward() method must clearly combine and apply masks for both encoder and decoder:  
+ – Padding Masks:  
+  ○ For the encoder, a padding mask is computed from the source sequence (e.g., where token indices are zero or a designated pad value) to prevent attention to padding tokens.  
+  ○ For the decoder, a similar padding mask is computed for target tokens.  
+ – Subsequent/Future Masks:  
+  ○ For masked self-attention in the decoder, a subsequent mask (triangular matrix) is generated with shape [target_seq_len, target_seq_len].  
+  ○ This mask is then combined with the target padding mask (using a logical AND or by addition of large negative values, ensuring masked positions in the attention logits).  
+• Broadcasting Rules:  
+ – Each mask, after combining, should be unsqueezed so that its dimensions conform to the attention tensor, typically [batch_size, num_heads, query_seq_len, key_seq_len].  
+ – During multi-head attention, ensure that the same mask is applied for each head; this may require explicitly duplicating or broadcasting the mask over the num_heads dimension.
+ – When adding the mask to the attention logits, a typical implementation adds a large negative number (e.g., -1e9) to the masked scores before applying softmax.
+
+─────────────────────────────  
+5. HELPER CLASSES
+
+A. MultiHeadAttention  
+ – Implements scaled dot-product attention across h heads.  
+ – Accepts query, key, and value tensors along with an optional mask.  
+ – The mask is expected to be pre-combined (if needed) with both padding and subsequent masks, so that its shape is broadcastable to [B, h, query_seq_len, key_seq_len].  
+ – After computing linear projections (using separate sets of weights per head), the attention scores are computed and scaled by 1/√(d_k), then the mask is added. The softmax is applied and dropout is performed before concatenating the results.
+
+B. PositionwiseFeedForward  
+ – Consists of two linear layers with a ReLU activation and dropout in between.  
+ – Applied independently to each position in the sequence.
+
+C. PositionalEncoding  
+ – Generates a fixed sinusoidal encoding matrix based on the formula provided.  
+ – These encodings are added to the embedded input vectors (and are precomputed for a maximum sequence length).
+
+─────────────────────────────  
+6. DATA FLOW IN FORWARD PASS
+
+1. EMBEDDING LOOKUP:  
+ – Source and target token indices are passed through their respective embedding layers.  
+ – Scale the embeddings by √(d_model) and add positional encodings.
+
+2. APPLYING MASKS:  
+ – For the encoder, the source padding mask is generated (e.g., shape adjusted to [B, 1, 1, src_seq_len]).  
+ – For the decoder’s self-attention, generate the subsequent mask (triangular) and combine it with the target padding mask to form a final mask of shape [B, 1, target_seq_len, target_seq_len].  
+ – For encoder-decoder attention, reuse the source padding mask appropriately.
+
+3. ENCODER PASS:  
+ – Pass the enriched source embeddings and the encoder padding mask through the encoder stack, layer by layer.
+
+4. DECODER PASS:  
+ – Pass the target embeddings along with the combined target mask and the source mask (for cross-attention) through the decoder stack.
+
+5. OUTPUT PROJECTION:  
+ – Apply a final linear projection that (if embedding sharing is enabled) reuses the input embedding weights, producing unnormalized logits.
+ – These logits are output for downstream loss calculation (with label smoothing applied externally).
+
+─────────────────────────────  
+7. FINAL NOTES
+
+• The implementation adheres strictly to the original paper’s design while adding detailed handling for masks.  
+• All masks are explicitly described in terms of their expected shapes and broadcasting rules to ensure the correct attention computations across variable-length sequences.  
+• Conditional support for weight tying is provided so that tasks with distinct source and target vocabularies can opt for separate embeddings.  
+• All hyperparameters such as dropout rates, model dimensions, number of heads, and mask-related operations are driven directly by the configuration file (config.yaml) to facilitate reproducibility.
+
+This revised logic analysis addresses the raised critiques by clarifying the mask handling in the forward pass (including explicit shape and broadcasting details) and by discussing conditional weight tying to support scenarios with different vocabularies.

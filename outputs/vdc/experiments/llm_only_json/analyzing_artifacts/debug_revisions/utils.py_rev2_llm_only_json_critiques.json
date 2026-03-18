@@ -1,0 +1,90 @@
+{
+  "all": [
+    {
+      "target_func_name": "init_seed",
+      "severity_level": "medium",
+      "critique": "While the function seeds torch.cuda with torch.cuda.manual_seed_all(seed), it does not set torch.backends.cudnn.deterministic or torch.backends.cudnn.benchmark settings, which may result in non‐deterministic behavior on some GPU operations despite the seeding.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "preprocess_image",
+      "severity_level": "low",
+      "critique": "The description states that image dimensions, normalization means, and std values are chosen either hard-coded or via the configuration based on the dataset_name. This introduces ambiguity and may lead to inconsistency if the configuration file is intended to solely drive preprocessing parameters.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "overlay_badnets_trigger",
+      "severity_level": "medium",
+      "critique": "The function uses fixed patch sizes (3×3 for CIFAR‑10 and 21×21 for ImageNet) with an assumed position (e.g., lower‐right corner) without a clearly defined dynamic scaling strategy for various image resolutions, which risks deviating from the original experimental design if the images have non-standard dimensions.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_sig_trigger",
+      "severity_level": "low",
+      "critique": "The function applies a horizontal sinusoidal signal with hard-coded delta and frequency values. Although the formula is clarified, the lack of explicit linkage to the configuration file reduces flexibility and may prevent easy adjustments needed for different experimental settings.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_trojanNN_trigger",
+      "severity_level": "medium",
+      "critique": "This function relies on an externally supplied trigger_mask (e.g., an Apple logo) without clarifying how this mask is defined or linked to the configuration file, potentially leading to undefined behavior or inconsistencies in trigger injection.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_ssba_trigger",
+      "severity_level": "high",
+      "critique": "The use of the ssba_params dictionary is ill-defined; it is expected to include U-Net settings, decoder configuration, and iteration details, yet the source and structure of these parameters remain unspecified. This lack of clarity can critically break reproducibility and deviates from a strict configuration-based design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_wanet_trigger",
+      "severity_level": "medium",
+      "critique": "The warping_params parameter is handed over as a dictionary without a clear definition of its keys (such as warping intensity and scale) or how it is integrated with the configuration file. This ambiguity may result in inconsistent warping transformations that do not align with the experimental design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "General Utilities and Configuration Integration",
+      "severity_level": "medium",
+      "critique": "There is an overall inconsistency in how configuration parameters are managed. While some functions explicitly mention linking to the configuration file (e.g., for API caching/logging), others hard-code parameters or leave critical parameters undefined. This mixed approach could lead to reproducibility issues and potential contradictions with the original paper's intent.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "init_seed",
+      "severity_level": "medium",
+      "critique": "While the function seeds torch.cuda with torch.cuda.manual_seed_all(seed), it does not set torch.backends.cudnn.deterministic or torch.backends.cudnn.benchmark settings, which may result in non‐deterministic behavior on some GPU operations despite the seeding.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "overlay_badnets_trigger",
+      "severity_level": "medium",
+      "critique": "The function uses fixed patch sizes (3×3 for CIFAR‑10 and 21×21 for ImageNet) with an assumed position (e.g., lower‐right corner) without a clearly defined dynamic scaling strategy for various image resolutions, which risks deviating from the original experimental design if the images have non-standard dimensions.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_trojanNN_trigger",
+      "severity_level": "medium",
+      "critique": "This function relies on an externally supplied trigger_mask (e.g., an Apple logo) without clarifying how this mask is defined or linked to the configuration file, potentially leading to undefined behavior or inconsistencies in trigger injection.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_ssba_trigger",
+      "severity_level": "high",
+      "critique": "The use of the ssba_params dictionary is ill-defined; it is expected to include U-Net settings, decoder configuration, and iteration details, yet the source and structure of these parameters remain unspecified. This lack of clarity can critically break reproducibility and deviates from a strict configuration-based design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_wanet_trigger",
+      "severity_level": "medium",
+      "critique": "The warping_params parameter is handed over as a dictionary without a clear definition of its keys (such as warping intensity and scale) or how it is integrated with the configuration file. This ambiguity may result in inconsistent warping transformations that do not align with the experimental design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "General Utilities and Configuration Integration",
+      "severity_level": "medium",
+      "critique": "There is an overall inconsistency in how configuration parameters are managed. While some functions explicitly mention linking to the configuration file (e.g., for API caching/logging), others hard-code parameters or leave critical parameters undefined. This mixed approach could lead to reproducibility issues and potential contradictions with the original paper's intent.",
+      "source": "llm-judge"
+    }
+  ]
+}

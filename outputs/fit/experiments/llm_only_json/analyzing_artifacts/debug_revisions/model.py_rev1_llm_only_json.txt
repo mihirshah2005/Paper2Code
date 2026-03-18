@@ -1,0 +1,150 @@
+Below is the logic analysis for model.py, which is responsible for assembling the FiT transformer architecture. This document outlines the key components, data flow, and how the various modifications described in the paper are integrated. Remember that the implementation must strictly follow the design and parameter values from config.yaml.
+
+────────────────────────────────────────────
+1. OVERALL STRUCTURE
+
+• The Model class is instantiated with a configuration dictionary (params) that provides values such as:  
+ – patch_size (p = 2)  
+ – max_token_length (Lₘₐₓ = 256)  
+ – transformer sub-configuration (using “2D RoPE” for positional embedding, “Masked MHSA” for attention, and “SwiGLU” for the FFN block)  
+ – pretrained VAE path (set to "huggingface/stabilityai/sd-vae-ft-ema")  
+
+• The Model class will include the following key methods:  
+ – __init__(params: dict): Parses the configuration, sets up model hyperparameters, and builds all necessary sub-modules (VAE encoder/decoder, transformer layers, positional embedding module, etc.).  
+ – forward(x: Tensor) -> Tensor: Implements the forward pass for a batch of images.  
+ – load_pretrained_vae(vae_path: str) -> None: Loads the pretrained VAE for encoding and (optionally) decoding images.
+
+────────────────────────────────────────────
+2. PRETRAINED VAE INTEGRATION
+
+• In __init__, instantiate/load the pretrained VAE using the provided path from config.yaml.  
+ – The VAE encoder will be used to encode input images into latent codes while respecting the HW ⩽ 256² requirement.  
+ – (Optionally) The corresponding VAE decoder is stored for later use in image reconstruction during inference.
+
+• The load_pretrained_vae method abstracts the loading procedure so that the VAE can be replaced or updated if needed without affecting the transformer modules.
+
+────────────────────────────────────────────
+3. LATENT TOKENIZATION & PATCHIFICATION
+
+• Once an input image passes through the VAE encoder, we obtain a latent representation (likely of shape [B, C, H, W]).  
+ – Implement a “patchification” routine that divides the latent map into non-overlapping patches.  
+ – With patch size p = 2, each patch is flattened to form a “token” (i.e. a vector representing that image region).
+
+• Because the original image resolutions vary (while preserving aspect ratio), the resulting token sequence length L may differ from sample to sample.  
+ – A padding mechanism is applied so that all token sequences reach a fixed maximum length Lₘₐₓ = 256.  
+ – A corresponding mask is generated that flags “valid” tokens (real image content) versus “padding” tokens.  
+ – The loss computation (performed later in training) will ignore padded tokens by using this mask.
+
+────────────────────────────────────────────
+4. POSITIONAL EMBEDDING USING 2D RoPE
+
+• Instead of using a fixed absolute positional embedding, the model applies 2D Rotary Positional Embeddings (RoPE).  
+ – For each token, determine its “2D” position in the latent grid (height and width indices from the patchification).  
+ – Compute separate 1D RoPE embeddings along the height and width dimensions. Then, concatenate these embeddings to form a 2D embedding per token.
+
+• An option to implement the decoupled version is available. In this variant, the rotary frequencies for height and width are computed independently (using the same rotary base b = 10000 and using the scale factors defined in the paper).  
+ – This decoupling is key for improved resolution extrapolation when testing on resolutions different from the training distribution.
+
+• Additionally, implement routines for positional interpolation methods (see later section) to adapt to inference resolutions that may lie outside the training regime.  
+ – The interpolation variants include PI, EI, NTK, YaRN, as well as VisionNTK and VisionYaRN.
+
+────────────────────────────────────────────
+5. TRANSFORMER BLOCKS WITH MODIFIED COMPONENTS
+
+Within the transformer backbone (which follows the DiT-B/2 or DiT-XL/2 baseline):
+
+A. MASKED MULTI-HEAD SELF-ATTENTION (MHSA)
+ – Replace the standard MHSA with a masked version.  
+ – Within each attention block, build an attention mask M where:
+  • “Real” (active/noised) tokens receive a value of 0.
+  • Padding tokens receive a value of –∞ and are thereby eliminated by the softmax.
+ – The attention computation follows the standard scaled dot-product mechanism with the mask integrated.
+
+B. FFN MODULE WITH SWIGLU
+ – Replace the conventional MLP used in the feed-forward network (FFN) with a SwiGLU block.
+ – The calculation inside the FFN follows the formula:  
+  f(x) = Linear( SiLU(W₁ * x) ⊙ (W₂ * x) )  
+  where ⊙ denotes element-wise multiplication and the weight matrices are defined without bias.
+ – This modification is inspired by recent LLM architectures and shown to benefit flexibility and performance.
+
+C. RESIDUAL CONNECTIONS & LAYER NORMALIZATION  
+ – Standard residual connections and layer normalization are used around both the attention and FFN sub-modules, consistent with transformer design patterns.
+
+D. TRANSFORMER LAYER STACK  
+ – The complete FiT transformer backbone is a stack of these flexible blocks (the number of layers, hidden dimensions, and attention heads are inherited from the DiT baseline).
+
+────────────────────────────────────────────
+6. POSITIONAL EMBEDDING INTERPOLATION FOR RESOLUTION EXTRAPOLATION
+
+• During inference, the model may be asked to generate images at resolutions beyond those seen in training. To support this, implement several interpolation methods to modify the positional embeddings:
+ – PI (Position Interpolation): Linearly rescales the coordinate indices to match those of the training resolution.
+ – EI (Embedding Interpolation): Uses bilinear interpolation (e.g., torch.nn.functional.interpolate) to resize the positional embeddings.
+ – NTK and YaRN: These adjust the rotary frequency parameters (including a scale factor s = max(max(H_test, W_test)/L_train, 1.0) where L_train = √256 = 16) based on the method-specific formulas. For YaRN, use hyperparameters α = 1 and β = 32.
+ – VisionNTK and VisionYaRN: These are vision-specific adaptations of the NTK and YaRN methods that handle height and width separately (decoupling the rotary positions).
+
+• Provide a dedicated method (or sub-module) inside Model to handle these interpolation routines. The method should:  
+ – Accept the original positional embeddings and the target resolution (or token grid dimensions) as arguments.  
+ – Compute and return the appropriately interpolated embeddings.
+
+────────────────────────────────────────────
+7. FORWARD PASS OVERVIEW
+
+The primary flow in the forward(x: Tensor) method is as follows:
+
+1. Input Preprocessing:  
+ – x is a batch of images.  
+ – Pass x through the pretrained VAE encoder to get latent representations.
+
+2. Patchification & Tokenization:  
+ – Apply the patchify routine with patch size p = 2 to convert each latent map into a sequence of tokens.  
+ – Determine the actual token sequence length per image and pad tokens (and their corresponding positional embeddings) to a fixed length of 256 using a corresponding mask.
+
+3. Injection of Positional Embeddings:  
+ – Compute 2D RoPE (or its decoupled variant) for each token based on its position in the latent grid.  
+ – Add (or concatenate) the positional information to the token embeddings.
+
+4. Transformer Processing:  
+ – Forward the padded token sequence (with valid token mask) through the stack of transformer blocks.  
+ – Each layer applies:  
+  a. Masked MHSA (using the attention mask to exclude padded tokens).  
+  b. Residual connections and layer normalization.  
+  c. A SwiGLU-based FFN block with its own residual path.
+ – The output is a sequence of updated token embeddings, representing the denoised latent tokens for the diffusion process.
+
+5. Output:  
+ – Return the processed tokens which are later used in the diffusion loss computation or decoded back into images (via the pretrained VAE decoder) during inference.
+
+────────────────────────────────────────────
+8. ADDITIONAL SUPPORTED METHODS
+
+• decode(latent_tokens: Tensor) -> Tensor  
+ – Optionally, implement a helper method that passes the final latent tokens to the VAE decoder to generate reconstructed images.
+
+• positional_interpolation(method: str, original_pos: Tensor, target_dims: tuple) -> Tensor  
+ – A method that selects the appropriate interpolation routine (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN) based on input parameters and produces a new set of positional embeddings tailored to the target resolution.
+
+────────────────────────────────────────────
+9. DESIGN AND DEPENDENCIES
+
+• The Model class must strictly adhere to the provided design interface and should not expose any public member functions beyond those specified:  
+ – __init__(params: dict)  
+ – forward(x: Tensor) -> Tensor  
+ – load_pretrained_vae(vae_path: str) -> None
+
+• All numerical details (e.g., patchification dimensions, rotary base b = 10000, scale factor computations, EMA decay settings) are exactly taken from the config.yaml and paper.
+
+• The transformer’s architectural parameters (layer count, hidden size, attention heads) follow the DiT baseline (either DiT-B/2 or DiT-XL/2 as specified), so these should be passed from the configuration or set as default constants.
+
+────────────────────────────────────────────
+10. SUMMARY
+
+In summary, model.py implements the FiT Model class that:
+
+– Loads a pretrained VAE and uses it to encode images into latent space.
+– Patchifies the VAE latent codes into a sequence of tokens (with patch size=2) and pads them to max length 256.
+– Injects rich 2D positional information using a (decoupled) 2D RoPE mechanism.
+– Processes the token sequence through a custom transformer backbone that features Masked MHSA and SwiGLU-based FFN.
+– Provides positional interpolation routines (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN) to adjust for resolution extrapolation at inference time.
+– Exposes a clean forward interface for use by the Trainer and Evaluation modules.
+
+This analysis ensures that the subsequent code will faithfully reproduce the experiments and architecture modifications as described in the FiT paper while following our design and configuration parameters.

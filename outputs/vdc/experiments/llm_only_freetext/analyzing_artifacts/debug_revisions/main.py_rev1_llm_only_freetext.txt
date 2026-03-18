@@ -1,0 +1,94 @@
+Below is the detailed logic analysis for main.py. This file serves as the entry point of the experiment flow. It instantiates configuration, loads datasets, injects dirty samples, uses the VDCDetector to purify the training data, retrains a classifier on the purified dataset, and finally evaluates the trained model. Each step is described in detail below:
+
+──────────────────────────────
+1. Load Configuration
+
+• Read the “config.yaml” file and load the settings into a dictionary.  
+  – Training parameters: epochs, optimizer (SGD), learning rate (0.1), batch sizes (e.g., CIFAR-10: 128, ImageNet-100: 64, ImageNet-Dog: 64), and the learning rate decay schedules.  
+  – Detection parameters: threshold (α = 0.5), number of general questions (2) and label-specific questions per dataset (e.g., 4 for CIFAR-10, 6 for ImageNet-100, 4 for ImageNet-Dog).  
+  – Dirty sample generation parameters: noisy ratio (0.4) and poisoning details per dataset (e.g., samples per class as specified).  
+  – Model configurations: detector is “VDC” and classifier is “ResNet-18”.  
+  – API information: ChatGPT (gpt-3.5-turbo) and Instruct-BLIP.
+
+──────────────────────────────
+2. Module Initialization
+
+• Import modules: DatasetLoader, VQG, VQA, VAE, VDCDetector, Trainer, and Evaluation.  
+• Instantiate DatasetLoader with the loaded configuration. The DatasetLoader handles loading CIFAR-10 (or any chosen dataset like ImageNet-100 or ImageNet-Dog) via torchvision and applying preprocessing steps.  
+• Call DatasetLoader.load_data() to obtain the data dictionary containing training and test sets.
+
+──────────────────────────────
+3. Dirty Sample Injection & Dataset Purification
+
+• With the loaded training set, call DatasetLoader.inject_dirty_samples() passing in the training data along with the dirty sample generation settings (e.g., injecting noisy labels and backdoor triggers such as BadNets, Blended, SIG, etc.).  
+• This step mimics the real-world scenario where the dataset contains both poisoned samples and samples with noisy labels.
+
+• Next, initialize the VDC components:
+  – Create a VQG instance. It is configured with the pre-defined general question templates and the label-specific prompts (loaded from config or cached from previous ChatGPT calls).
+  – Create a VQA instance that wraps around the Instruct-BLIP model. Ensure that image preprocessing is aligned with what BLIP expects.
+  – Create a VAE instance, passing in evaluation configuration. This module will handle comparison of VQA outputs with expected answers (using simple string matching for label-specific questions and ChatGPT for general questions).
+
+• Instantiate the VDCDetector with the three modules (VQG, VQA, VAE) and set the detection threshold (0.5 from config).
+
+• Iterate over every sample in the training data:
+  – For each sample (image, label), call detector.detect_sample(image, label).
+  – Inside detect_sample:  
+     • The VQG is used to generate a union of questions (general and label‐specific) for the given label.
+     • For each question, the VQA module generates an answer.
+     • The answer is evaluated by VAE (using string matching for deterministic cases or by calling the evaluator API for general questions).
+     • A vote-based matching score (number of “yes” answers divided by the total number of questions) is computed.
+  – If the computed matching score is below 0.5, the sample is flagged as dirty.
+  
+• After processing, use the detector’s results to “purify” the training dataset (i.e., remove all flagged dirty samples). Log the number of samples dropped and the final count for reproducibility.
+
+──────────────────────────────
+4. Classifier Training
+
+• Instantiate the Trainer module with the purified training dataset (and, if needed, the corresponding labels).  
+  – The Trainer is configured to use ResNet-18 as the classifier.  
+  – Training hyperparameters (epochs, batch size, learning rate, and LR decay schedule) are set according to the dataset (e.g., CIFAR-10: 100 epochs, batch size 128, LR decay after epochs 50 and 75).  
+• Call trainer.train() to start the training loop.  
+  – The Trainer will use an SGD optimizer.
+  – During training, metrics such as training accuracy and loss are logged.
+  
+• Optionally, save the model checkpoint for later analysis.
+
+──────────────────────────────
+5. Model Evaluation
+
+• Instantiate the Evaluation module with the trained classifier model and the test dataset (obtained from DatasetLoader).  
+• Call evaluation.evaluate() to compute the key metrics:  
+  – For dirty sample detection: True Positive Rate (TPR) and False Positive Rate (FPR) based on how many actual dirty samples (if known via injection) were detected, and how many clean samples were incorrectly flagged.
+  – For classifier performance on the purified dataset: Compute the Clean Accuracy (ACC) and, in the case of backdoor attacks, the Attack Success Rate (ASR).  
+• Log and output the metrics.
+
+──────────────────────────────
+6. Orchestration and Overall Flow
+
+The flow in main.py should follow these steps sequentially:  
+
+• Load configuration from “config.yaml”.  
+• Initialize and load datasets using DatasetLoader.  
+• Inject dirty samples into training data if required.  
+• Initialize VQG, VQA, and VAE modules and combine them into VDCDetector.  
+• Loop over each training sample to determine whether it is dirty; then remove dirty samples to create a purified dataset.
+• Instantiate the Trainer and perform classifier training (e.g., ResNet-18) on the purified dataset.
+• Instantiate the Evaluation module and compute evaluation metrics (TPR, FPR, ASR, ACC).
+• Output the evaluation results (e.g., to the console and/or log files).
+
+──────────────────────────────
+7. Logging, Reproducibility, and Error Handling
+
+• Ensure that random seeds are fixed (via utils functions) to enable reproducibility across runs.  
+• Use logging to record the number of dirty samples injected, number removed by the detector, training losses, and evaluation metrics.  
+• For API calls to ChatGPT (used in VQG and VAE), incorporate caching to mitigate rate limit issues.  
+• Wrap API calls and critical processing blocks in try/except blocks to handle errors or API timeouts gracefully.
+
+──────────────────────────────
+8. Final Remarks
+
+The main.py script orchestrates the entire experimental pipeline. It leverages modular classes for data loading, detection using the VDC method, retraining a classifier with purified data, and finally evaluation. The logic strictly adheres to the methodology and experimental setup described in the paper while using the configuration parameters specified in config.yaml. This ensures that any change in, for example, the number of questions per label or training hyperparameters will be automatically picked up by the system.
+
+By following this logical flow, the experiments can be reproduced step by step and each module’s behavior can be independently verified and logged. This modular design also allows for future refinements (such as testing alternative MLLMs or improving prompt engineering) without disrupting the overall pipeline.
+
+This completes the logic analysis for main.py.

@@ -1,0 +1,110 @@
+Below is a detailed logic analysis for the dataset_loader.py module. This module’s role is to define a DatasetLoader class that reads the image dataset (e.g., ImageNet), applies proper image transformations (including resizing while preserving aspect ratio and horizontal flip augmentation), and computes—as early as possible—the information needed for tokenization of the VAE latent codes. In particular, it must estimate the variable token sequence length for each image and then “pad” that information to a fixed maximum length (L_max) as specified in the configuration.
+
+──────────────────────────────
+1. Overall Responsibilities
+
+• Read image files (using a dataset interface such as torchvision.datasets.ImageFolder) from the specified dataset (e.g., ImageNet).
+
+• Apply image transformations:
+ – Resize each image so that its area does not exceed the predetermined maximum (resize_max_area, set to 65,536 which is 256×256).
+ – Preserve the original aspect ratio when resizing.
+ – Apply horizontal flip augmentation (e.g., RandomHorizontalFlip) as specified.
+ – Convert the image into a tensor (and possibly perform normalization if needed later).
+
+• Preprocess for latent tokenization:
+ – Although the actual VAE encoding will happen later (in the Model module), the DatasetLoader should compute the expected shape of the VAE latent output.
+ – Assume that the pretrained VAE (from “huggingface/stabilityai/sd-vae-ft-ema”) downsamples the image by a fixed factor (commonly a factor of 8 in Stable Diffusion VAE). Using this, calculate the “latent resolution” of an image.
+ – Using the provided patch size (p = 2 from config), simulate the patchification step. In most FiT experiments the latent code is “patchified” by dividing the VAE latent spatial dimensions by patch size. For example, for a 256×256 input image:
+  ◦ Estimated latent resolution = (256 / 8) × (256 / 8) → (32×32)
+  ◦ Patchifying with patch size 2 gives token dimensions = (32/2)×(32/2) → (16×16) = 256 tokens.
+ – Similarly, for other aspect ratios (e.g., 160×320 or 128×384) compute the token count.
+ – Compute the “dynamic token length” as:
+  token_length = (floor(H / (downsampling_factor)) / patch_size) × (floor(W / (downsampling_factor)) / patch_size)
+ – Given the configuration parameter max_token_length (256), generate a padding mask (or metadata) that marks positions [0, token_length) as “real” tokens and positions [token_length, 256) as padding tokens.
+
+• Package the output:
+ – In the __getitem__ method, return a dictionary that includes:
+  • The transformed image tensor.
+  • Image metadata such as post-transform height and width.
+  • The computed token_count for that sample.
+  • A token mask or padded token placeholder of fixed length (256), which will later be used by the training pipeline to compute the loss only on valid tokens.
+
+• Provide a load_data() method:
+ – The DatasetLoader class should have a load_data() method that wraps the dataset into a PyTorch DataLoader with the configured batch size (256), shuffling (as appropriate), and (if needed) a custom collate function that ensures each field (e.g., the padded token mask) has uniform dimensions across the batch.
+
+──────────────────────────────
+2. Detailed Flow in DatasetLoader
+
+A. __init__(config: dict)
+ – Read and store key parameters from the config:
+  • data.dataset (e.g., “ImageNet”)
+  • data.resize_max_area (65,536)
+  • data.augmentation (e.g., “Horizontal Flip”)
+  • model.patch_size (2)
+  • model.max_token_length (256)
+ – (Optionally) Define and store any assumed constants such as the VAE downsampling factor (assumed to be 8). This is critical for computing the latent resolution.
+ – Build a composed transformation pipeline using torchvision.transforms:
+  • A custom Resize transform that:
+   – Determines the current image size (width and height).
+   – Computes the area, and if it exceeds 65,536, calculates a scaling factor = sqrt(max_area / (H×W)) and resizes accordingly (while preserving aspect ratio).
+  • A RandomHorizontalFlip transformation for data augmentation.
+  • Conversion to tensor.
+ – Instantiate the underlying dataset (for instance, using torchvision.datasets.ImageFolder) with the root path to the images and the defined transformation.
+
+B. __len__()
+ – Return the total number of images in the dataset.
+
+C. __getitem__(index)
+ – Load the image using the dataset’s internal loader (e.g., PIL image).
+ – Apply the transformation pipeline to obtain the transformed image tensor.
+ – Determine the new image dimensions (H, W); if needed, extract these before or after conversion.
+ – Compute the expected latent dimensions:
+  • latent_height = floor(H / downsampling_factor) and latent_width = floor(W / downsampling_factor)
+ – Compute the patchified token dimensions:
+  • token_height = floor(latent_height / patch_size) and token_width = floor(latent_width / patch_size)
+  • token_count = token_height × token_width
+ – Ensure that token_count does not exceed the fixed maximum (max_token_length); note that during training the images are preprocessed so that token_count is within or equal to max_token_length.
+ – Create a token mask (or a padded token sequence placeholder) of fixed length (256). For example, set the first token_count entries to “1” (or a valid token indicator) and the remaining (256 − token_count) entries to “0” (or a designated padding value). This mask is later used in loss computation.
+ – Return a dictionary containing:
+  { "image": transformed image tensor,
+    "token_count": token_count,
+    "token_mask": padded mask of length max_token_length,
+    "original_size": (H, W) }                     (“original_size” could be useful for later debugging/evaluation)
+
+D. load_data() -> DataLoader
+ – Construct a torch.utils.data.DataLoader by passing in the dataset defined above.
+ – Use the batch_size from the config (256) and shuffle the data for training if needed.
+ – (Optionally) Supply a custom collate_fn that simply stacks the “image” tensors and token information since every sample will now have token-related entries already padded to the same fixed size.
+ – Return the DataLoader to be used by the main training loop.
+
+──────────────────────────────
+3. Integration and Reference to Configurations
+
+• The module must strictly use the values provided in the config.yaml file. In particular:
+ – Use “resize_max_area” (65,536) to determine the maximum allowed image area.
+ – Use “patch_size” (2) and “max_token_length” (256) from the model configuration.
+ – Use the “Horizontal Flip” augmentation as specified.
+ – While the exact VAE downsampling factor is not in the config, this module should assume a constant (e.g., factor = 8) based on Stable Diffusion practices.
+ – The DataLoader’s batch size should be taken from training.batch_size (256).
+
+• All computed token lengths and padding steps must align with the FiT training pipieline requirements (i.e. every tokenized latent sequence is padded to exactly 256 tokens).
+
+──────────────────────────────
+4. Error Handling and Edge Cases
+
+• Ensure that images that already meet the area requirement (i.e., area ≤ 65,536) are not upscaled.
+• Handle any exceptions when reading images (e.g., corrupted files) by either skipping or providing a warning.
+• If an image somehow produces a token_count larger than max_token_length (which ideally should not happen due to preprocessing), decide whether to clip the tokens (and the mask) or raise an error.
+
+──────────────────────────────
+5. Summary
+
+The DatasetLoader in dataset_loader.py will:
+ – Initialize by reading essential configuration parameters.
+ – Create a transformation pipeline that properly resizes images while preserving aspect ratio and applies a horizontal flip augmentation.
+ – Load images from the dataset and compute both the transformed image dimensions and the expected tokenized latent dimensions (using an assumed VAE downsampling factor and the given patch size).
+ – Generate a padded token mask of fixed length (256) based on the computed token count.
+ – Wrap the dataset in a PyTorch DataLoader using the configured batch size.
+ – Provide uniform data objects that downstream modules (Model, Trainer, and Evaluation) can use to process the image and its dynamic (but padded) token representation.
+
+This design ensures that later stages in the FiT framework—especially the transformer model and diffusion training process—receive well-structured inputs with consistent shapes and the necessary metadata to handle dynamic token lengths.

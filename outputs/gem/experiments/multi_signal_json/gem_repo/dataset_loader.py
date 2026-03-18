@@ -1,0 +1,211 @@
+"""
+dataset_loader.py
+
+This module implements the DatasetLoader class and the GraphData data structure.
+It loads a graph dataset, computes the normalized Laplacian and performs a truncated
+eigendecomposition based on the provided configuration. The configuration expects
+a "compression_ratio" (in percentage, e.g., 0.15 for 0.15%) and a ratio r_k to split
+the eigenpairs into K1 smallest and K2 largest eigenpairs.
+"""
+
+import os
+import logging
+from math import ceil, sqrt
+from typing import Any, Dict
+
+import numpy as np
+import networkx as nx
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+
+# Configure logging for the module
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# GraphData data structure to hold the graph and eigen-decomposition results.
+class GraphData:
+    def __init__(self,
+                 adjacency: np.ndarray,
+                 node_features: np.ndarray,
+                 labels: np.ndarray,
+                 laplacian: np.ndarray,
+                 eigenvalues: np.ndarray,
+                 eigenvectors: np.ndarray) -> None:
+        """
+        Initializes the GraphData container.
+
+        Args:
+            adjacency (np.ndarray): Adjacency matrix of the graph.
+            node_features (np.ndarray): Node feature matrix X (shape: [N, d]).
+            labels (np.ndarray): Array of node labels.
+            laplacian (np.ndarray): Normalized Laplacian matrix L.
+            eigenvalues (np.ndarray): Combined array of K eigenvalues (from eigen-decomposition).
+            eigenvectors (np.ndarray): Combined eigenvector matrix (shape: [N, K]).
+        """
+        self.adjacency = adjacency
+        self.node_features = node_features
+        self.labels = labels
+        self.laplacian = laplacian
+        self.eigenvalues = eigenvalues
+        self.eigenvectors = eigenvectors
+
+
+class DatasetLoader:
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initializes the DatasetLoader with a configuration dictionary.
+        Validates and sets parameters for dataset loading and eigen-decomposition.
+
+        Expected configuration keys:
+            dataset:
+                name: Name of the dataset (default "Pubmed").
+                split_method: Method used for splitting data (default "public").
+            synth_graph:
+                compression_ratio: Desired percentage of real nodes to use for the synthetic graph.
+                                   (e.g., 0.15 means 0.15%; must be between 0 and 100).
+                r_k: Fraction to allocate for the smallest eigenpairs (K1) in synthetic graph eigenbasis.
+                     (must be in the range (0, 1], default 0.9)
+
+        Args:
+            config (Dict[str, Any]): Configuration dictionary containing dataset and synthesis parameters.
+        """
+        self.config = config
+
+        dataset_config = config.get("dataset", {})
+        self.dataset_name: str = dataset_config.get("name", "Pubmed")
+        self.split_method: str = dataset_config.get("split_method", "public")
+
+        synth_config = config.get("synth_graph", {})
+        # Compression ratio is expected as a percentage (e.g., 0.15 for 0.15%).
+        self.compression_ratio: float = float(synth_config.get("compression_ratio", 0.15))
+        if not (0 <= self.compression_ratio <= 100):
+            raise ValueError("compression_ratio must be between 0 and 100, representing a percentage.")
+
+        self.r_k: float = float(synth_config.get("r_k", 0.9))
+        if not (0 < self.r_k <= 1):
+            raise ValueError("r_k must be in the range (0, 1].")
+
+        logging.info(f"DatasetLoader initialized with dataset: {self.dataset_name}, "
+                     f"split_method: {self.split_method}, compression_ratio: {self.compression_ratio}%, r_k: {self.r_k}")
+
+    def load_data(self) -> GraphData:
+        """
+        Loads the graph dataset, computes the normalized Laplacian, and performs a truncated
+        eigendecomposition. It determines the synthetic graph size based on the compression_ratio,
+        and splits the number of eigenpairs into K1 (smallest eigenpairs) and K2 (largest eigenpairs).
+
+        Returns:
+            GraphData: An instance of GraphData containing the graph structure, features, labels,
+                       laplacian, and the computed eigenpairs.
+        """
+        # Attempt to load raw graph data from a file if available.
+        data_dir: str = "data"
+        file_name: str = f"{self.dataset_name}.npz"
+        data_path: str = os.path.join(data_dir, file_name)
+
+        if os.path.exists(data_path):
+            logging.info(f"Loading dataset '{self.dataset_name}' from {data_path}")
+            try:
+                loaded_data = np.load(data_path, allow_pickle=True)
+                # Expecting keys: 'adjacency', 'node_features', 'labels'
+                A: np.ndarray = loaded_data["adjacency"]
+                X: np.ndarray = loaded_data["node_features"]
+                Y: np.ndarray = loaded_data["labels"]
+            except Exception as e:
+                logging.error(f"Error loading dataset from {data_path}: {e}")
+                raise e
+        else:
+            logging.warning(f"Dataset file {data_path} not found. Generating a synthetic example graph.")
+            # Generate a fallback synthetic graph using NetworkX (e.g., Erdos-Renyi graph)
+            N_example: int = 100  # Number of nodes for the synthetic example
+            probability: float = 0.05
+            graph = nx.erdos_renyi_graph(n=N_example, p=probability, seed=42)
+            A = nx.adjacency_matrix(graph).toarray().astype(np.float32)
+            # Set a default feature dimension
+            feature_dim: int = 10
+            X = np.random.randn(N_example, feature_dim).astype(np.float32)
+            # Assume a classification task with 3 classes
+            Y = np.random.randint(0, 3, size=(N_example,))
+
+        # Ensure the adjacency matrix is a numpy array and binary (0, 1)
+        if not isinstance(A, np.ndarray):
+            A = np.array(A)
+        A = (A > 0).astype(np.float32)
+
+        num_nodes: int = A.shape[0]
+        logging.info(f"Graph loaded with {num_nodes} nodes.")
+
+        # Compute the degree vector and normalized Laplacian L = I - D^(-1/2) * A * D^(-1/2)
+        degree: np.ndarray = np.sum(A, axis=1)
+        # Compute D^(-1/2) safely (for nodes with zero degree, assign 0 to avoid division by zero)
+        with np.errstate(divide='ignore'):
+            d_inv_sqrt: np.ndarray = np.where(degree > 0, 1.0 / np.sqrt(degree), 0.0)
+        D_inv_sqrt: np.ndarray = np.diag(d_inv_sqrt)
+        I: np.ndarray = np.eye(num_nodes, dtype=np.float32)
+        L: np.ndarray = I - D_inv_sqrt @ A @ D_inv_sqrt
+
+        if np.any(degree == 0):
+            logging.warning("One or more nodes with degree zero encountered during Laplacian computation.")
+
+        # Determine synthetic graph size based on the compression_ratio.
+        # compression_ratio is assumed to be in percentage; convert to fraction.
+        fraction: float = self.compression_ratio / 100.0
+        synthetic_nodes: int = max(ceil(num_nodes * fraction), 1)
+        # Total number of eigenpairs to be used is set to synthetic_nodes.
+        K: int = synthetic_nodes
+        # Split eigenpairs: K1 smallest and K2 largest.
+        K1: int = ceil(self.r_k * synthetic_nodes)
+        K2: int = synthetic_nodes - K1
+
+        logging.info(f"Computed synthetic graph size: {synthetic_nodes} nodes. Total eigenpairs K: {K} "
+                     f"(K1: {K1} smallest, K2: {K2} largest).")
+
+        # Convert L to a sparse matrix for efficient eigen-decomposition.
+        L_sparse = csr_matrix(L)
+
+        # Compute the K1 smallest eigenpairs using eigsh with which='SM'
+        if K1 > 0:
+            try:
+                evals_small, evecs_small = eigsh(L_sparse, k=K1, which='SM')
+            except Exception as e:
+                logging.error(f"Error computing smallest eigenpairs: {e}")
+                raise e
+            # Sort in ascending order.
+            sort_idx_small = np.argsort(evals_small)
+            evals_small = evals_small[sort_idx_small]
+            evecs_small = evecs_small[:, sort_idx_small]
+        else:
+            evals_small = np.array([], dtype=np.float32)
+            evecs_small = np.empty((num_nodes, 0), dtype=np.float32)
+
+        # Compute the K2 largest eigenpairs using eigsh with which='LA'
+        if K2 > 0:
+            try:
+                evals_large, evecs_large = eigsh(L_sparse, k=K2, which='LA')
+            except Exception as e:
+                logging.error(f"Error computing largest eigenpairs: {e}")
+                raise e
+            # Sort in descending order.
+            sort_idx_large = np.argsort(evals_large)[::-1]
+            evals_large = evals_large[sort_idx_large]
+            evecs_large = evecs_large[:, sort_idx_large]
+        else:
+            evals_large = np.array([], dtype=np.float32)
+            evecs_large = np.empty((num_nodes, 0), dtype=np.float32)
+
+        # Combine the eigenpairs to form the final eigenbasis U_K and eigenvalues.
+        eigenvalues_combined: np.ndarray = np.concatenate([evals_small, evals_large])
+        eigenvectors_combined: np.ndarray = np.concatenate([evecs_small, evecs_large], axis=1)
+
+        logging.info(f"Truncated eigendecomposition complete. Combined eigenpairs shape: {eigenvectors_combined.shape}")
+
+        # Package data into GraphData structure.
+        graph_data = GraphData(
+            adjacency=A,
+            node_features=X,
+            labels=Y,
+            laplacian=L,
+            eigenvalues=eigenvalues_combined,
+            eigenvectors=eigenvectors_combined
+        )
+        return graph_data

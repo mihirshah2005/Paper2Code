@@ -1,0 +1,354 @@
+"""
+evaluation.py
+
+This module implements the Evaluation class used to assess the quality of the distilled
+synthetic graph. It trains one or more standard GNN classifiers (here a simple 2-layer GCN)
+on the synthetic graph produced by the distillation process and then evaluates the trained
+classifier on the test set of the real graph.
+
+The evaluation process includes:
+  1. Reconstructing the synthetic graph using the Model's reconstruct_graph() method.
+  2. Mapping synthetic labels: If the synthetic graph does not come with explicit labels,
+     they are transferred from the real graph by assuming that the first N_syn nodes
+     correspond to the synthetic nodes.
+  3. Training a GCN classifier on the synthetic graph (with normalized adjacency and synthetic features).
+  4. Splitting the real graph data (node features and labels) into training/validation/test subsets.
+  5. Evaluating the trained classifier on the real graph test set.
+
+All hyperparameters (such as evaluation epochs, learning rate, number of GNN layers, hidden units)
+are read from the evaluation section of the configuration dictionary (config.yaml). Default values
+are provided if they are missing.
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import math
+from typing import Dict, Any, Tuple, List
+
+# ----------------------- Utility Functions -----------------------
+
+def normalize_adjacency(adj: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the symmetrically normalized adjacency matrix.
+    A_norm = D^(-1/2) (A + I) D^(-1/2) where D is the degree diagonal matrix.
+    
+    Args:
+        adj (torch.Tensor): Dense adjacency matrix of shape (N, N).
+    
+    Returns:
+        torch.Tensor: Normalized adjacency matrix of shape (N, N).
+    """
+    device = adj.device
+    N = adj.size(0)
+    # Add identity for self-loops
+    adj_with_self = adj + torch.eye(N, device=device, dtype=adj.dtype)
+    # Compute degree matrix
+    degree = torch.sum(adj_with_self, dim=1)
+    # Avoid division by zero
+    degree_inv_sqrt = torch.pow(degree, -0.5)
+    degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0
+    D_inv_sqrt = torch.diag(degree_inv_sqrt)
+    # Normalized adjacency: D^(-1/2) (A+I) D^(-1/2)
+    return torch.matmul(torch.matmul(D_inv_sqrt, adj_with_self), D_inv_sqrt)
+
+def split_indices(labels: np.ndarray,
+                    train_ratio: float = 0.6,
+                    val_ratio: float = 0.2,
+                    test_ratio: float = 0.2,
+                    random_seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Splits indices for the dataset into training, validation, and testing subsets.
+    
+    Args:
+        labels (np.ndarray): Array of labels.
+        train_ratio (float): Fraction of indices for training.
+        val_ratio (float): Fraction for validation.
+        test_ratio (float): Fraction for testing.
+        random_seed (int): Seed for reproducibility.
+    
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]: The train, validation, and test indices.
+    """
+    assert math.isclose(train_ratio + val_ratio + test_ratio, 1.0), "Ratios must sum to 1.0."
+    num_nodes = len(labels)
+    indices = np.arange(num_nodes)
+    np.random.seed(random_seed)
+    np.random.shuffle(indices)
+    train_end = int(train_ratio * num_nodes)
+    val_end = train_end + int(val_ratio * num_nodes)
+    train_idx = indices[:train_end]
+    val_idx = indices[train_end:val_end]
+    test_idx = indices[val_end:]
+    return train_idx, val_idx, test_idx
+
+def calc_accuracy(output: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Calculates classification accuracy given model outputs and true labels.
+    
+    Args:
+        output (torch.Tensor): Logits output by the classifier (N x num_classes).
+        labels (torch.Tensor): True labels (N,).
+    
+    Returns:
+        float: Accuracy as a percentage.
+    """
+    preds = output.max(dim=1)[1]
+    correct = preds.eq(labels).sum().item()
+    return correct / labels.size(0)
+
+# ----------------------- GCN Classifier Definition -----------------------
+
+class GCN(nn.Module):
+    """
+    A simple 2-layer Graph Convolutional Network (GCN) used as the classifier for evaluation.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int) -> None:
+        super(GCN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+    
+    def forward(self, X: torch.Tensor, A_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the GCN classifier.
+        
+        Args:
+            X (torch.Tensor): Node feature matrix of shape (N, input_dim).
+            A_norm (torch.Tensor): Normalized adjacency matrix of shape (N, N).
+        
+        Returns:
+            torch.Tensor: Logits for each class of shape (N, num_classes).
+        """
+        hidden = self.fc1(torch.matmul(A_norm, X))
+        hidden = F.relu(hidden)
+        logits = self.fc2(torch.matmul(A_norm, hidden))
+        return logits
+
+# ----------------------- Evaluation Class -----------------------
+
+class Evaluation:
+    """
+    Evaluation class for assessing the quality of the distilled synthetic graph.
+    It trains a GCN classifier on the synthetic graph and evaluates its performance
+    on the real graph's test set.
+    """
+    def __init__(self, model: nn.Module, data: Any, eval_config: Dict[str, Any]) -> None:
+        """
+        Initializes the Evaluation class.
+        
+        Args:
+            model (nn.Module): The distillation model that has been trained.
+            data (GraphData): The real graph data object containing adjacency, features, labels, etc.
+            eval_config (Dict[str, Any]): Configuration dictionary for evaluation parameters.
+        """
+        self.model = model
+        self.data = data
+        self.eval_config = eval_config
+
+        # Extract evaluation hyperparameters for spatial GNN (GCN) from configuration.
+        gnn_config: Dict[str, Any] = eval_config.get("gnn", {}).get("spatial", {})
+        self.n_layers: int = int(gnn_config.get("n_layers", 2))
+        self.hidden_units: int = int(gnn_config.get("hidden_units", 256))
+        
+        # Additional evaluation-specific hyperparameters.
+        self.eval_epochs: int = int(eval_config.get("evaluation_epochs", 200))
+        self.eval_lr: float = float(eval_config.get("evaluation_lr", 0.01))
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def evaluate(self) -> Dict[str, Any]:
+        """
+        Evaluates the quality of the synthetic graph by training a GCN classifier
+        on the synthetic graph and evaluating it on the real graph's test set.
+        
+        Returns:
+            Dict[str, Any]: A dictionary mapping the evaluated architecture (e.g., "GCN")
+            to its performance metrics, including training, validation, and test accuracy,
+            as well as training loss.
+        """
+        # ---------------- Step 1: Reconstruct Synthetic Graph ----------------
+        # Determine the synthetic eigenvalues from the real graph data.
+        # Use the first N_syn eigenvalues where N_syn is determined by the model.
+        N_syn = self.model.N_syn
+        eigenvalues_np = self.data.eigenvalues
+        if eigenvalues_np.shape[0] < N_syn:
+            real_eigvals_np = eigenvalues_np
+        else:
+            real_eigvals_np = eigenvalues_np[:N_syn]
+        real_eigvals_tensor = torch.tensor(real_eigvals_np, dtype=torch.float32, device=self.device)
+        
+        # Reconstruct the synthetic graph using the model.
+        # L_syn is the synthetic Laplacian and A_syn is the synthetic adjacency matrix.
+        self.model.to(self.device)
+        L_syn, A_syn = self.model.reconstruct_graph(real_eigvals_tensor)
+        # Ensure synthetic features are detached and sent to the evaluation device.
+        X_syn = self.model.X_syn.detach().to(self.device)
+        # Define synthetic labels by transferring from the real graph.
+        # Here we assume the first N_syn nodes in the real graph correspond to synthetic nodes.
+        synthetic_labels_np = self.data.labels[:N_syn]
+        y_syn = torch.tensor(synthetic_labels_np, dtype=torch.long, device=self.device)
+        
+        # Normalize the synthetic adjacency matrix.
+        A_syn = A_syn.to(self.device)
+        A_syn_norm = normalize_adjacency(A_syn)
+        
+        # ---------------- Step 2: Train GCN Classifier on Synthetic Graph ----------------
+        input_dim = self.model.feature_dim
+        num_classes = int(np.max(self.data.labels)) + 1  # Assuming labels are 0-indexed.
+        classifier = GCN(input_dim=input_dim, hidden_dim=self.hidden_units, num_classes=num_classes)
+        classifier = classifier.to(self.device)
+        optimizer = optim.Adam(classifier.parameters(), lr=self.eval_lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Training loop on synthetic graph.
+        classifier.train()
+        for epoch in range(1, self.eval_epochs + 1):
+            optimizer.zero_grad()
+            # Forward pass: using synthetic features and normalized synthetic adjacency.
+            output = classifier(X_syn, A_syn_norm)
+            loss = criterion(output, y_syn)
+            loss.backward()
+            optimizer.step()
+            if epoch % 20 == 0 or epoch == 1 or epoch == self.eval_epochs:
+                train_acc = calc_accuracy(output, y_syn)
+                print(f"[Synthetic Training] Epoch {epoch}/{self.eval_epochs} - Loss: {loss.item():.4f}, Train Acc: {train_acc*100:.2f}%")
+        
+        # ---------------- Step 3: Evaluate Classifier on Real Graph ----------------
+        # Prepare real graph features and normalized adjacency.
+        X_real = torch.tensor(self.data.node_features, dtype=torch.float32, device=self.device)
+        A_real = torch.tensor(self.data.adjacency, dtype=torch.float32, device=self.device)
+        A_real_norm = normalize_adjacency(A_real)
+        # Obtain real labels.
+        y_real = torch.tensor(self.data.labels, dtype=torch.long, device=self.device)
+        num_real_nodes = X_real.size(0)
+        # Split real graph indices into train, validation, test sets.
+        train_idx_np, val_idx_np, test_idx_np = split_indices(self.data.labels, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42)
+        train_idx = torch.tensor(train_idx_np, dtype=torch.long, device=self.device)
+        val_idx = torch.tensor(val_idx_np, dtype=torch.long, device=self.device)
+        test_idx = torch.tensor(test_idx_np, dtype=torch.long, device=self.device)
+        
+        classifier.eval()
+        with torch.no_grad():
+            # Evaluate on training set of real graph.
+            output_train = classifier(X_real[train_idx], A_real_norm)
+            train_acc_real = calc_accuracy(output_train, y_real[train_idx])
+            # Evaluate on validation set.
+            output_val = classifier(X_real[val_idx], A_real_norm)
+            val_acc_real = calc_accuracy(output_val, y_real[val_idx])
+            # Evaluate on test set.
+            output_test = classifier(X_real[test_idx], A_real_norm)
+            test_acc_real = calc_accuracy(output_test, y_real[test_idx])
+        
+        print(f"[Real Evaluation] Train Acc: {train_acc_real*100:.2f}%, Val Acc: {val_acc_real*100:.2f}%, Test Acc: {test_acc_real*100:.2f}%")
+        
+        # ---------------- Step 4: Compile and Return Evaluation Results ----------------
+        results = {
+            "GCN": {
+                "synthetic_train_loss": loss.item(),
+                "synthetic_train_accuracy": calc_accuracy(output, y_syn),
+                "real_train_accuracy": train_acc_real,
+                "real_val_accuracy": val_acc_real,
+                "real_test_accuracy": test_acc_real,
+                "evaluation_epochs": self.eval_epochs,
+                "evaluation_lr": self.eval_lr
+            },
+            "mean_test_accuracy": test_acc_real,
+            "test_accuracy_variance": 0.0  # Since only one architecture is evaluated.
+        }
+        return results
+
+# ----------------------- Main Testing (Optional) -----------------------
+# The following code block can be used for standalone testing of evaluation.py.
+# It will not execute when the module is imported elsewhere.
+
+if __name__ == "__main__":
+    # For standalone testing, create dummy synthetic model outputs and dummy GraphData.
+    # Normally, these objects are created by dataset_loader.py, model.py, and trainer.py.
+    
+    # Create a dummy configuration dictionary for evaluation.
+    eval_config = {
+        "gnn": {
+            "spatial": {
+                "n_layers": 2,
+                "hidden_units": 256
+            }
+        },
+        "evaluation_epochs": 200,
+        "evaluation_lr": 0.01
+    }
+    
+    # Dummy GraphData (simulate a small graph)
+    # For demonstration, use a 100-node graph with 50-dimensional features and 3 classes.
+    N_real = 100
+    feature_dim = 50
+    np.random.seed(42)
+    dummy_adj = np.random.randint(0, 2, size=(N_real, N_real)).astype(np.float32)
+    # Force symmetry and zero diagonal
+    dummy_adj = np.triu(dummy_adj, 1)
+    dummy_adj = dummy_adj + dummy_adj.T
+    np.fill_diagonal(dummy_adj, 0)
+    dummy_features = np.random.rand(N_real, feature_dim).astype(np.float32)
+    dummy_labels = np.random.randint(0, 3, size=(N_real,))
+    
+    # For eigen-decomposition, create a dummy Laplacian and eigenpairs.
+    # Here, we use identity for simplicity.
+    dummy_laplacian = np.eye(N_real, dtype=np.float32)
+    # Select 10 eigenvalues/eigenvectors as dummy (assuming compression_ratio leads to N_syn=10)
+    dummy_eigenvalues = np.linspace(0, 2, num=10, dtype=np.float32)
+    dummy_eigenvectors = np.eye(N_real, 10, dtype=np.float32)
+    
+    class GraphDataDummy:
+        def __init__(self, adjacency, node_features, labels, laplacian, eigenvalues, eigenvectors):
+            self.adjacency = adjacency
+            self.node_features = node_features
+            self.labels = labels
+            self.laplacian = laplacian
+            self.eigenvalues = eigenvalues
+            self.eigenvectors = eigenvectors
+    
+    dummy_graph_data = GraphDataDummy(
+        adjacency=dummy_adj,
+        node_features=dummy_features,
+        labels=dummy_labels,
+        laplacian=dummy_laplacian,
+        eigenvalues=dummy_eigenvalues,
+        eigenvectors=dummy_eigenvectors
+    )
+    
+    # For testing, create a dummy Model with necessary attributes.
+    # We mimic a trained model by creating a simple object with X_syn, U_syn, N_syn, feature_dim,
+    # and a reconstruct_graph method that returns A_syn and L_syn.
+    class DummyModel(nn.Module):
+        def __init__(self, N_syn, feature_dim, K_total):
+            super(DummyModel, self).__init__()
+            self.N_syn = N_syn
+            self.feature_dim = feature_dim
+            self.K_total = K_total
+            # Initialize synthetic features and synthetic eigenbasis.
+            self.X_syn = nn.Parameter(torch.randn(N_syn, feature_dim, dtype=torch.float32))
+            self.U_syn = nn.Parameter(torch.randn(N_syn, K_total, dtype=torch.float32))
+            # Perform orthogonal initialization.
+            nn.init.orthogonal_(self.U_syn)
+        
+        def reconstruct_graph(self, real_eigvals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            # Reconstruct synthetic Laplacian and adjacency following the formula:
+            # L_syn = U_syn * diag(real_eigvals) * U_syn^T
+            # A_syn = U_syn * diag(1 - real_eigvals) * U_syn^T
+            diag_eig = torch.diag(real_eigvals)
+            L_syn = torch.matmul(torch.matmul(self.U_syn, diag_eig), self.U_syn.transpose(0, 1))
+            diag_adj = torch.diag(1.0 - real_eigvals)
+            A_syn = torch.matmul(torch.matmul(self.U_syn, diag_adj), self.U_syn.transpose(0, 1))
+            return L_syn, A_syn
+        
+        def forward(self, x):
+            # Not used in evaluation.
+            return self.X_syn, self.U_syn
+    
+    # Assume compression_ratio has resulted in N_syn = 10 and thus K_total = 10.
+    dummy_model = DummyModel(N_syn=10, feature_dim=feature_dim, K_total=10)
+    
+    # Instantiate the Evaluation class.
+    evaluator = Evaluation(model=dummy_model, data=dummy_graph_data, eval_config=eval_config)
+    eval_results = evaluator.evaluate()
+    print("Evaluation Results:", eval_results)

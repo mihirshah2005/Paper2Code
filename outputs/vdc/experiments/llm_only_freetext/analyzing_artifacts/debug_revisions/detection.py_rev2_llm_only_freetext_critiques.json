@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "The overall explanation is detailed and mostly accurate, but I noticed a few points that could use clarification or additional handling:\n\n1. Expected Answer Management for Label-Specific Questions – Medium:\n • The analysis notes that the “expected_answer” for label-specific questions is pre‐determined (for example, via templates or configuration) but does not explain exactly how this expected answer is supplied. Is it embedded in the question item (e.g., as part of a tuple) or retrieved from con",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "The overall explanation is detailed and mostly accurate, but I noticed a few points that could use clarification or additional handling:\n\n1. Expected Answer Management for Label-Specific Questions – Medium:\n • The analysis notes that the “expected_answer” for label-specific questions is pre‐determined (for example, via templates or configuration) but does not explain exactly how this expected answer is supplied. Is it embedded in the question item (e.g., as part of a tuple) or retrieved from con",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

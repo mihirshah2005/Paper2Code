@@ -1,0 +1,147 @@
+```python
+"""detection.py
+
+This module implements the VDCDetector class which integrates the Visual Question Generation (VQG),
+Visual Question Answering (VQA), and Visual Answer Evaluation (VAE) modules to detect dirty samples
+with visual-linguistic inconsistency.
+
+For a given image and its associated label, the detector:
+  1. Generates two sets of questions via VQG:
+       a. General questions (e.g., "Describe the image briefly.")
+       b. Label-specific questions (generated using ChatGPT API with tailored prompts)
+  2. Uses VQA (Instruct-BLIP) to answer each question.
+  3. Evaluates each answer with VAE:
+       - For label-specific questions: uses simple string matching (checks for "yes"/"no").
+       - For general questions: calls ChatGPT via an evaluation prompt to obtain a binary decision.
+  4. Computes the matching score as the proportion of "correct" answers.
+  5. Flags the sample as dirty if the matching score is below the configured threshold (default: 0.5).
+
+The class is initialized with pre-instantiated objects for VQG, VQA, and VAE, and uses configuration
+parameters from config.yaml.
+"""
+
+from typing import Any, Dict, List
+
+from vqg import VQG
+from vqa import VQA
+from vae import VAE
+
+from utils import get_logger
+
+
+class VDCDetector:
+    """
+    VDCDetector integrates VQG, VQA, and VAE modules to detect dirty samples.
+    
+    Attributes:
+        vqg (VQG): Visual Question Generation module instance.
+        vqa (VQA): Visual Question Answering module instance.
+        vae (VAE): Visual Answer Evaluation module instance.
+        threshold (float): Matching score threshold below which a sample is considered dirty.
+        logger: Logger instance for debugging and information logging.
+    """
+
+    def __init__(self, vqg: VQG, vqa: VQA, vae: VAE, threshold: float = 0.5) -> None:
+        """
+        Initializes the VDCDetector with given VQG, VQA, and VAE modules and detection threshold.
+        
+        Args:
+            vqg (VQG): An instance of the VQG module.
+            vqa (VQA): An instance of the VQA module.
+            vae (VAE): An instance of the VAE module.
+            threshold (float, optional): Detection threshold; if the matching score is below this value,
+                                         the sample is flagged as dirty. Defaults to 0.5.
+        """
+        self.vqg: VQG = vqg
+        self.vqa: VQA = vqa
+        self.vae: VAE = vae
+        self.threshold: float = threshold
+        self.logger = get_logger("VDCDetector")
+
+    def detect_sample(self, image: Any, label: str) -> bool:
+        """
+        Detects whether the given image sample with its associated label is "dirty" 
+        by quantifying the visual-linguistic inconsistency between the image and its label.
+        
+        The detection pipeline performs the following:
+          1. Generates a set of general and label-specific questions using VQG.
+          2. For every question in the union of these two sets:
+               - Uses VQA to obtain an answer.
+               - Uses VAE to evaluate the answer against an expected criterion.
+          3. Computes the matching score as:
+                 matching_score = (number of evaluations that returned True) / (total number of questions).
+          4. Flags the sample as dirty if matching_score < threshold.
+        
+        Args:
+            image (Any): Input image sample. Expected to be a PIL.Image or a torch.Tensor.
+            label (str): The associated label (as a string) for the image.
+        
+        Returns:
+            bool: True if the sample is marked as dirty (i.e., matching score below threshold),
+                  False otherwise.
+        """
+        # Generate general questions and label-specific questions.
+        general_questions: List[str] = self.vqg.generate_general_questions(label)
+        label_specific_questions: List[str] = self.vqg.generate_label_specific_questions(label)
+
+        # Log the number of questions generated.
+        self.logger.debug(f"Generated {len(general_questions)} general questions and "
+                          f"{len(label_specific_questions)} label-specific questions for label '{label}'.")
+
+        # Form the complete set of questions along with their associated question types.
+        # Each question is represented as a dict with keys: "question" and "type".
+        questions_data: List[Dict[str, str]] = []
+        for general_q in general_questions:
+            questions_data.append({"question": general_q, "type": "general"})
+        for spec_q in label_specific_questions:
+            questions_data.append({"question": spec_q, "type": "label-specific"})
+
+        total_questions: int = len(questions_data)
+        if total_questions == 0:
+            self.logger.warning(f"No questions generated for label '{label}'. Consider checking VQG module.")
+            # If no questions could be generated, return False (sample deemed clean).
+            return False
+
+        correct_count: int = 0
+
+        # For each generated question, obtain an answer via VQA and evaluate it using VAE.
+        for qa in questions_data:
+            question_text: str = qa["question"]
+            question_type: str = qa["type"]
+
+            # Get the answer from VQA module.
+            answer_text: str = self.vqa.answer_question(image, question_text)
+            if not answer_text:
+                self.logger.warning(f"No answer obtained for question '{question_text}' (type: {question_type}).")
+            
+            # Determine the expected answer based on question type.
+            if question_type == "general":
+                # For general questions, the expected answer aligns with the label's semantics.
+                expected_answer: str = f"The image is correctly labeled as {label}."
+            elif question_type == "label-specific":
+                # For label-specific questions, the assumption is that a "yes" response indicates correctness.
+                expected_answer: str = "yes"
+            else:
+                expected_answer: str = ""
+
+            # Evaluate the answer using VAE.
+            evaluation_result: bool = self.vae.evaluate_answer(answer_text, expected_answer, question_type)
+            self.logger.debug(f"Evaluation for question (type: {question_type}): "
+                              f"'{question_text}' | Answer: '{answer_text}' | Expected: '{expected_answer}' "
+                              f"| Result: {evaluation_result}")
+            if evaluation_result:
+                correct_count += 1
+
+        # Compute the matching score (vote-based ensemble).
+        matching_score: float = correct_count / total_questions
+        self.logger.info(f"Matching score for sample with label '{label}': {matching_score:.4f} "
+                         f"(Threshold: {self.threshold})")
+
+        # If the matching score is lower than the threshold, flag the sample as dirty.
+        is_dirty: bool = matching_score < self.threshold
+        if is_dirty:
+            self.logger.info(f"Sample flagged as DIRTY (matching score: {matching_score:.4f} < threshold).")
+        else:
+            self.logger.info(f"Sample flagged as CLEAN (matching score: {matching_score:.4f} >= threshold).")
+        return is_dirty
+```

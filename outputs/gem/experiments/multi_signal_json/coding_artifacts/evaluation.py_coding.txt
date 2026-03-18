@@ -1,0 +1,327 @@
+```python
+"""
+evaluation.py
+
+This module implements the Evaluation class that performs the evaluation of the distilled synthetic graph.
+It reconstructs the synthetic graph using the provided distillation model, validates the outputs, generates
+synthetic labels by sampling from the real label distribution, and then performs cross-architecture evaluation.
+For each candidate GNN architecture, the model is trained on the synthetic graph (A′, X′, synthetic labels)
+and then evaluated on the test split of the real graph. The evaluation results (mean accuracy, std, and per-run
+accuracies) are returned as a dictionary.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import logging
+import random
+
+# Setup logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --------------------------
+# Candidate Architectures
+# --------------------------
+class SimpleGCN(nn.Module):
+    """A simple 2-layer Graph Convolutional Network for evaluation."""
+    def __init__(self, in_features: int, hidden_units: int, num_classes: int, n_layers: int = 2):
+        super(SimpleGCN, self).__init__()
+        self.n_layers = n_layers
+        self.fc1 = nn.Linear(in_features, hidden_units)
+        self.fc2 = nn.Linear(hidden_units, num_classes)
+
+    def forward(self, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        # First propagation step: H = A @ X
+        H = torch.matmul(A, X)
+        H = self.fc1(H)
+        H = F.relu(H)
+        # Second propagation step: H = A @ H
+        H = torch.matmul(A, H)
+        out = self.fc2(H)
+        return out
+
+class SimpleSGC(nn.Module):
+    """A simple Simplified Graph Convolution (SGC) model for evaluation.
+    SGC performs K-fold message passing on input features and then applies a linear classifier.
+    """
+    def __init__(self, in_features: int, num_classes: int, K: int = 2):
+        super(SimpleSGC, self).__init__()
+        self.K = K
+        self.fc = nn.Linear(in_features, num_classes)
+
+    def forward(self, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        H = X
+        for _ in range(self.K):
+            H = torch.matmul(A, H)
+        out = self.fc(H)
+        return out
+
+def get_candidate_architectures(in_features: int, num_classes: int, config_eval: dict) -> dict:
+    """Returns a dictionary mapping candidate architecture names to fresh model instances.
+
+    Args:
+        in_features (int): Input feature dimension.
+        num_classes (int): Number of output classes.
+        config_eval (dict): Evaluation configuration for GNNs; expected keys under "spatial".
+
+    Returns:
+        dict: A dictionary where keys are architecture names and values are the candidate model instances.
+    """
+    # Retrieve hyperparameters from config; set defaults if not provided.
+    spatial_config = config_eval.get("spatial", {})
+    n_layers = int(spatial_config.get("n_layers", 2))
+    hidden_units = int(spatial_config.get("hidden_units", 256))
+    sgc_K = 2  # Default propagation steps for SGC
+
+    # For demonstration, use SimpleGCN for most candidates.
+    candidate_models = {
+        "GCN": SimpleGCN(in_features, hidden_units, num_classes, n_layers),
+        "SGC": SimpleSGC(in_features, num_classes, K=sgc_K),
+        "PPNP": SimpleGCN(in_features, hidden_units, num_classes, n_layers),  # Placeholder
+        "ChebyNet": SimpleGCN(in_features, hidden_units, num_classes, n_layers),  # Placeholder
+        "BernNet": SimpleGCN(in_features, hidden_units, num_classes, n_layers),  # Placeholder
+        "GPR-GNN": SimpleGCN(in_features, hidden_units, num_classes, n_layers)   # Placeholder
+    }
+    return candidate_models
+
+def train_val_test_split(num_nodes: int, train_frac: float = 0.7, val_frac: float = 0.15, test_frac: float = 0.15, seed: int = 42):
+    """Splits indices into train, validation, and test sets.
+
+    Args:
+        num_nodes (int): Total number of nodes.
+        train_frac (float): Fraction for training.
+        val_frac (float): Fraction for validation.
+        test_frac (float): Fraction for testing.
+        seed (int): Random seed.
+    
+    Returns:
+        tuple: (train_indices, val_indices, test_indices) as numpy arrays.
+    """
+    assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-6, "Fractions must sum to 1."
+    indices = np.arange(num_nodes)
+    np.random.seed(seed)
+    np.random.shuffle(indices)
+    train_end = int(train_frac * num_nodes)
+    val_end = train_end + int(val_frac * num_nodes)
+    train_idx = indices[:train_end]
+    val_idx = indices[train_end:val_end]
+    test_idx = indices[val_end:]
+    return train_idx, val_idx, test_idx
+
+# --------------------------
+# Evaluation Class
+# --------------------------
+class Evaluation:
+    def __init__(self, model: torch.nn.Module, graph_data: object, eval_config: dict) -> None:
+        """
+        Initializes the Evaluation instance.
+        
+        Args:
+            model (torch.nn.Module): The trained distillation model; must implement reconstruct_graph().
+            graph_data (GraphData): Real graph data containing adjacency, node_features, labels, etc.
+            eval_config (dict): Evaluation configuration dictionary. Expected keys:
+                - "evaluation": for evaluation hyperparameters (e.g., epochs, learning_rate)
+                - "gnn": for candidate GNN architecture parameters.
+                - "device": (optional) device string.
+                - "training": may contain "num_runs" used during evaluation.
+        """
+        self.device = torch.device(eval_config.get("device", "cpu"))
+        self.eval_config = eval_config.get("evaluation", {})
+        self.training_config = eval_config.get("training", {})
+
+        # Reconstruct the synthetic graph using the provided model.
+        reconstruction = model.reconstruct_graph()
+        if not isinstance(reconstruction, tuple) or len(reconstruction) < 3:
+            raise ValueError("model.reconstruct_graph() must return a tuple (A_prime, L_prime, X_syn).")
+        A_prime, L_prime, X_syn = reconstruction
+
+        # Validate synthetic adjacency matrix.
+        if not isinstance(A_prime, torch.Tensor):
+            raise TypeError("Synthetic adjacency matrix (A_prime) must be a torch.Tensor.")
+        if A_prime.dim() != 2 or A_prime.shape[0] != A_prime.shape[1]:
+            raise ValueError("Synthetic adjacency matrix (A_prime) must be square.")
+        # Validate synthetic node features.
+        if not isinstance(X_syn, torch.Tensor):
+            raise TypeError("Synthetic node features (X_syn) must be a torch.Tensor.")
+        if X_syn.dim() != 2:
+            raise ValueError("Synthetic node features (X_syn) must be a 2D tensor.")
+        if A_prime.shape[0] != X_syn.shape[0]:
+            raise ValueError("Mismatch: A_prime and X_syn must have the same first dimension.")
+
+        self.synthetic_A = A_prime
+        self.synthetic_X = X_syn
+        self.synthetic_size = X_syn.shape[0]
+        self.feature_dim = X_syn.shape[1]
+
+        # Generate synthetic labels by sampling from the real graph's label distribution.
+        real_labels = graph_data.labels  # Expected to be a 1D numpy array.
+        if not isinstance(real_labels, np.ndarray):
+            raise TypeError("graph_data.labels must be a numpy array.")
+        np.random.seed(42)  # For reproducibility.
+        self.synthetic_labels = np.random.choice(real_labels, size=self.synthetic_size, replace=True)
+
+        # Prepare the real graph's data for evaluation.
+        self.real_A = torch.tensor(graph_data.adjacency, dtype=torch.float32, device=self.device)
+        self.real_X = torch.tensor(graph_data.node_features, dtype=torch.float32, device=self.device)
+        self.real_labels = graph_data.labels  # numpy array
+
+        num_real_nodes = self.real_X.shape[0]
+        # Create a test split from the real graph.
+        _, _, self.test_indices = train_val_test_split(num_real_nodes, train_frac=0.7, val_frac=0.15, test_frac=0.15, seed=42)
+        self.num_classes = len(np.unique(real_labels))
+        
+        logging.info(f"Evaluation initialized with synthetic graph: {self.synthetic_size} nodes, feature dim: {self.feature_dim}.")
+        logging.info(f"Real graph: {num_real_nodes} nodes, {self.num_classes} classes; Test set size: {len(self.test_indices)}.")
+
+    def evaluate(self) -> dict:
+        """
+        Performs evaluation across candidate GNN architectures.
+        
+        For each candidate, the model is trained on the synthetic graph (A_prime, X_syn, synthetic_labels)
+        for a specified number of epochs and then evaluated on the real graph's test set.
+        The method aggregates accuracies over multiple runs and returns the results.
+
+        Returns:
+            dict: Mapping architecture names to their evaluation metrics (mean_accuracy, std_accuracy, accuracies list).
+        """
+        # Read evaluation hyperparameters with defaults.
+        eval_epochs = int(self.eval_config.get("epochs", 200))
+        eval_lr = float(self.eval_config.get("learning_rate", 0.01))
+        num_runs = int(self.training_config.get("num_runs", 10))
+
+        # Get candidate architectures using the evaluation "gnn" configuration.
+        candidate_models = get_candidate_architectures(self.feature_dim, self.num_classes, 
+                                                       self.eval_config.get("gnn", {}))
+        results = {}
+
+        # Iterate over each candidate architecture.
+        for candidate_name, candidate_instance in candidate_models.items():
+            logging.info(f"Starting evaluation for candidate: {candidate_name}")
+            candidate_accuracies = []
+            for run in range(num_runs):
+                # For each run, instantiate a fresh candidate model.
+                if candidate_name == "SGC":
+                    model_candidate = SimpleSGC(self.feature_dim, self.num_classes, K=2)
+                else:
+                    hidden_units = int(self.eval_config.get("gnn", {}).get("spatial", {}).get("hidden_units", 256))
+                    n_layers = int(self.eval_config.get("gnn", {}).get("spatial", {}).get("n_layers", 2))
+                    model_candidate = SimpleGCN(self.feature_dim, hidden_units, self.num_classes, n_layers)
+                model_candidate.to(self.device)
+
+                optimizer = optim.Adam(model_candidate.parameters(), lr=eval_lr)
+                criterion = nn.CrossEntropyLoss()
+
+                # Prepare synthetic training data.
+                synthetic_A = self.synthetic_A  # Tensor: (N_syn, N_syn)
+                synthetic_X = self.synthetic_X  # Tensor: (N_syn, feature_dim)
+                synthetic_labels_tensor = torch.tensor(self.synthetic_labels, dtype=torch.long, device=self.device)
+
+                model_candidate.train()
+                for epoch in range(eval_epochs):
+                    optimizer.zero_grad()
+                    logits = model_candidate(synthetic_A, synthetic_X)  # Shape: (N_syn, num_classes)
+                    loss = criterion(logits, synthetic_labels_tensor)
+                    loss.backward()
+                    optimizer.step()
+                    # Log training progress every 50 epochs.
+                    if (epoch + 1) % 50 == 0:
+                        logging.info(f"{candidate_name} Run {run+1}/{num_runs}, Epoch {epoch+1}/{eval_epochs}, Loss: {loss.item():.4f}")
+
+                # After training, evaluate on the real graph's test set.
+                model_candidate.eval()
+                with torch.no_grad():
+                    logits_real = model_candidate(self.real_A, self.real_X)  # Shape: (N_real, num_classes)
+                    predictions = torch.argmax(logits_real, dim=1).cpu().numpy()
+
+                # Compute test accuracy based on the test indices.
+                test_true_labels = self.real_labels[self.test_indices]
+                test_predictions = predictions[self.test_indices]
+                correct = np.sum(test_predictions == test_true_labels)
+                accuracy = correct / len(self.test_indices)
+                logging.info(f"{candidate_name} Run {run+1}/{num_runs}, Test Accuracy: {accuracy:.4f}")
+                candidate_accuracies.append(accuracy)
+
+            mean_acc = float(np.mean(candidate_accuracies))
+            std_acc = float(np.std(candidate_accuracies))
+            results[candidate_name] = {
+                "mean_accuracy": mean_acc,
+                "std_accuracy": std_acc,
+                "accuracies": candidate_accuracies
+            }
+            logging.info(f"{candidate_name} Evaluation: Mean Accuracy = {mean_acc:.4f}, Std = {std_acc:.4f}")
+        
+        logging.info("Evaluation of all candidate architectures completed.")
+        return results
+
+# --------------------------
+# Optional Script Test Block
+# --------------------------
+if __name__ == "__main__":
+    # This block is for standalone testing of evaluation.py.
+    # It uses the DatasetLoader and Model classes from the project.
+    from dataset_loader import DatasetLoader, GraphData
+    from model import Model
+
+    # Merge configurations from config.yaml; here we construct a dictionary similar to the config file.
+    config = {
+        "training": {
+            "epochs": 1500,
+            "learning_rate_feat": 1e-05,
+            "learning_rate_eigenvecs": 0.01,
+            "tau1": 0,
+            "tau2": 5,
+            "optimizer": "adam",
+            "loss_weights": {"alpha": 1.0, "beta": 1.0, "gamma": 1.0},
+            "num_runs": 10
+        },
+        "synth_graph": {
+            "compression_ratio": 0.15,  # 0.15% compression ratio (as per Pubmed settings)
+            "r_k": 0.9
+        },
+        "evaluation": {
+            "epochs": 200,
+            "learning_rate": 0.01,
+            "gnn": {
+                "spatial": {
+                    "n_layers": 2,
+                    "hidden_units": 256
+                },
+                "spectral": {
+                    "polynomial_order": 10,
+                    "hidden_units": 256
+                }
+            },
+            "device": "cpu"
+        },
+        "dataset": {
+            "name": "Pubmed",
+            "split_method": "public"
+        }
+    }
+
+    # Load the dataset.
+    dataset_loader = DatasetLoader(config)
+    graph_data = dataset_loader.load_data()
+
+    # Initialize the distillation model.
+    synthetic_size = int(np.ceil(graph_data.adjacency.shape[0] * (config["synth_graph"]["compression_ratio"] / 100.0)))
+    params = {
+        "synthetic_size": synthetic_size,
+        "feature_dim": graph_data.node_features.shape[1],
+        "K": synthetic_size,  # Use synthetic_size as number of eigenvectors
+        "real_eigenvalues": graph_data.eigenvalues,
+        "loss_weights": config["training"]["loss_weights"],
+        "device": config["evaluation"].get("device", "cpu")
+    }
+    distillation_model = Model(params)
+    # For testing evaluation, we assume the distillation model has been (pre-)trained.
+    # (In an actual experiment, the training loop in trainer.py would be run beforehand.)
+
+    # Initialize the evaluator.
+    evaluator = Evaluation(distillation_model, graph_data, config)
+    eval_results = evaluator.evaluate()
+    logging.info("Final Evaluation Results:")
+    logging.info(eval_results)
+```

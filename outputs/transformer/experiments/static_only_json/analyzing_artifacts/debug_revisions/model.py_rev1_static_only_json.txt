@@ -1,0 +1,107 @@
+Below is the detailed logic analysis for model.py. This analysis describes, in a structured way, how the TransformerModel and its helper classes will be implemented according to the paper “Attention Is All You Need”, the reproduction plan, the design specifications, the task list, and the config.yaml settings.
+
+─────────────────────────────  
+1. OVERALL STRUCTURE
+
+• The module (model.py) will contain the complete Transformer architecture organized in multiple interdependent classes. These include:
+ – A main TransformerModel class that ties together the Encoder and Decoder stacks.
+ – Encoders and Decoders built as a stack of identical layers.
+ – Helper modules such as MultiHeadAttention and PositionwiseFeedForward, as well as a PositionalEncoding function/class.
+
+• Configurable parameters (e.g., d_model, d_ff, num_heads, dropout rate) are obtained from the configuration file. In our code these values will be passed as a dictionary (or config object) so that switching between “base” and “big” configurations follows exactly the settings provided in config.yaml.
+
+─────────────────────────────  
+2. COMPONENT BREAKDOWN
+
+A. Embedding Layer and Weight Tying  
+ • Initialize a token embedding matrix for the source and target vocabularies.  
+ • The embedding dimension will be d_model (e.g., 512 for the base model).  
+ • Prior to feeding the embeddings into the encoder or decoder, multiply them by √d_model (scaling factor) and add positional encodings.  
+ • The output projection layer (for softmax/logits) will share its weight matrix with the input embeddings (weight tying).
+
+B. Positional Encoding  
+ • Implement a function or a small module (e.g., PositionalEncoding) that computes sinusoidal positional encodings.  
+  – For each position pos and each dimension index 2i and 2i+1, compute:  
+   PE(pos, 2i) = sin(pos / 10000^(2i/d_model))  
+   PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))  
+ • The positional encoding has the same dimension as the embeddings, so the two can be summed directly.  
+ • Optionally, support learned positional embeddings as an alternative (but the default is sinusoidal).
+
+C. MultiHeadAttention Module  
+ • Create a class (MultiHeadAttention) that encapsulates the scaled dot–product attention mechanism.  
+ • For each attention head:  
+  – Use three learned linear projections (W_Q, W_K, and W_V) to project the input tensor into query, key, and value subspaces.  
+  – The dimensions d_k and d_v for each head are provided by the configuration (e.g., d_k = d_v = 64 for the base model).  
+ • Concatenate the outputs from all heads and pass the resulting tensor through a final linear layer (W_O).  
+ • Incorporate dropout (using the dropout_rate set in the configuration) as needed post softmax.  
+ • Implement support for an optional mask to be used in decoder self-attention (masking out future positions).
+
+D. PositionwiseFeedForward Module  
+ • Build a class PositionwiseFeedForward that applies two linear transformations to each position separately:  
+  – The first linear layer projects the input from d_model to the inner-layer dimension d_ff (e.g., 2048 for the base model).  
+  – A ReLU activation is applied immediately after.  
+  – The second linear layer projects from d_ff back to d_model.  
+ • Dropout should be applied (with the configured dropout_rate) between the layers.
+
+E. Encoder Layer and Encoder Stack  
+ • Create an EncoderLayer class that contains two sub-layers:  
+  1. A multi-head self-attention module (using the MultiHeadAttention class) applied to the input sequence.  
+  2. A positionwise feed-forward network (using the PositionwiseFeedForward class).  
+ • For each sub-layer, implement a residual connection and then layer normalization. The logic will be:  
+  output = LayerNorm(input + Sublayer(input))  
+ • Stack N encoder layers (N comes from config.model.base.num_layers or config.model.big.num_layers) to form the full encoder.
+
+F. Decoder Layer and Decoder Stack  
+ • Create a DecoderLayer class that comprises three sub-layers:  
+  1. A masked multi-head self-attention module – here, the attention must not allow a given position to attend to positions in the future. This is achieved by providing an appropriate mask to the MultiHeadAttention module.  
+  2. A multi-head attention layer over the encoder’s output (encoder-decoder attention).  
+  3. A positionwise feed-forward network (similar to that in the encoder).  
+ • As with the encoder layer, each sub-layer is wrapped with residual connections followed by layer normalization.  
+ • Stack N decoder layers to form the complete decoder.
+
+G. TransformerModel Class  
+ • The TransformerModel class is the top-level class in model.py. Its __init__() method creates:  
+  – The shared token embedding matrices (which will be reused in the final output projection).  
+  – The positional encoding component.  
+  – The Encoder stack built from EncoderLayer instances.  
+  – The Decoder stack built from DecoderLayer instances.  
+  – The output projection layer that ties its weight with the embedding weight.  
+ • The forward() method takes as input:  
+  – The source tensor (batch of token ids for the source sentence) and an optional source mask (e.g., for padding).  
+  – The target tensor (batch of token ids for the target sentence) and an optional target mask (to apply the look-ahead mask in the decoder self-attention).  
+ • Forward pass steps:  
+  1. Embed the source and target tokens; scale embeddings and add positional encodings.  
+  2. Pass the source embeddings through the encoder stack to obtain encoder outputs.  
+  3. In the decoder, pass the target embeddings together with the encoder outputs (and apply masks) through the decoder stack.  
+  4. Project the decoder outputs using the tied output layer to obtain logits over the vocabulary for each position.  
+ • The final tensor (logits) is returned to be consumed by the loss function (e.g., cross-entropy with label smoothing that is attached in trainer.py).
+
+─────────────────────────────  
+3. MASKING DETAILS
+
+• In the MultiHeadAttention module, the forward() function must handle an optional mask:  
+ – If a mask is provided (e.g., a subsequent mask in the decoder), apply it to the computed scores before the softmax so that illegal connections (e.g., future tokens) are suppressed (set to a very negative value).  
+ – The mask may also be used to hide positions corresponding to padding in the input sequences.
+
+─────────────────────────────  
+4. DROPOUT AND LAYER NORMALIZATION
+
+• At every sub-layer (both in the multi-head attention and the feed-forward network), apply dropout to the output of the sublayer before adding the residual connection.  
+• After the residual addition, apply layer normalization. This is done uniformly in EncoderLayer and DecoderLayer.
+
+─────────────────────────────  
+5. CONFIGURATION INTEGRATION
+
+• All model hyperparameters (such as d_model, d_ff, num_heads, dropout_rate, d_k, d_v) must be read from the configuration dictionary provided at initialization.  
+• For example, if the “base” configuration is used, the parameters from config.model.base should be used; if “big” is selected then config.model.big parameters are used.  
+• The code must not assume any hard-coded values but instead reference these setting values, ensuring reproducibility and fidelity with the paper’s reported experiments.
+
+─────────────────────────────  
+6. FINAL REMARKS
+
+• The module should be modular, making it easier to test each component (e.g., unit test the MultiHeadAttention separately from the Encoder).  
+• By following the paper’s architecture, the code ensures that the only mechanism of information propagation is self-attention (and cross-attention in the decoder), with no recurrence or convolution.  
+• Weight tying between the embedding layer and the final projection is critical for parameter efficiency, so ensure that both share the same learned weight matrix.  
+• Comments and docstrings in the actual code will document not only how each module is implemented but also why (referring to the relevant sections of the paper, e.g., “3.2” for multi-head attention and “3.3” for feed-forward networks).
+
+This thorough logic analysis for model.py sets the framework for writing code that precisely reproduces the Transformer architecture as described in the original paper and the experiment plan.

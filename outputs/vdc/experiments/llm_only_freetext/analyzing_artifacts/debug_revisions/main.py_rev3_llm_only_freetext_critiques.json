@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is a plain‐text review of the logic analysis with identified issues and their estimated severity:\n\n1. One major shortcoming is that the analysis does not mention any handling for randomness (for example, setting random seeds) in any stage—be it during dirty sample injection or during training. Since reproducibility is a key concern in scientific experiments, leaving out any discussion of how randomness is controlled is a high‐severity issue.\n\n2. The analysis describes how missing or malfor",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is a plain‐text review of the logic analysis with identified issues and their estimated severity:\n\n1. One major shortcoming is that the analysis does not mention any handling for randomness (for example, setting random seeds) in any stage—be it during dirty sample injection or during training. Since reproducibility is a key concern in scientific experiments, leaving out any discussion of how randomness is controlled is a high‐severity issue.\n\n2. The analysis describes how missing or malfor",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

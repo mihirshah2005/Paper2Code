@@ -1,0 +1,64 @@
+Below is the detailed logic analysis for main.py. This file serves as the overall entry point and orchestrates the complete experiment. The logic flows as follows:
+
+1. Load and Parse Configuration  
+   • Read the config.yaml file and parse it into a Python dictionary.  
+   • The configuration contains separate groups for training (epochs, learning rates for node features and eigenvectors, tau1/tau2, loss weights α, β, γ, and number of runs), synthetic graph settings (compression_ratio, r_k), evaluation settings (GNN architecture parameters for spatial and spectral models), and dataset info (name and split method).  
+   • Log or print the loaded configuration for reproducibility.
+
+2. Instantiate the Dataset Loader and Load Data  
+   • Create a DatasetLoader instance by passing the configuration (specifically the dataset section).  
+   • Call the load_data() method to obtain a GraphData object.  
+   • GraphData should include:  
+  – The real graph’s adjacency matrix (A)  
+  – Node features (X)  
+  – Labels (Y)  
+  – The normalized Laplacian (L)  
+  – Its truncated eigen-decomposition (selected eigenvalues and eigenvectors).  
+   • Check that the dataset (e.g., Pubmed) is loaded correctly, and log key statistics (number of nodes, features, etc.).
+
+3. Initialize the Model  
+   • Instantiate the Model class, passing in a parameters dictionary that includes the training and synthetic graph settings (loss weights, learning rates, compression ratio, and r_k).  
+   • Inside the Model, synthetic node features (X′) are initialized – either with a random initialization or using a pre-trained MLP as described.  
+   • The synthetic eigenbasis (U′_K) is also initialized here using either a stochastic block model strategy (if available) or a random orthogonal initialization.  
+   • The model encapsulates the forward() method (computes synthetic graph properties), the loss computation (for eigenbasis matching loss L_e, discrimination loss L_d, and orthogonality regularization L_o), and a method reconstruct_graph() that combines learned U′_K with the real spectrum to produce the synthetic Laplacian and adjacency.
+
+4. Setup the Trainer and Run the Training Loop  
+   • Instantiate the Trainer class with the Model object, GraphData, and the full configuration.  
+   • The Trainer is responsible for the training loop:
+  – The loop runs for the number of epochs specified (1500 in this case).  
+  – It implements an alternating update schedule based on tau1 and tau2 (here tau1 is 0, and tau2 is 5). For example, in iterations where t % (tau1 + tau2) is less than tau1, the trainer updates the synthetic eigenbasis; otherwise, it updates the synthetic node features.  
+  – At each iteration, the Model’s forward() is called to compute intermediate predictions and losses.  
+  – The aggregated loss L_total (αL_e + βL_d + γL_o) is computed, and backpropagation is used to update parameters using the Adam optimizer with the graph feature learning rate and eigenvector learning rate from the configuration.  
+   • During training, the Trainer also logs training losses and intermediate statistics (e.g., total variation metrics for the synthetic graph) for monitoring and debugging.
+
+5. Reconstruct the Synthetic Graph  
+   • After the training loop completes, the Model’s reconstruct_graph() method is called.  
+   • This method uses the learned synthetic eigenbasis together with the real graph’s eigenvalues to compute:
+  – The synthetic Laplacian, L′ = Σₖ λ_k (u′_k u′_kᵀ)  
+  – The synthetic adjacency, A′ = Σₖ (1 – λ_k) (u′_k u′_kᵀ)  
+   • The output (A′, X′) represents the distilled graph that will be used for evaluation.
+
+6. Evaluate the Distilled Graph  
+   • Create an Evaluation instance by passing the trained Model, the original GraphData, and the evaluation-specific part of the configuration (which specifies GNN architectures, such as for spatial models: 2 layers with 256 hidden units, and for spectral models: polynomial order 10 with 256 hidden units).  
+   • Call the evaluate() method – this module trains various standard GNN architectures (e.g., a 2-layer GCN, SGC, PPNP for spatial as well as ChebyNet, BernNet, GPR-GNN for spectral evaluations) on the synthetic graph (A′, X′) and then measures node classification performance on the test subset of the real graph.  
+   • The Evaluation module should return a dictionary of performance metrics (accuracy, variance across architectures, possibly time overhead).
+
+7. (Optional) Multiple Runs and Aggregation  
+   • Since the configuration specifies num_runs = 10, main.py can wrap the training and evaluation inside a loop to run the experiment multiple times with different random seeds.  
+   • After the runs complete, aggregate the results – compute the mean and standard deviation of evaluation metrics across runs, which is important when comparing to the paper’s reported values.
+
+8. Log and Output Final Results  
+   • Print or log the final aggregated evaluation metrics so that the results can be compared with baseline methods as reported in the paper.  
+   • Ensure that all key parameters (including hyperparameter values and random seeds) are logged for reproducibility.
+
+9. Application Termination  
+   • Once all runs and evaluations are finished, perform any necessary cleanup (e.g., closing file descriptors, saving checkpoints if needed), and then exit the application.
+
+Throughout main.py, the dependencies on dataset_loader.py, model.py, trainer.py, and evaluation.py are respected. Each module fulfills its specific role: data loading and preprocessing, model definition and loss computation, training orchestration with alternating updates, and final evaluation of the distilled synthetic graph using various GNNs.
+
+Note:  
+– The exact mathematical details of L_e and L_d (loss components) are assumed to be encapsulated within model.py’s methods. These should be implemented later in accordance with the interpretations discussed in the paper and outlined in the plan.  
+– The selected initialization (using stochastic block model or random orthogonal) for U′_K should be handled in Model’s __init__ based on available methods.  
+– The schedule with tau1 = 0 and tau2 = 5 implies that, in this configuration, only the synthetic node features are updated every step (since 0 steps for eigenbasis update); this should be carefully interpreted during training.
+
+This analysis provides a clear step‐by‐step outline to guide the actual code development of main.py in order to faithfully reproduce the experiment as described in the paper "Graph Distillation with Eigenbasis Matching."

@@ -1,0 +1,132 @@
+Below is a detailed logic analysis for model.py. This module will define the complete TransformerModel class along with its helper sub-modules. The analysis is structured by outlining the responsibilities of each class and the data flow inside the Transformer, while always leveraging the configuration values from config.yaml. No changes to the planned data structures or interfaces will be made.
+
+─────────────────────────────  
+1. OVERALL STRUCTURE
+
+• The main class, TransformerModel (a subclass of nn.Module), will serve as the entry point for the model. It will incorporate the following components:
+ – A shared input embedding layer for both encoder and decoder. The same weight matrix will later be used for the output linear projection (weight tying) as required by the paper.
+ – A positional encoding module that computes (by default) sinusoidal positional encodings (using the formulas from the paper).
+ – An Encoder stack and a Decoder stack. Each of these is composed of several identical layers (number specified by the chosen model configuration in config.yaml; e.g., 6 layers for the base model).
+
+• The forward() method of TransformerModel will receive:
+ – Source sequence tokens and corresponding source masks.
+ – Target sequence tokens (as decoder inputs) and a target mask (which includes a subsequent/future mask to prevent positions from “seeing” future tokens).
+ – Optionally any padding masks (if implemented).
+
+• The output will be the unnormalized logits obtained by multiplying the decoder’s final output with the tied embedding weights.
+
+─────────────────────────────  
+2. BUILDING BLOCKS
+
+A. Embedding & Positional Encoding  
+ • The model will first embed the input tokens using a learned embedding matrix. The embedding will be scaled by √d_model (using the value from the config under model.base or model.big).
+ • The positional encodings (calculated according to:  
+  PE(pos, 2i) = sin(pos / 10000^(2i/d_model))  
+  PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))) are then added to the token embeddings.  
+ • An optional alternative (learned positional embeddings) is possible, but by default the sinusoidal method is used.
+
+B. Encoder  
+ • The Encoder is a separate sub-module (or class) that includes:
+  – A loop to instantiate “num_layers” encoder layers (from config, e.g., 6 layers for base).
+  – Each encoder layer comprises two sub-layers:
+   1. Multi-head self-attention:
+    – Implemented using a helper class “MultiHeadAttention”. This class will:
+     ▪ Linearly project the input into queries, keys, and values for each head (using separate weights W_Q_i, W_K_i, and W_V_i).
+     ▪ Compute the scaled dot-product attention using the formula:  
+      Attention(Q, K, V) = softmax((QKᵀ/√d_k) + mask)V
+     ▪ Apply dropout to the attention weights (using dropout_rate from config).
+     ▪ Concatenate the results from all heads and project using W_O.
+   – Residual connection is applied (input + attention output) then layer normalization.
+   – A position-wise feed-forward network follows:
+    – This is implemented via the “PositionwiseFeedForward” helper class.
+    – It consists of a first linear transformation (from d_model to d_ff), followed by ReLU activation, a dropout layer and a second linear transformation from d_ff back to d_model.
+   – Again use residual connection and layer normalization after the feed-forward stage.
+
+C. Decoder  
+ • The Decoder is a separate sub-module (or class) that constructs “num_layers” decoder layers.
+ • Each decoder layer has three sub-layers:
+  1. Masked multi-head self-attention:
+   – Similar to encoder self-attention but includes an additional “subsequent mask” to prevent tokens from attending to future positions.
+  2. Encoder-decoder attention:
+   – Uses the MultiHeadAttention module but the queries come from the decoder’s previous sub-layer input and the keys/values come from the encoder output.
+  3. Position-wise feed-forward network (identical in structure to the one in the encoder).
+ • Residual connections and layer normalization follow each sub-layer consistently.
+
+D. Final Projection and Weight Tying  
+ • After the decoder, a final linear transformation projects the decoder output into the vocabulary space.  
+ • The weight matrix for this linear layer is tied to the input embedding weights (as specified in the paper). This ensures that the same parameter set is used in both embedding and output projection.
+ • No softmax is applied within the model; this will be done together with the loss function externally.
+
+─────────────────────────────  
+3. HELPER CLASSES
+
+• MultiHeadAttention:
+ – Accepts query, key, and value tensors as inputs along with an optional mask.
+ – Computes linear projections for each head based on config parameters (num_heads, d_k, d_v).
+ – Scales the dot products by 1/√(d_k) before applying softmax.
+ – After computing attention for each head, concatenates the outputs and projects them into the model dimension with a final weight matrix.
+ – Ensures that the provided mask is correctly broadcast to all heads.
+ – Dropout is applied to the softmax output using the dropout_rate from config.
+
+• PositionwiseFeedForward:
+ – Implements the two-layer feed-forward network.
+ – Uses a first linear layer to map from d_model to d_ff then applies a ReLU activation.
+ – After a dropout layer (using the specified dropout value), applies a second linear layer from d_ff back to d_model.
+ – A residual connection is applied (adding the input of the FFN) followed by layer normalization.
+
+• PositionalEncoding:
+ – Implements the sinusoidal positional encoding as described in the paper.
+ – Computes and caches a matrix of positional encodings for a given maximum sequence length and d_model.
+ – Adds the positional encoding information to the token embeddings.
+
+─────────────────────────────  
+4. MASKING AND DROPOUT
+
+• Masking:
+ – For decoder self-attention, a future mask is generated so that the attention mechanism cannot use information from future time-steps.
+ – Padding masks could also be passed to both encoder and decoder to prevent attention to padded positions.
+ – The mask is added to the attention scores (by setting masked entries to a large negative value) before the softmax operation.
+
+• Dropout:
+ – Dropout is applied in multiple locations:
+  – After the linear transformation in the multi-head attention (before concatenating heads and after the final projection).
+  – Within the feed-forward network after the first linear layer and before the second.
+  – On the summed embeddings (token embeddings + positional encodings).
+ – The dropout rate is taken from the configuration (0.1 by default).
+
+─────────────────────────────  
+5. PARAMETER INITIALIZATION AND CONFIGURATION
+
+• The TransformerModel class’s __init__ method accepts a dictionary (params: dict). This includes model hyperparameters such as:
+ – num_layers, d_model, d_ff, num_heads, d_k, d_v (separate sets for “base” or “big” as defined in config.yaml).
+ – It also configures dropout rate and other regularization parameters.
+• All these parameters must be fetched directly from the configuration file to ensure reproduction accuracy.
+
+─────────────────────────────  
+6. DATA FLOW IN FORWARD PASS
+
+1. INPUT EMBEDDINGS:
+ – Source (x) and target (y) token indices are converted into embeddings.
+ – Multiply embeddings by √(d_model) and add the corresponding positional encodings.
+
+2. ENCODER:
+ – Pass the enriched source embeddings and source mask to the encoder stack.
+ – Each encoder layer processes the input and outputs a refined encoder representation.
+
+3. DECODER:
+ – Pass the target embeddings, the encoder output (for cross-attention), the target mask (to block future tokens), and the source mask (if needed) into the decoder stack.
+ – Each decoder layer uses its three sub-layers with residual + normalization to produce the final decoder output.
+
+4. OUTPUT PROJECTOR:
+ – The final decoder output is passed through a linear projection layer that uses the same weights as the input embedding (weight tying).
+ – The resulting logits are then used by an external loss function (e.g., combined with label smoothing) for training, or by beam search decoding in evaluation.
+
+─────────────────────────────  
+7. FINAL NOTES
+
+• The implementation will strictly adhere to the design specified in the plan and use hyperparameters from config.yaml.
+• All residual connections, layer normalization operations, and dropout placements will be implemented as described without adding extra public member functions.
+• The module will be built using PyTorch and follow the modular structure such that components can be individually unit-tested.
+• Any ambiguity (e.g., precise shapes of masks or handling variable-length sequences) will be resolved by referring back to the paper and ensuring consistency with the overall design.
+
+This logic analysis provides a comprehensive step‐by‐step breakdown for writing model.py. Each helper class and component is aligned with the “Attention Is All You Need” paper, the experimental plan, and the configuration details specified.

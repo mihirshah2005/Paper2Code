@@ -1,0 +1,78 @@
+{
+  "all": [
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "high",
+      "critique": "The analysis does not specify how the ground truth for dirty vs. clean samples is maintained during dirty sample injection, which is crucial for accurately computing detection metrics (TPR and FPR) in later stages.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample / VAE.evaluate_answer",
+      "severity_level": "high",
+      "critique": "Relying on real-time ChatGPT API calls to evaluate general questions can lead to non-deterministic outcomes, scalability issues, and potential API rate limiting. The design should include caching or alternative local evaluation methods to ensure reproducibility and efficiency.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Evaluation.evaluate",
+      "severity_level": "high",
+      "critique": "While the evaluation stage is supposed to compute ASR on poisoned samples, it is unclear how the test dataset is structured to include or simulate these poisoned samples. This ambiguity could contradict the backdoor detection methodology typically used in the paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Random Seed Initialization (utils.py)",
+      "severity_level": "medium",
+      "critique": "The analysis mentions setting random seeds via a helper function but does not detail when and how these seeds should be applied across all modules (data loading, model initialization, etc.) to guarantee reproducibility throughout the entire pipeline.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Dirty Sample Generation Strategy",
+      "severity_level": "medium",
+      "critique": "The description for injecting hybrid dirty samples (combining both poisoning triggers and noisy labels) is vague. Without clear guidelines on how to consistently combine these strategies, the implementation may diverge from the intended experimental design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Module Definitions (VQG, VQA, VAE)",
+      "severity_level": "low",
+      "critique": "The key modules (VQG, VQA, VAE) are referenced without detailed implementation guidelines or interface specifications. Although this may not block reproduction, additional clarification is needed to ensure they fully adhere to the paper's methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Learning Rate Decay Schedule",
+      "severity_level": "low",
+      "critique": "The configuration specifies a learning rate decay schedule, but the analysis does not elaborate on how this schedule is implemented during training. This omission could lead to ambiguity in reproducing the exact training dynamics.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "high",
+      "critique": "The analysis does not specify how the ground truth for dirty vs. clean samples is maintained during dirty sample injection, which is crucial for accurately computing detection metrics (TPR and FPR) in later stages.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample / VAE.evaluate_answer",
+      "severity_level": "high",
+      "critique": "Relying on real-time ChatGPT API calls to evaluate general questions can lead to non-deterministic outcomes, scalability issues, and potential API rate limiting. The design should include caching or alternative local evaluation methods to ensure reproducibility and efficiency.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Evaluation.evaluate",
+      "severity_level": "high",
+      "critique": "While the evaluation stage is supposed to compute ASR on poisoned samples, it is unclear how the test dataset is structured to include or simulate these poisoned samples. This ambiguity could contradict the backdoor detection methodology typically used in the paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Random Seed Initialization (utils.py)",
+      "severity_level": "medium",
+      "critique": "The analysis mentions setting random seeds via a helper function but does not detail when and how these seeds should be applied across all modules (data loading, model initialization, etc.) to guarantee reproducibility throughout the entire pipeline.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Dirty Sample Generation Strategy",
+      "severity_level": "medium",
+      "critique": "The description for injecting hybrid dirty samples (combining both poisoning triggers and noisy labels) is vague. Without clear guidelines on how to consistently combine these strategies, the implementation may diverge from the intended experimental design.",
+      "source": "llm-judge"
+    }
+  ]
+}

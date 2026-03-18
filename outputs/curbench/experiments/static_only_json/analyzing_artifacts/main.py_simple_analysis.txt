@@ -1,0 +1,107 @@
+Below is a thorough logic analysis for main.py. This entry‐point script will orchestrate the entire experimental pipeline by doing the following steps:
+
+────────────────────────────
+1. Load Configuration and Initialize Logging
+────────────────────────────
+• Use the Config class (from config.py) to load the experiment settings from config.yaml.  
+• The configuration includes the training settings for different domains (CV, NLP, Graph), curriculum learning hyperparameters, reproducibility seeds, and evaluation metrics.  
+• Log the loaded configuration to ensure that later modules use the same parameters.
+
+────────────────────────────
+2. Loop Over Reproducibility Seeds
+────────────────────────────
+• Retrieve the list of seeds from the reproducibility section of the configuration.  
+• For each seed in [42, 666, 777, 888, 999]:
+  - Set the random seed for all libraries (e.g., numpy, torch, etc.) to guarantee experiment reproducibility.
+  - This loop ensures that each experiment run is executed with a fixed seed, and later the final evaluation can report averages and standard deviations.
+
+────────────────────────────
+3. Data Loading and Preprocessing
+────────────────────────────
+• Instantiate the DatasetLoader by passing the configuration dictionary.  
+• Call the load_data() method from DatasetLoader, which returns a data dictionary containing training, validation, and test splits.  
+  - Internally, the DatasetLoader will parse dataset identifiers (e.g., "cifar10", "cifar100-noise-0.4", "tinyimagenet-imbalance-50") and apply the appropriate preprocessing steps:
+    • For noise settings: apply apply_noise() to flip labels in the training set with probability p.
+    • For imbalance settings (for CV tasks only): call apply_imbalance() to sub-sample classes based on an exponential function.
+• The output “data” structure (possibly a dict) is then used by both training and evaluation modules.
+
+────────────────────────────
+4. Model Building
+────────────────────────────
+• Instantiate the ModelManager with the same configuration.  
+• Execute build_model(), which selects and instantiates the correct backbone model based on the experiment’s domain:
+  - For CV: choose from LeNet, ResNet-18, or ViT.
+  - For NLP: either the LSTM-based model or transformer-based models (BERT and GPT2).
+  - For Graph: choose from GCN, GAT, or GIN.
+• Ensure that the model’s input and output layers are adjusted based on dataset properties (e.g., number of classes, input dimensions).
+
+────────────────────────────
+5. Curriculum Learning Scheduler Setup
+────────────────────────────
+• Instantiate the CurriculumScheduler class using the configuration.
+• The scheduler’s update_schedule(loss, epoch) method will be integrated into the training loop to determine data selection or loss weight adjustments based on current training performance.
+• Note: Curriculum hyperparameters (warmup epochs, schedule epochs, growth rate) are taken from the curriculum section in the config. Even if they are placeholders (null), they are passed along so that the scheduler can handle any default behavior.
+
+────────────────────────────
+6. Training Process via Trainer Module
+────────────────────────────
+• Create an instance of the Trainer class by passing:
+  - The model from ModelManager.
+  - The data dictionary from DatasetLoader.
+  - The curriculum scheduler instance.
+  - The global configuration.
+• Within Trainer.train():
+  - Execute the training loop for the specified number of epochs (domain-specific, e.g., 200 for CV and graph, 10 or 3 for NLP).
+  - At each training step:
+    • Run a forward pass through the model.
+    • Compute the loss.
+    • Before (or during) backpropagation, invoke CurriculumScheduler.update_schedule(loss, epoch) to update sample weighting or selection.
+    • Record training metrics such as loss, GPU memory, and training time if the configuration (evaluation.record_complexity) is enabled.
+  - Log the progress and checkpoint intermediate results as needed.
+• After training, the model’s learned parameters are fixed for evaluation.
+
+────────────────────────────
+7. Evaluation
+────────────────────────────
+• Instantiate the Evaluation class with:
+  - The trained model.
+  - The same datasets (training/validation/test splits) from DatasetLoader.
+  - The configuration.
+• Call evaluate() on the Evaluation instance:
+  - For CV tasks, compute accuracy.
+  - For NLP tasks, compute metrics such as accuracy, F1 score, Spearman correlation, and Matthews correlation as specified.
+  - For Graph tasks, compute AUC.
+• Retrieve a result dictionary of evaluation metrics, as well as complexity metrics like total training time and max GPU memory if recorded.
+
+────────────────────────────
+8. Collect and Aggregate Results
+────────────────────────────
+• For each seed iteration:
+  - Store the evaluation metrics and complexity metrics.
+• After all seed iterations:
+  - Compute the average and standard deviation (std) across the multiple runs.
+  - These aggregated results are logged and printed, ensuring consistency with the reporting criteria in the paper (e.g., Table 3 style).
+
+────────────────────────────
+9. Final Reporting and Optional Plotting
+────────────────────────────
+• Print/log a summary of the aggregated evaluation metrics.
+• Optionally, plot performance curves (e.g., performance vs. noise ratio or imbalance factor) if needed for further analysis.
+• Ensure that all experiment settings, results, and reproducibility details (including the seed list and hyperparameters) are documented in the logs.
+
+────────────────────────────
+10. Summary of Overall Flow
+────────────────────────────
+The main.py logic is structured to:
+  - Load and distribute configuration settings.
+  - Process data and instantiate models consistently across domains.
+  - Integrate the curriculum learning methods within the training cycle.
+  - Run experiments repeatedly with fixed seeds to collect robust performance metrics.
+  - Aggregate and report final results matching both performance and complexity criteria from the paper.
+
+This analysis ensures that each module (config.py, dataset_loader.py, model.py, curriculum.py, trainer.py, evaluation.py) is utilized in strict accordance with the designed interfaces and that all settings come directly from the config.yaml file.
+
+────────────────────────────
+End of Logic Analysis
+
+The next step is to implement main.py following this logic so that all experiments are reproducible and the experimental pipeline mirrors the methods described in the CurBench paper.

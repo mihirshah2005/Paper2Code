@@ -1,0 +1,358 @@
+```python
+#!/usr/bin/env python3
+"""
+evaluation.py
+
+This module implements the Evaluation class that performs inference on the test set
+using a trained TransformerModel. It implements beam search decoding for either
+translation or parsing tasks, computes evaluation metrics (BLEU for translation,
+and token-level F1 for parsing), and returns these metrics as a dictionary.
+
+The module validates the configuration from config.yaml, sets default constants,
+and provides a complete, reusable Evaluation class.
+
+Author: [Your Name]
+Date: [Date]
+"""
+
+import os
+import math
+import time
+import logging
+from collections import Counter
+from typing import Any, Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import sentencepiece as spm
+
+# Module-level logger configuration
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
+
+# Default special token indices.
+# These defaults are set assuming that a SentencePiece model did not assign bos/eos.
+# For beam search decoding, we assume a beginning-of-sequence token (BOS) and an end-of-sequence token (EOS).
+BOS_TOKEN: int = 2  # default BOS token id
+EOS_TOKEN: int = 3  # default EOS token id
+
+def compute_corpus_bleu(candidate_texts: List[str], reference_texts: List[str]) -> float:
+    """
+    Computes corpus-level BLEU score (up to 4-grams) in a simplified manner.
+    
+    Args:
+        candidate_texts: List of system-generated sentences.
+        reference_texts: List of reference sentences.
+        
+    Returns:
+        BLEU score as a float.
+    """
+    def ngram_counts(tokens: List[str], n: int) -> Counter:
+        return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)) if len(tokens) >= n else Counter()
+
+    total_candidate_length = 0
+    total_reference_length = 0
+    precisions = [0.0, 0.0, 0.0, 0.0]
+    
+    total_matches = [0, 0, 0, 0]
+    total_ngrams = [0, 0, 0, 0]
+    
+    for cand, ref in zip(candidate_texts, reference_texts):
+        cand_tokens = cand.split()
+        ref_tokens = ref.split()
+        total_candidate_length += len(cand_tokens)
+        total_reference_length += len(ref_tokens)
+        for n in range(1, 5):
+            cand_ngrams = ngram_counts(cand_tokens, n)
+            ref_ngrams = ngram_counts(ref_tokens, n)
+            total_ngrams[n-1] += max(sum(cand_ngrams.values()), 1)
+            # Compute clipped counts.
+            match_count = 0
+            for ngram in cand_ngrams:
+                match_count += min(cand_ngrams[ngram], ref_ngrams.get(ngram, 0))
+            total_matches[n-1] += match_count
+
+    for i in range(4):
+        if total_ngrams[i] > 0:
+            precisions[i] = total_matches[i] / total_ngrams[i]
+        else:
+            precisions[i] = 0.0
+    # If any precision is zero, the BLEU score is zero.
+    if min(precisions) == 0:
+        geo_mean = 0.0
+    else:
+        geo_mean = math.exp(sum(math.log(p) for p in precisions) / 4)
+    
+    # Brevity penalty.
+    if total_candidate_length > total_reference_length:
+        bp = 1.0
+    else:
+        bp = math.exp(1 - (total_reference_length / (total_candidate_length + 1e-9)))
+    
+    bleu = bp * geo_mean
+    return bleu * 100.0  # return percentage BLEU score
+
+def compute_token_f1(candidate_texts: List[str], reference_texts: List[str]) -> float:
+    """
+    Computes a simple average token-level F1 score.
+    For each sentence, F1 is computed as:
+      F1 = 2 * (precision * recall) / (precision + recall),
+    where precision = (# common tokens) / (# predicted tokens)
+          recall = (# common tokens) / (# reference tokens)
+    The average F1 over all sentences is returned.
+    
+    Args:
+        candidate_texts: List of system-generated sentences.
+        reference_texts: List of reference sentences.
+    
+    Returns:
+        Average F1 score (0 to 100).
+    """
+    f1_scores = []
+    for cand, ref in zip(candidate_texts, reference_texts):
+        cand_tokens = cand.split()
+        ref_tokens = ref.split()
+        if not cand_tokens or not ref_tokens:
+            f1_scores.append(0.0)
+            continue
+        common = Counter(cand_tokens) & Counter(ref_tokens)
+        common_count = sum(common.values())
+        precision = common_count / len(cand_tokens) if len(cand_tokens) > 0 else 0.0
+        recall = common_count / len(ref_tokens) if len(ref_tokens) > 0 else 0.0
+        if precision + recall > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+        f1_scores.append(f1)
+    avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+    return avg_f1 * 100.0  # as percentage
+
+class Evaluation:
+    """
+    Evaluation class implements inference using beam search decoding and evaluation
+    metrics computation (BLEU for translation, F1 for parsing).
+    
+    Attributes:
+        model: A trained TransformerModel instance.
+        test_loader: A PyTorch DataLoader with test examples.
+        config: Configuration dictionary parsed from config.yaml.
+        evaluation_task: The task for evaluation: "translation" or "parsing".
+        beam_size: Beam search beam size.
+        length_penalty: Length penalty (alpha) used in score normalization.
+        max_length_offset: Offset used to compute maximum output length = source_length + offset.
+        device: The torch device to run inference on.
+        sp: SentencePieceProcessor for decoding token indices back to text.
+    """
+    def __init__(self, model: torch.nn.Module, test_loader: torch.utils.data.DataLoader, config: Dict[str, Any]) -> None:
+        self.model = model
+        self.test_loader = test_loader
+        self.config = config
+
+        # Determine evaluation task
+        self.evaluation_task: str = config.get("evaluation_task", "translation").lower()
+        if self.evaluation_task not in {"translation", "parsing"}:
+            raise ValueError(f"Unsupported evaluation task: {self.evaluation_task}. Choose 'translation' or 'parsing'.")
+
+        # Validate inference configuration
+        if "inference" not in config:
+            raise ValueError("Missing 'inference' section in configuration.")
+        inference_config = config["inference"].get(self.evaluation_task)
+        if inference_config is None:
+            raise ValueError(f"Missing inference configuration for task '{self.evaluation_task}' in config['inference'].")
+
+        try:
+            self.beam_size: int = int(inference_config["beam_size"])
+            self.length_penalty: float = float(inference_config["length_penalty"])
+            self.max_length_offset: int = int(inference_config["max_length_offset"])
+        except KeyError as e:
+            raise ValueError(f"Missing required inference configuration key: {e}")
+
+        # Set model to evaluation mode and device.
+        self.model.eval()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Load SentencePiece processor for decoding.
+        # For translation, use the first dataset key from config.data.translation.datasets.
+        # For parsing, use dataset name and default mode "wsj_only".
+        if self.evaluation_task == "translation":
+            translation_config = config.get("data", {}).get("translation", {})
+            datasets_dict = translation_config.get("datasets", {})
+            if not datasets_dict:
+                raise ValueError("No translation datasets found in config['data']['translation']['datasets'].")
+            dataset_keys = list(datasets_dict.keys())
+            self.dataset_key: str = dataset_keys[0]
+            sp_model_file: str = f"spm_{self.evaluation_task}_{self.dataset_key}.model"
+        else:  # parsing
+            parsing_config = config.get("data", {}).get("parsing", {})
+            dataset_name: str = parsing_config.get("dataset")
+            if not dataset_name:
+                raise ValueError("Missing 'dataset' key in config['data']['parsing'].")
+            # Default to "wsj_only" mode.
+            parsing_mode: str = "wsj_only"
+            sp_model_file = f"spm_{self.evaluation_task}_{dataset_name}_{parsing_mode}.model"
+
+        if not os.path.exists(sp_model_file):
+            LOGGER.warning(f"SentencePiece model file {sp_model_file} not found. Decoding may fail.")
+        self.sp = spm.SentencePieceProcessor(model_file=sp_model_file)
+
+    def beam_search_decode(self, src: torch.Tensor, max_output_length: int) -> List[int]:
+        """
+        Performs beam search decoding for a single example.
+        
+        Args:
+            src: Source tensor of shape [src_len] (1D tensor of token ids).
+            max_output_length: Maximum output length for this sample.
+        
+        Returns:
+            List of token ids representing the best decoded output (BOS token removed).
+        """
+        # Initialize candidate beams.
+        BeamCandidate = Dict[str, Any]  # keys: "tokens" (List[int]), "score" (float), "finished" (bool)
+        initial_candidate: BeamCandidate = {"tokens": [BOS_TOKEN], "score": 0.0, "finished": False}
+        beam: List[BeamCandidate] = [initial_candidate]
+        
+        # Expand beam iterations.
+        for step in range(max_output_length - 1):  # already have BOS token.
+            new_beam: List[BeamCandidate] = []
+            any_active = False
+            # Process each candidate in the current beam.
+            for candidate in beam:
+                if candidate["finished"]:
+                    # Carry forward finished candidates.
+                    new_beam.append(candidate)
+                    continue
+                any_active = True
+                # Prepare current candidate tokens tensor.
+                tgt_tokens = torch.tensor(candidate["tokens"], dtype=torch.long, device=self.device).unsqueeze(0)  # shape [1, seq_len]
+                # The source should be unsqueezed as [1, src_len]
+                src_tensor = src.unsqueeze(0).to(self.device)
+                # Forward pass through the model.
+                with torch.no_grad():
+                    logits = self.model(src_tensor, tgt_tokens)  # shape [1, seq_len, vocab_size]
+                # Get logits for the last time step.
+                last_logits = logits[0, -1, :]  # shape [vocab_size]
+                log_probs = F.log_softmax(last_logits, dim=-1)  # log probabilities
+                # Select top k tokens based on beam_size.
+                topk_log_probs, topk_indices = torch.topk(log_probs, self.beam_size)
+                topk_log_probs = topk_log_probs.cpu().tolist()
+                topk_indices = topk_indices.cpu().tolist()
+                
+                # Expand this candidate for each of the top tokens.
+                for token, token_log_prob in zip(topk_indices, topk_log_probs):
+                    new_tokens = candidate["tokens"] + [token]
+                    new_score = candidate["score"] + token_log_prob
+                    finished = candidate["finished"] or (token == EOS_TOKEN)
+                    new_candidate = {"tokens": new_tokens, "score": new_score, "finished": finished}
+                    new_beam.append(new_candidate)
+            if not any_active:
+                # All candidates are finished.
+                break
+            # From new_beam, select top beam_size candidates based on normalized score.
+            # Normalized score = cumulative_score / (length^length_penalty) (avoid division by zero by ensuring length>=1)
+            for cand in new_beam:
+                length = max(len(cand["tokens"]), 1)
+                cand["norm_score"] = cand["score"] / (length ** self.length_penalty)
+            # Sort candidates based on norm_score in descending order.
+            new_beam = sorted(new_beam, key=lambda x: x["norm_score"], reverse=True)
+            beam = new_beam[:self.beam_size]
+            # If at least one candidate has finished and all candidates in beam are finished, break early.
+            if all(cand["finished"] for cand in beam):
+                break
+        
+        # Select the best candidate among finished ones, if any; otherwise, the best overall.
+        finished_candidates = [cand for cand in beam if cand["finished"]]
+        if finished_candidates:
+            best_candidate = max(finished_candidates, key=lambda x: x["score"] / (len(x["tokens"]) ** self.length_penalty))
+        else:
+            best_candidate = max(beam, key=lambda x: x["score"] / (len(x["tokens"]) ** self.length_penalty))
+        # Remove the initial BOS token before returning.
+        output_tokens = best_candidate["tokens"][1:] if len(best_candidate["tokens"]) > 1 else best_candidate["tokens"]
+        return output_tokens
+
+    def evaluate(self) -> Dict[str, float]:
+        """
+        Performs evaluation on the test set.
+        
+        For each example in the test_loader, the method:
+          - Computes the maximum output length using: true_source_length + max_length_offset.
+          - Runs beam search decoding.
+          - Converts predicted token ids back to text using SentencePiece.
+          - Converts reference token ids back to text (removing padding).
+          - Aggregates predictions and references.
+          
+        Finally, computes and returns evaluation metrics:
+          - BLEU score for translation tasks.
+          - Token-level F1 score for parsing tasks.
+          
+        Returns:
+            A dictionary containing the evaluation metrics.
+        """
+        all_predictions: List[str] = []
+        all_references: List[str] = []
+        sample_count: int = 0
+        
+        with torch.no_grad():
+            for batch in self.test_loader:
+                # Determine field names based on task.
+                if self.evaluation_task == "translation":
+                    if "source" not in batch or "target" not in batch:
+                        raise ValueError("Test batch missing 'source' or 'target' keys for translation.")
+                    src_batch = batch["source"]  # shape [B, src_seq_len]
+                    tgt_batch = batch["target"]  # shape [B, tgt_seq_len]
+                else:  # parsing task uses "sentence"; reference is in "parse" if available, else use "sentence"
+                    if "sentence" not in batch:
+                        raise ValueError("Test batch missing 'sentence' key for parsing.")
+                    src_batch = batch["sentence"]
+                    tgt_batch = batch.get("parse", batch["sentence"])  # if "parse" not available, use sentence
+                
+                batch_size = src_batch.size(0)
+                for i in range(batch_size):
+                    # For each sample, calculate true input length (non-zero tokens).
+                    src_tokens = src_batch[i]
+                    true_src_length = int((src_tokens != 0).sum().item())
+                    max_out_length = true_src_length + self.max_length_offset
+                    # Remove padding from source: take the first true_src_length tokens.
+                    src_tokens_trimmed = src_tokens[:true_src_length].cpu()
+                    # Beam search decoding for single sample.
+                    predicted_token_ids = self.beam_search_decode(src_tokens_trimmed, max_out_length)
+                    # Decode predicted tokens to text.
+                    predicted_text = self.sp.decode_ids(predicted_token_ids)
+                    all_predictions.append(predicted_text)
+                    
+                    # Process reference: for translation, decode target tokens (remove padding).
+                    # For parsing, if reference (parse) is a string, use it directly.
+                    if self.evaluation_task == "translation":
+                        tgt_tokens = tgt_batch[i]
+                        # Remove padding (assume pad token is 0)
+                        true_tgt_tokens = tgt_tokens[tgt_tokens != 0].cpu().tolist()
+                        reference_text = self.sp.decode_ids(true_tgt_tokens)
+                    else:
+                        # For parsing, if the reference is a string already, use it.
+                        if isinstance(tgt_batch, dict) or isinstance(tgt_batch[i], str):
+                            reference_text = tgt_batch[i] if isinstance(tgt_batch[i], str) else ""
+                        else:
+                            tgt_tokens = tgt_batch[i]
+                            true_tgt_tokens = tgt_tokens[tgt_tokens != 0].cpu().tolist()
+                            reference_text = self.sp.decode_ids(true_tgt_tokens)
+                    all_references.append(reference_text)
+                    sample_count += 1
+                    # Log first few samples.
+                    if sample_count <= 5:
+                        LOGGER.info(f"Sample {sample_count}:")
+                        LOGGER.info(f"  Prediction: {predicted_text}")
+                        LOGGER.info(f"  Reference : {reference_text}")
+        
+        # Compute evaluation metric based on task.
+        metrics: Dict[str, float] = {}
+        if self.evaluation_task == "translation":
+            bleu_score = compute_corpus_bleu(all_predictions, all_references)
+            metrics["BLEU"] = bleu_score
+            LOGGER.info(f"Computed BLEU score: {bleu_score:.2f}")
+        else:  # parsing task: compute token-level F1
+            f1_score = compute_token_f1(all_predictions, all_references)
+            metrics["F1"] = f1_score
+            LOGGER.info(f"Computed token-level F1 score: {f1_score:.2f}")
+        return metrics
+```

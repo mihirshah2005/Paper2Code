@@ -1,0 +1,88 @@
+Below is the revised logic analysis for dataset_loader.py. In this updated version, we explicitly address two main points:
+
+1. For the load_data() method, we now clarify that while CV datasets may have both “noise” and “imbalance” modifiers, for non‐CV domains (NLP and Graph) only the noise modifier may be applicable. If an imbalance modifier is provided outside the CV domain, the method will ignore it and log an appropriate warning to ensure consistency with the paper’s intent.  
+2. In apply_imbalance(), we now note that applying the imbalance transformation strictly assumes a balanced starting point. If the dataset is not perfectly balanced (i.e. the class counts differ), rather than using the maximum class count (n₀) as baseline, the implementation will either use a more representative measure (such as the average or median count) or, alternatively, log an error/warning and skip the imbalance modifier—since the original experimental design is intended for balanced CV datasets such as CIFAR. 
+
+────────────────────────────
+1. Class Initialization and Configuration
+
+• The DatasetLoader class is initialized with a configuration dictionary (e.g., loaded from config.yaml) that includes experiment hyperparameters, dataset paths, and modifiers.  
+• During initialization in __init__(self, config: dict), the class stores the configuration and extracts the dataset identifier string (which may include modifiers like “-noise-0.4” and “-imbalance-50”).  
+• A fixed random seed (or a seed selected from reproducibility.seeds) is applied for any random operations to ensure reproducibility.
+
+────────────────────────────
+2. load_data() Method
+
+The load_data() method is the unified entry point to load and preprocess datasets. Its actions include:
+
+ a. Parsing the dataset identifier:  
+  – Determine the target domain (CV, NLP, or Graph) via string matching (e.g., “cifar”, “tinyimagenet”, “RTE”, “ogbg-molhiv”).  
+  – Detect any modifiers attached to the identifier, such as “noise-0.4” and “imbalance-50”.  
+  – For non‑CV domains, if an “imbalance” modifier is provided, the method will ignore this modifier (logging a warning) since imbalance is not part of the experimental design for NLP or Graph data.
+
+ b. Loading the raw dataset using domain‑appropriate libraries:  
+  – For CV datasets:  
+   • Use torchvision.datasets for CIFAR‑10 and CIFAR‑100.  
+   • For Tiny‑ImageNet, use a custom loader (adapted from CS231n resources) and then use the provided validation set as the test set (since test labels are unavailable).  
+   • Split the training set into training and validation subsets using a 9:1 ratio.  
+  – For NLP datasets:  
+   • Use Hugging Face datasets or similar utilities to load GLUE benchmark tasks (excluding WNLI) with the available splits, treating the validation set as the test set.  
+  – For Graph datasets:  
+   • Load ogbg-molhiv using torch_geometric’s OGB module and use its official train/val/test splits.  
+   • For additional graph datasets (e.g., MUTAG, PROTEINS, NCI1), load them via torch_geometric.datasets.TUDataset and randomly split the data into training, validation, and test sets using an 8:1:1 ratio with a fixed seed.
+
+ c. Applying Preprocessing Modifiers (with explicit ordering for CV):  
+  – For CV datasets:  
+   • If both “imbalance” and “noise” modifiers are present, first apply the imbalance modifier to create a long‑tailed distribution using apply_imbalance(), then inject random label noise via apply_noise().  
+   • This ordering ensures that the imbalance ratio is enforced on the clean labels first, after which noise is applied to the already selected subset.  
+  – For non‑CV domains (NLP and Graph):  
+   • If a noise modifier is detected, the noise injection will be applied using apply_noise() provided the labels are numeric or otherwise appropriate for random label replacement.  
+   • If an imbalance modifier is detected, it is ignored (with a warning), because the paper explicitly does not apply imbalance to NLP and Graph datasets.
+
+ d. Upon completion, load_data() returns a dictionary with keys “train”, “val”, and “test”. This return format—whether as raw Dataset objects or wrapped in DataLoaders—is uniform across domains for seamless integration with downstream modules (e.g., training and evaluation).
+
+────────────────────────────
+3. apply_noise(data: Any, p: float) Method
+
+• Purpose: To inject uniform random noise into the training labels.  
+• Logic:  
+  1. Iterate over each sample in the provided training dataset.  
+  2. For each sample, generate a random value (using a reproducible random method such as torch.rand or numpy.random.rand).  
+  3. If the random value is below the noise probability p, randomly select a new label from the class index set—ensuring that it differs from the original label.  
+  4. Return the modified dataset (with noise injected only into training labels).  
+• Note: This method is designed to work across domains where label noise injection is valid (e.g., CV and NLP, and under controlled scenarios for Graph data if applicable).
+
+────────────────────────────
+4. apply_imbalance(data: Any, r: int) Method
+
+• Purpose: To create a long‑tailed version of the training dataset for CV tasks.  
+• Logic:  
+  1. Confirm that the dataset is for a CV domain; if not, log a warning and return the original data.  
+  2. Group the training samples by their class labels.  
+  3. Verify that the dataset is roughly balanced. If the class counts vary significantly from each other, log a warning: since the intended experimental design assumes balanced starting conditions, one option is to use a representative baseline count (e.g., the average or median count) instead of the maximum class count (n₀). This adjustment is documented as a deviation and should be clearly noted.  
+  4. Assuming a balanced starting point, compute the decay factor d using the formula:  
+    d = (1 / r)^(1 / (C – 1))  
+    where C is the total number of classes.  
+  5. For each class c (in ascending order), calculate the desired sample count as:  
+    desired_count[c] = int(n₀ × d^c)  
+  6. Randomly select the desired number of samples from each class (using a fixed random seed) and combine these selections into a new imbalanced training dataset.  
+  7. Return this imbalanced dataset.  
+• Note: This method is primarily intended for balanced CV datasets (e.g., CIFAR). If the input data is not balanced, the computed imbalance ratio might not strictly match the intended design. In such cases, logging and possibly an alternative baseline (using average/median counts) should be considered.
+
+────────────────────────────
+5. General Considerations and Reproducibility
+
+• Every random operation (dataset splitting, noise injection, and subsampling for imbalance) will use a fixed seed from the provided reproducibility settings to guarantee that experiments are repeatable.  
+• Domain-specific branching is clearly defined so that CV datasets can have both noise and imbalance pre‑processing (applied in a prescribed order), while non‑CV datasets (NLP and Graph) will only accept noise modifications (and ignore imbalance if specified).  
+• The final output of load_data() is structured uniformly (as a dictionary with “train”, “val”, and “test” keys) to facilitate integration with downstream Trainer and Evaluation modules.
+
+────────────────────────────
+Summary
+
+This revised analysis ensures that:  
+ – For CV datasets, when both noise and imbalance modifiers are specified, the method first applies the imbalance transformation and then injects label noise.  
+ – For non‑CV domains, only the noise modifier is applied (if provided), while the imbalance modifier is explicitly ignored with a warning to maintain consistency with the paper’s experimental design.  
+ – In apply_imbalance(), if the dataset is not perfectly balanced, the baseline (n₀) may be adjusted (or a warning is logged) so that the intended imbalance ratio is not enforced inappropriately.  
+ – These clarifications guarantee that the preprocessing operations occur in a well‑defined order and that any deviations from the experimental assumptions are acknowledged and managed.
+
+This updated design is now aligned with the original paper’s intent and addresses the raised critiques.

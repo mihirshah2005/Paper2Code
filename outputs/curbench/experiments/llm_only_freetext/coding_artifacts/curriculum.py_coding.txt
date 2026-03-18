@@ -1,0 +1,139 @@
+```python
+"""curriculum.py
+
+This module defines the abstract base class, CurriculumScheduler, to provide a unified interface 
+for curriculum learning strategies. It is designed to be a pluggable component in the training 
+pipeline that adjusts the training process (e.g., via sample weighting or data selection) 
+based on the current loss and epoch. Concrete implementations must implement the abstract 
+method update_schedule, which computes a curriculum factor. 
+
+Additionally, a sample concrete subclass, SelfPacedLearningScheduler, is provided as an example 
+implementation following a simple linear schedule.
+"""
+
+from abc import ABC, abstractmethod
+import logging
+from typing import Dict
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+class CurriculumScheduler(ABC):
+    """
+    Abstract base class for curriculum learning strategies.
+
+    __init__(self, config: dict):
+        Initializes the curriculum scheduler by extracting hyperparameters from the configuration.
+        The following hyperparameters are expected in config["curriculum"]:
+            - warmup_epochs: Number of epochs for the warm-up phase (default: 5)
+            - schedule_epochs: Number of epochs over which the curriculum factor is updated linearly (default: 10)
+            - growth_rate: A multiplier for controlling curriculum growth (default: 1.0)
+
+    update_schedule(self, loss: float, epoch: int) -> float:
+        Abstract method that computes and returns a curriculum factor based on the current loss and epoch.
+        This factor can be used to adjust the loss weighting or data selection criteria during training.
+    """
+
+    def __init__(self, config: Dict[str, any]) -> None:
+        curriculum_config = config.get("curriculum", {})
+        
+        # Set warmup_epochs with a default value of 5 if not provided or null.
+        warmup = curriculum_config.get("warmup_epochs")
+        if warmup is None:
+            logger.warning("curriculum->warmup_epochs not provided; defaulting to 5.")
+            self.warmup_epochs: int = 5
+        else:
+            self.warmup_epochs: int = int(warmup)
+        
+        # Set schedule_epochs with a default value of 10 if not provided or null.
+        schedule = curriculum_config.get("schedule_epochs")
+        if schedule is None:
+            logger.warning("curriculum->schedule_epochs not provided; defaulting to 10.")
+            self.schedule_epochs: int = 10
+        else:
+            self.schedule_epochs: int = int(schedule)
+        
+        # Set growth_rate with a default value of 1.0 if not provided or null.
+        growth = curriculum_config.get("growth_rate")
+        if growth is None:
+            logger.warning("curriculum->growth_rate not provided; defaulting to 1.0.")
+            self.growth_rate: float = 1.0
+        else:
+            self.growth_rate: float = float(growth)
+        
+        logger.info(f"CurriculumScheduler initialized with warmup_epochs={self.warmup_epochs}, "
+                    f"schedule_epochs={self.schedule_epochs}, growth_rate={self.growth_rate}.")
+
+    @abstractmethod
+    def update_schedule(self, loss: float, epoch: int) -> float:
+        """
+        Abstract method to update the curriculum factor.
+
+        This method must be overridden by concrete subclasses to compute and return a float
+        representing the curriculum adjustment factor based on the current training loss and epoch.
+        
+        :param loss: Current loss value (float).
+        :param epoch: Current training epoch (int).
+        :return: Curriculum factor as a float.
+        """
+        pass
+
+
+class SelfPacedLearningScheduler(CurriculumScheduler):
+    """
+    A simple implementation of Self-Paced Learning (SPL) as a curriculum strategy.
+
+    This scheduler uses a linear schedule where:
+      - For epochs during the warm-up phase, the factor remains at an initial threshold.
+      - During the scheduling phase, the factor increases linearly from the initial threshold
+        to a maximum threshold.
+      - After the scheduling phase, the factor stays at the maximum threshold.
+
+    The returned factor can be used, for instance, to reweight the loss of samples during training.
+    """
+
+    def __init__(self, config: Dict[str, any]) -> None:
+        super().__init__(config)
+        # Additional hyperparameters for SPL with default values.
+        # These defaults can be further tuned or extended via configuration if desired.
+        self.initial_threshold: float = 0.5  # Default initial threshold during warmup.
+        self.max_threshold: float = 1.0      # Default maximum threshold after scheduling.
+        logger.info(f"SelfPacedLearningScheduler initialized with "
+                    f"initial_threshold={self.initial_threshold}, max_threshold={self.max_threshold}.")
+
+    def update_schedule(self, loss: float, epoch: int) -> float:
+        """
+        Compute the curriculum factor based on the current epoch.
+        
+        Strategy:
+          - When epoch < warmup_epochs: return the initial threshold.
+          - When warmup_epochs <= epoch < (warmup_epochs + schedule_epochs):
+                Linearly interpolate from initial_threshold to max_threshold.
+          - When epoch >= (warmup_epochs + schedule_epochs): return max_threshold.
+        
+        The current loss is not used in this simple implementation, but in more advanced methods
+        it could be incorporated to adjust data selection or loss weighting.
+
+        :param loss: Current loss value (float).
+        :param epoch: Current training epoch (int).
+        :return: Computed curriculum factor (float).
+        """
+        if epoch < self.warmup_epochs:
+            factor = self.initial_threshold
+        elif epoch < (self.warmup_epochs + self.schedule_epochs):
+            progress = (epoch - self.warmup_epochs) / self.schedule_epochs
+            factor = self.initial_threshold + progress * (self.max_threshold - self.initial_threshold)
+        else:
+            factor = self.max_threshold
+
+        logger.debug(f"Epoch {epoch}: Computed curriculum factor = {factor} (loss: {loss}).")
+        return float(factor)
+```

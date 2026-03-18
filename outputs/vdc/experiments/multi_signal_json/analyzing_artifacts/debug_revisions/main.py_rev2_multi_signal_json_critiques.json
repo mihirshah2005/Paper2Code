@@ -1,0 +1,54 @@
+{
+  "all": [
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The description of hybrid dirty sample creation is ambiguous. It mentions that noisy label injection and poisoning triggers may be applied sequentially or to disjoint subsets and controlled by a mode flag, but it does not clearly specify the order of operations or conflict resolution. This lack of explicit mechanism could lead to inconsistent sample labeling if the configuration is changed.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample",
+      "severity_level": "medium",
+      "critique": "The detection logic uses a fixed threshold of 0.5 to flag samples as dirty. This hardcoding may contradict the configuration file if a different threshold is provided. Additionally, the current equal weighting of binary votes from heterogeneous sources (deterministic string-matching vs. ChatGPT evaluations) might not fully capture the calibration intended by the original paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Evaluation.evaluate (ASR computation)",
+      "severity_level": "medium",
+      "critique": "While the revised analysis clarifies that ASR is computed on a triggered subset of test samples, it does not detail how many samples are modified or how identical the trigger injection parameters are between training and evaluation. The process for generating the triggered test subset is underspecified, which could lead to inconsistencies in reproducing ASR results.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VAE module",
+      "severity_level": "low",
+      "critique": "The VAE module is repurposed for answer evaluation (performing string matching and interpreting ChatGPT’s binary responses), which may be confusing given that the acronym VAE is typically associated with Variational Autoencoders. Additional clarification or a different nomenclature might prevent misunderstandings regarding its role and implementation.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "API Configuration (ChatGPT/Instruct-BLIP)",
+      "severity_level": "low",
+      "critique": "The analysis briefly mentions API-related configurations for rate limiting and caching but lacks detail on error handling, cache invalidation, or fallback strategies. While not core to the methodology, these details are important for reproducibility and smooth operation during extensive evaluations.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The description of hybrid dirty sample creation is ambiguous. It mentions that noisy label injection and poisoning triggers may be applied sequentially or to disjoint subsets and controlled by a mode flag, but it does not clearly specify the order of operations or conflict resolution. This lack of explicit mechanism could lead to inconsistent sample labeling if the configuration is changed.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample",
+      "severity_level": "medium",
+      "critique": "The detection logic uses a fixed threshold of 0.5 to flag samples as dirty. This hardcoding may contradict the configuration file if a different threshold is provided. Additionally, the current equal weighting of binary votes from heterogeneous sources (deterministic string-matching vs. ChatGPT evaluations) might not fully capture the calibration intended by the original paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Evaluation.evaluate (ASR computation)",
+      "severity_level": "medium",
+      "critique": "While the revised analysis clarifies that ASR is computed on a triggered subset of test samples, it does not detail how many samples are modified or how identical the trigger injection parameters are between training and evaluation. The process for generating the triggered test subset is underspecified, which could lead to inconsistencies in reproducing ASR results.",
+      "source": "llm-judge"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is my plain‐text critique of the analysis:\n\n1. EMA Weight Handling  \n – The analysis correctly states that EMA weight management is the Model’s responsibility. However, it leaves a bit of ambiguity about whether Evaluation should perform any “verification” of EMA state. In practice, if Evaluation does call something like load_ema_weights() or similar, the analysis should note exactly when and how that check is made. This is a low‐severity issue because it won’t break reproduction—it only m",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is my plain‐text critique of the analysis:\n\n1. EMA Weight Handling  \n – The analysis correctly states that EMA weight management is the Model’s responsibility. However, it leaves a bit of ambiguity about whether Evaluation should perform any “verification” of EMA state. In practice, if Evaluation does call something like load_ema_weights() or similar, the analysis should note exactly when and how that check is made. This is a low‐severity issue because it won’t break reproduction—it only m",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

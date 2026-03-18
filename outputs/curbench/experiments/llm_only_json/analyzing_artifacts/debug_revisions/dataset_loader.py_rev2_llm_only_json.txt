@@ -1,0 +1,109 @@
+Below is the revised, detailed logic analysis for the dataset_loader.py module with changes addressing the critiques:
+
+────────────────────────────
+1. Overall Role and Structure
+
+• The DatasetLoader class is responsible for loading, splitting, and preprocessing datasets across the CV, NLP, and graph domains.  
+• It is initialized with a configuration dictionary (from config.yaml) that, among other things, contains reproducibility seeds.  
+• In its constructor (__init__), in addition to storing configuration values, the class will explicitly seed all random generators used in Python (using random.seed), NumPy (using np.random.seed), and PyTorch (using torch.manual_seed). This ensures full reproducibility across all library calls.  
+• The main public methods include:  
+  – load_data(): Loads the raw dataset, parses the dataset identifier, performs train/validation/test splits, and applies domain-specific preprocessing.  
+  – apply_noise(data, p: float, all_labels: list): Injects label noise into the training set by randomly flipping labels with probability p. This method will explicitly choose a new label from the set of incorrect labels (i.e., all_labels excluding the original label).  
+  – apply_imbalance(data, r: int): Creates a long-tailed distribution for CV datasets by sub-sampling the training set across classes according to a computed exponential decay.
+
+────────────────────────────
+2. Robust Parsing of the Dataset Identifier in load_data()
+
+• Instead of simply splitting the dataset identifier string on hyphens (which may be ambiguous for names like "tiny-imagenet" or when both noise and imbalance tokens are present), a more robust strategy will be used:
+  – Define a list of known base dataset names (e.g., "cifar10", "cifar100", "tiny-imagenet", "rte", etc.).  
+  – Use this list to first identify the base dataset name even if it contains hyphens.  
+  – After determining the base, scan the remainder of the identifier for keywords such as "noise" and "imbalance" along with their associated numeric values.  
+  – A regular expression–based approach (or a token parser that uses pre-defined keywords) will be adopted so that ambiguous cases (e.g., when the base dataset name itself includes hyphens) are handled correctly.
+  – All tokens will then be mapped to parameters: a noise probability (p) and/or an imbalance factor (r) if present.
+
+────────────────────────────
+3. Domain-Specific Data Loading and Splitting
+
+A. Computer Vision (CV) Datasets  
+ • Supported datasets include CIFAR-10, CIFAR-100, and Tiny-ImageNet.  
+ • For CIFAR datasets:  
+  – Download via torchvision.datasets.  
+  – Split the original training set into training and validation sets using a 9:1 ratio.  
+  – Use the provided test split (if available) for final evaluation.  
+ • For Tiny-ImageNet:  
+  – Use a dedicated loader (or adapted torchvision code).  
+  – Since the official test labels are unreleased, use the validation set as the test set and split the original training set into training and validation (9:1).
+
+B. Natural Language Processing (NLP) Datasets  
+ • Load the GLUE benchmark datasets (e.g., RTE, MRPC, STS-B, CoLA, SST-2, QNLI, QQP, MNLI), excluding problematic ones like WNLI.  
+ • Load these datasets using Hugging Face’s datasets library (or similar), and use the provided validation data as the evaluation set if official test labels are absent.
+
+C. Graph Datasets  
+ • For ogbg-molhiv:  
+  – Load using the official OGB API following the provided splits.  
+ • For TUDataset graph data (e.g., MUTAG, PROTEINS, NCI1):  
+  – Load using torch_geometric.datasets.TUDataset and randomly split the data into training, validation, and test sets using an 8:1:1 ratio (with a fixed seed for consistency).
+
+────────────────────────────
+4. Applying Label Noise with apply_noise
+
+• Purpose: To simulate a “noise-p” setting by introducing label noise exclusively in the training set.  
+• Implementation details:  
+  – Iterate over training samples in the dataset (or update the dataset’s labels contained in dataset.targets if using torchvision datasets).  
+  – For each sample, generate a random number (using a properly seeded random generator). If this number is less than p, then the label should be flipped.  
+  – To guarantee that the new label is different from the original, first form a candidate set: all possible labels for the dataset (determined from the dataset metadata) minus the original label. Then, randomly select a new label from this candidate set.  
+  – Update the sample’s label accordingly.  
+• This ensures that every flipped label is, by definition, different from its original value.
+
+────────────────────────────
+5. Creating Imbalanced Distributions with apply_imbalance
+
+• Purpose: To mimic the “imbalance-r” setting for CV datasets by sub-sampling the training set so that sample counts across classes follow a geometric decay.  
+• Implementation details:  
+  – Ensure that this function is only applied to CV datasets (and not to NLP or graph datasets, which are handled differently).  
+  – Group the training samples by class.  
+  – Assume that the original dataset is balanced; let n₀ be the number of samples in the first class.  
+  – Compute the decay factor d using the formula: d = (1/r)^(1/(C-1)), where C is the number of classes, ensuring that the ratio n₀:n_(C-1) equals the imbalance factor r.  
+  – For each class c, calculate the target number of samples as floor(n₀ × d^(c)).  
+  – Randomly select (using the seeded random generator) the computed number of samples from the available samples in that class.  
+  – Build a new training dataset (using torch.utils.data.Subset) with these selected indices.  
+  – Return the modified training dataset while leaving validation and test splits unmodified.
+
+────────────────────────────
+6. Order of Dataset Modifications (Noise and Imbalance)
+
+• If the dataset identifier indicates both a noise setting and an imbalance setting, the order in which these modifications are applied must be explicitly defined because the sequence can affect the final label distribution.  
+• In this design, we will apply the modifications in the following order:
+  1. First, apply label noise (using apply_noise) to the training set so that every sample is subject to the intended noise probability.  
+  2. Then, apply the imbalance sub-sampling (using apply_imbalance) on the noisy training set.  
+• This order is chosen to ensure that the effect of noise is uniformly injected across all classes before any sub-sampling is performed, preserving the intended noise proportion even in the imbalanced distribution.
+
+────────────────────────────
+7. Return Format and Reproducibility
+
+• The final output of load_data() is a dictionary with keys "train", "val", and "test", each containing a dataset (or a Subset) that can be later wrapped into a DataLoader by the training module.  
+• Uniform seeding is critical:
+  – In __init__, set random.seed, np.random.seed, and torch.manual_seed using a seed (typically the first value from config["reproducibility"]["seeds"]) to guarantee that every random operation (data shuffling, noise injection, imbalance sampling) is reproducible.
+
+────────────────────────────
+8. External Dependencies and Libraries
+
+• For CV datasets:  
+ – Use torch and torchvision (torchvision.datasets, torchvision.transforms) to load datasets and perform image transformations.  
+• For NLP datasets:  
+ – Use Hugging Face's datasets library (or transformers if tokenization is needed) to load GLUE benchmark datasets.  
+• For graph datasets:  
+ – Use torch_geometric.datasets for both OGB and TUDataset sources.  
+• Additionally, use torch.utils.data.Subset to create sub-sampled datasets when creating imbalanced distributions.
+
+────────────────────────────
+Summary
+
+The revised DatasetLoader module will:
+ 1. Use a robust parsing method for dataset identifiers that can correctly separate base dataset names from noise and imbalance tokens (without misinterpreting internal hyphens in dataset names).  
+ 2. Load and split CV, NLP, and graph datasets using domain-specific procedures, ensuring that splits conform to the 9:1 or 8:1:1 ratios as appropriate.  
+ 3. In the apply_noise method, ensure that when flipping a sample’s label, the new label is chosen exclusively from the candidate set that excludes the original label.  
+ 4. Clearly define the order of dataset modifications by first applying noise injection and then creating an imbalanced training set when both are requested.  
+ 5. Integrate reproducibility by setting seeds for Python’s random module, NumPy’s RNG, and PyTorch within __init__, ensuring that all random operations are fully deterministic across runs.
+
+This revised logic analysis directly addresses the raised critiques while remaining consistent with the paper’s experimental design and the provided configuration.

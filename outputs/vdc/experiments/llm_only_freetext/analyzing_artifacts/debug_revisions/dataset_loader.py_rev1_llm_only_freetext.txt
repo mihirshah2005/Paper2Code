@@ -1,0 +1,105 @@
+Below is a detailed logic analysis for the dataset_loader.py module that implements the DatasetLoader class. This class is responsible for loading the three target datasets (CIFAR-10, ImageNet-100, and ImageNet-Dog), performing the necessary image preprocessing and splitting (train/test), and then injecting “dirty” samples (both poisoned samples and noisy labels) according to the paper’s experimental setup and the configuration file.
+
+──────────────────────────────
+1. Overall Structure and Initialization
+
+• The DatasetLoader class will be initialized with a configuration dictionary (parsed from config.yaml). In the __init__ method, we:
+ – Store the config for later use.
+ – Extract parameters related to dataset paths (if needed), batch sizes, and the dirty_sample_generation settings.
+ – Set up common image preprocessing transforms using torchvision.transforms. For example, for CIFAR-10 we may use random crops, horizontal flips, conversion to tensor, and normalization with CIFAR-10 mean and std values; for ImageNet subsets, similar transforms (resizing, center crop, normalization using ImageNet statistics) will be set.
+ – Optionally, set a random seed (by calling a helper function from utils) to guarantee reproducibility in random sampling during injection.
+
+──────────────────────────────
+2. Loading Datasets (load_data Method)
+
+The load_data() function will handle three main cases:
+ – For CIFAR-10:
+  • Use torchvision.datasets.CIFAR10 with train=True and train=False.
+  • Provide the appropriate transform pipeline for training and testing.
+  • No custom filtering is necessary since the dataset is standard.
+ – For ImageNet-100:
+  • Although torchvision may not have a pre-specified “ImageNet-100”, the loader will use an ImageFolder-based loader.
+  • A helper function (or inline filtering logic) will be used to randomly select 100 classes from ImageNet.
+  • Ensure that for training, only 500 images per class are kept and for testing only 100 images per class are retained.
+  • The transforms will be defined for ImageNet images (e.g., resize to 224×224, center crop, normalization with ImageNet means).
+ – For ImageNet-Dog:
+  • Use a similar ImageFolder-based loader and filter the dataset to only include 10 dog classes.
+  • Make sure that the selected dog datasets conform to the paper’s specification of having 800 images per class for training and 200 images per class for testing.
+ – Finally, return a dictionary (or similar structure) containing “train_data” and “test_data” for the selected dataset.
+
+──────────────────────────────
+3. Image Preprocessing
+
+• A dedicated section of the class (or helper functions in utils) will build the transformation pipelines.
+ – For example, for CIFAR-10, use transforms.Compose([transforms.RandomCrop(...), transforms.RandomHorizontalFlip(), transforms.ToTensor()]) plus normalization.
+ – For ImageNet-type datasets, the preprocessing might include resizing (or scaling to the desired input size for Instruct-BLIP), center-cropping, converting to tensor and normalization.
+• The transforms used here must be consistent with what the VQA model (Instruct-BLIP) expects during inference.
+
+──────────────────────────────
+4. Dirty Sample Injection (inject_dirty_samples Method)
+
+This method takes the originally loaded training data (e.g., a list or a PyTorch Dataset) and modifies it to simulate “dirty” samples. The injection process includes two parts:
+
+A. Noisy Label Injection:
+ – According to the config, a noisy ratio (η = 0.4) is applied.
+ – For each sample in the training set, with probability η, its true label can be replaced by:
+  • For symmetric noise: a random label selected uniformly at random from the set of labels excluding the true label.
+  • For asymmetric noise: change the label according to a rule (for example, (i mod K) + 1, where i is the original label index and K is the total number of classes).
+ – The implementation should be careful to work on clean copies of data (or modify in place with reproducible randomness).
+
+B. Backdoor (Poisoned) Sample Injection:
+ – Retrieve the poisoning settings from the config for the current dataset. For example:
+  • CIFAR-10: two possibilities: 50 and 500 poisoned samples per class.
+  • ImageNet-100: 5 and 50 polluted samples per class.
+  • ImageNet-Dog: 80 samples per class.
+ – Follow the paper’s procedure: for each class (except the target class, which is fixed to class 0 per the paper’s example), randomly choose the specified number of samples.
+ – For each selected sample:
+  • Overlay a trigger using one of the backdoor attack functions (e.g., BadNets, Blended, SIG, etc.). The actual overlay implementation is delegated to utility functions provided by utils.py.
+  • Change the label of the modified sample to the target label (usually class 0).
+ – Depending on the implementation of multiple backdoor attack schemes, you might allow choosing one (or multiple) methods; however, at minimum the simple ones (e.g., BadNets or Blended) should be implemented.
+ – It is important to update both image data (with the trigger overlaid) and labels (changed to target).
+
+• The inject_dirty_samples method should then return the updated training data structure. Logging (or print statements via a helper utility) can be used to report the number of noisy and poisoned samples injected.
+
+──────────────────────────────
+5. Integration with Other Modules
+
+• The DatasetLoader class is a core provider for the experiment pipeline:
+ – It supplies the purified (or dirty) training dataset that will then be passed to the detection module (VDCDetector) to remove samples with visual-linguistic inconsistency.
+ – It is also used later by the Trainer and Evaluation modules for training a ResNet-18 classifier.
+• The code must call the helper functions in utils.py for steps such as:
+ – Trigger overlay (for poisoned sample injection).
+ – Data augmentation or preprocessing functions if additional customization is needed.
+ – Setting random seed for reproducibility across different injections.
+• If needed, the loader may cache the list of injected sample indices for later analysis (i.e., to compute TPR/FPR).
+
+──────────────────────────────
+6. Expected API and Flow Summary
+
+– The __init__(config) method:
+ • Reads configuration parameters, sets up transforms, and possibly initializes dataset-specific variables (like class names and paths).
+– The load_data() method:
+ • Loads the specified dataset with train/test splits, applies preprocessing transforms, and, for specialized datasets like ImageNet-100 and ImageNet-Dog, performs filtering based on class names.
+– The inject_dirty_samples(train_data) method:
+ • Modifies the training dataset by applying noisy label changes (using symmetric/asymmetric strategies) and by poisoning a fixed number of samples per class (skipping the target class).
+ • Utilizes utility functions to add trigger patterns and change labels.
+– The final output is a dictionary/structured object containing the preprocessed, dirty (or later purified) datasets to be used in subsequent detection and training steps.
+
+──────────────────────────────
+7. Key Points and Uncertainties
+
+• Preprocessing:
+ – Ensure that the image transformation pipelines are consistent with the requirements of both the detection (VQA model inputs) and classification (ResNet-18 training) stages.
+• Dataset Filtering:
+ – For ImageNet-100 and ImageNet-Dog, additional filtering logic is required to randomly select the correct number of classes and images per class.
+• Dirty Sample Injection:
+ – The exact implementation parameters (e.g., size and location of the BadNets white square trigger, blending ratio for the Blended attack, and parameters for SIG) should be delegated to utility functions. For more complex attacks like SSBA and WaNet, either a simplified version or further research might be required.
+ – The method must update both the image tensor and the corresponding label when poisoning a sample.
+• Reproducibility:
+ – Use fixed random seeds for sampling when injecting noisy or poisoned samples.
+ – Cache or log the indices of samples injected for later computation of evaluation metrics such as true positive rate (TPR) and false positive rate (FPR).
+
+──────────────────────────────
+Conclusion
+
+This logic analysis for dataset_loader.py outlines how the DatasetLoader class will load and preprocess the three datasets based on TorchVision, apply the appropriate image transformations, and inject dirty samples (noisy labels and backdoor triggers) in accordance with the paper’s methodology and the experimental configuration. All configuration parameters (like noisy_ratio, samples per class for poisoning, batch sizes, and transforms) are expected to be read from config.yaml, and several helper functions from utils.py are extensively used for tasks like trigger injection and logging. This modular approach ensures that the data preparation step is reproducible, consistent, and well integrated with the overall VDC detection and classifier training pipeline.

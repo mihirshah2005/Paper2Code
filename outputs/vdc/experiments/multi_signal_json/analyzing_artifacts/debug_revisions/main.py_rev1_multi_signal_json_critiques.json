@@ -1,0 +1,54 @@
+{
+  "all": [
+    {
+      "target_func_name": "Evaluation.evaluate",
+      "severity_level": "high",
+      "critique": "The evaluation phase indicates that the test dataset is clean yet computes the Attack Success Rate (ASR). In most backdoor scenarios the ASR is measured on triggered samples. This discrepancy leaves unclear how ASR is actually evaluated and may contradict the original paper’s methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample",
+      "severity_level": "medium",
+      "critique": "The computation of the matching score (s = votes/total_questions) and the subsequent decision to flag a sample as dirty if s < 0.5 are under-specified. It is unclear how the outputs from VQG, VQA, and VAE are calibrated together to form s, which could lead to ambiguity in reproducing the intended detection behavior described in the paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The dirty sample injection process is ambiguous regarding the simultaneous application of poisoning (backdoor trigger insertion) and noisy label injection. The analysis does not clearly specify under what conditions hybrid dirty samples are created or how the parameters from config.yaml govern each type of injection, risking deviation from the paper’s design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VAE (Visual Answer Evaluation) Module",
+      "severity_level": "low",
+      "critique": "Naming the visual answer evaluation component as 'VAE' can be confusing because 'VAE' is commonly understood as Variational Autoencoder. Clarifying its naming or purpose would help avoid ambiguity among developers and reviewers.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "API Interaction and Caching Mechanisms",
+      "severity_level": "low",
+      "critique": "While the analysis mentions caching for ChatGPT and Instruct-BLIP API calls and error handling for API connections, there is insufficient detail on how these strategies are implemented. This lack of specifics may affect reproducibility and robustness, albeit it is not a core methodological flaw.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "Evaluation.evaluate",
+      "severity_level": "high",
+      "critique": "The evaluation phase indicates that the test dataset is clean yet computes the Attack Success Rate (ASR). In most backdoor scenarios the ASR is measured on triggered samples. This discrepancy leaves unclear how ASR is actually evaluated and may contradict the original paper’s methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "VDCDetector.detect_sample",
+      "severity_level": "medium",
+      "critique": "The computation of the matching score (s = votes/total_questions) and the subsequent decision to flag a sample as dirty if s < 0.5 are under-specified. It is unclear how the outputs from VQG, VQA, and VAE are calibrated together to form s, which could lead to ambiguity in reproducing the intended detection behavior described in the paper.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader.inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The dirty sample injection process is ambiguous regarding the simultaneous application of poisoning (backdoor trigger insertion) and noisy label injection. The analysis does not clearly specify under what conditions hybrid dirty samples are created or how the parameters from config.yaml govern each type of injection, risking deviation from the paper’s design.",
+      "source": "llm-judge"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+Below is the detailed logic analysis for main.py. This file will serve as the main entry point for the entire experimental pipeline. It will do the following:
+
+1. Load the configuration from config.yaml using the Config class so that all modules (data loading, model instantiation, curriculum scheduling, training, and evaluation) use identical parameters. Note that parameters such as training hyperparameters (batch size, epochs, optimizer settings), curriculum hyperparameters (warmup_epochs, schedule_epochs, growth_rate—all of which may be null or set to defaults), and reproducibility seeds come directly from the configuration.
+
+2. Set up the reproducibility by iterating over the list of random seeds provided in the configuration (seeds: [42, 666, 777, 888, 999]). For each seed, the code will:
+  a. Set the random seed for Python, NumPy, and PyTorch so that the training can be exactly reproduced.
+  b. Log (or print) which seed is being used.
+
+3. For each experiment run (which may be organized by domain or by model within a specific domain as indicated in the training section of the configuration):
+  a. Instantiate the DatasetLoader with the config dictionary. The DatasetLoader will then parse the dataset identifier (for example, “cifar10”, “cifar10-noise-0.4”, or “tinyimagenet-imbalance-50”) and perform all necessary preprocessing steps such as:
+   • Downloading the dataset (using torchvision for CV, Hugging Face Datasets for NLP, and torch-geometric for Graph datasets).
+   • Splitting into training, validation, and test sets.
+   • Applying noise (injecting label noise with probability p) or imbalance (subsampling classes according to the specified imbalance ratio) as required.
+  b. Get the output from load_data() – a dictionary containing the train, validation, and test data.
+
+4. Next, instantiate the ModelManager with the same configuration. The ModelManager inspects the configuration and, based on the specified domain (for instance, “cv”, “nlp” with its “lstm” or “transformer” subdivisions, or “graph”) and the list of models (e.g., ["LeNet", "ResNet-18", "ViT"] for CV), it will:
+  a. Build and return the corresponding backbone model (by modifying input layers, output layers, or patch configuration as needed).
+  b. Use pre‐trained weights for transformer models (BERT and GPT2) where appropriate, or initialize the remaining networks (LeNet, ResNet-18, ViT, LSTM, GCN, etc.) from scratch.
+
+5. Create an instance of a CurriculumScheduler. This scheduler is built using an abstract interface (e.g., having an update_schedule(loss, epoch) method) so that the specific curriculum learning strategy (like Self-Paced Learning, TTCL, or loss reweighting) can be plugged into the training loop. The scheduler’s hyperparameters are fetched from the “curriculum” section of the config. (Keep in mind that some fields may be null—if so, the scheduler should handle it with default behavior or log a warning.)
+
+6. Instantiate the Trainer class by passing the following objects and parameters:
+  a. The model returned by ModelManager.
+  b. The data dictionary (train, validation, test) returned by DatasetLoader.
+  c. The instantiated CurriculumScheduler.
+  d. The configuration dictionary (which contains information such as epochs, batch_size, optimizer details, and domain-specific training settings).
+  e. The Trainer will incorporate the curriculum scheduler into the training loop. For every epoch and for every mini-batch, it calls update_schedule(loss, epoch) to reweigh data samples or to decide which samples to select.
+
+7. Call the Trainer.train() method:
+  a. The training loop is executed for the number of epochs specified (e.g., 200 for CV, 10 or 3 for NLP, and 200 for graph tasks).
+  b. During training, training loss, performance on the validation set, and complexity metrics (training time and GPU memory consumption) are logged.
+  c. The Trainer uses the model’s forward(x) method (from ModelManager) during each training iteration.
+  d. The curriculum scheduler’s update_schedule() is invoked on every training step (or per epoch as needed) to drive the curriculum learning process.
+
+8. Once training is complete, instantiate the Evaluation module by passing:
+  a. The trained model.
+  b. The same data dictionary.
+  c. The configuration.
+  d. The Evaluation module will then perform a forward pass over the test set and compute domain‐specific performance metrics (accuracy for CV, a combination of accuracy, F1 score, Spearman, Matthews for NLP tasks, and AUC for graph tasks). It will also output the recorded complexity metrics if record_complexity is set to true in the config.
+
+9. The output from Evaluation.evaluate() is a summary dictionary that contains the performance results and the complexity metrics for the run.
+
+10. For multi-seed experiments:
+  a. The above process (steps 3–9) is repeated for each seed.
+  b. All individual metrics are then aggregated (computing the average and standard deviation) across the seeds.
+  c. The final aggregated results are logged or printed in a final summary similar to Table 3 in the paper.
+
+11. Finally, main.py will ensure that all experiments run in sequence (or using a loop over domains/models if needed) and that the final results (both performance and complexity) are stored or exported for later analysis and plotting.
+
+Throughout the main.py logic:
+• The code will rely on shared configuration parameters (such as learning rates, batch sizes, epochs, and curriculum hyperparameters) from config.yaml.
+• Clear logging will be performed to track each major step, including data loading, model building, training progress, metric calculation, and final output.
+• Any ambiguous settings (e.g., null values for curriculum hyperparameters) are noted and handled via defaults or appropriate warnings.
+
+This organization ties together the modular components as designed and directly implements the experimental pipeline described by the CurBench paper and the provided plan, ensuring consistency, reproducibility, and clarity in the experimental flow.

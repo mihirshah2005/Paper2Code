@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below are some issues I found with the analysis, along with an assessment of how they impact specific functions:\n\n1. Disambiguation Logic Inconsistency – Medium  \n • The written description says that when both “yes” and “no” are present, the function should determine dominance (for example, ensuring that one of the words is clearly more frequent or appears first) or flag the answer as ambiguous. However, in the pseudocode the condition \"if len(yes_matches) >= len(no_matches)\" will return True ev",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below are some issues I found with the analysis, along with an assessment of how they impact specific functions:\n\n1. Disambiguation Logic Inconsistency – Medium  \n • The written description says that when both “yes” and “no” are present, the function should determine dominance (for example, ensuring that one of the words is clearly more frequent or appears first) or flag the answer as ambiguous. However, in the pseudocode the condition \"if len(yes_matches) >= len(no_matches)\" will return True ev",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

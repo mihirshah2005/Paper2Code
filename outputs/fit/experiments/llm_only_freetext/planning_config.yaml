@@ -1,0 +1,35 @@
+## config.yaml
+training:
+  learning_rate: 1e-4
+  batch_size: 256
+  training_steps_fit_b2: 400000
+  training_steps_fit_xl2: 1800000
+  optimizer: "AdamW"
+  weight_decay: 0.0
+  ema_decay: 0.9999
+
+model:
+  patch_size: 2
+  max_token_length: 256
+  transformer:
+    positional_embedding: "2D RoPE"
+    attention: "Masked MHSA"
+    ffn: "SwiGLU"
+  pretrained_vae: "huggingface/stabilityai/sd-vae-ft-ema"
+
+diffusion:
+  num_sampling_steps: 250
+  noise_schedule: "DDPM"
+
+data:
+  dataset: "ImageNet"
+  resize_max_area: 65536  # 256 x 256
+  augmentation: "Horizontal Flip"
+
+extrapolation:
+  methods: ["PI", "EI", "NTK", "YaRN", "VisionNTK", "VisionYaRN"]
+  scale_factor: "max(max(H_test, W_test)/L_train, 1.0)"
+
+evaluation:
+  fid_steps: 250
+  metrics: ["FID", "sFID", "IS", "Precision", "Recall"]

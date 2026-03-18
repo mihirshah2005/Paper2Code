@@ -1,0 +1,119 @@
+/*******************************************************
+ * Revised Logic Analysis for main.py
+ *
+ * Overview:
+ * This file serves as the main entry point for executing the FiT reproduction experiment.
+ * It orchestrates the entire pipeline from configuration loading, data preparation, model
+ * initialization, training, to final evaluation and logging.
+ *
+ * Detailed Steps:
+ *
+ * 1. Load Configuration:
+ *    - The program begins by reading “config.yaml” to extract all necessary hyperparameters and settings.
+ *    - Key configuration sections include:
+ *         • Training: Contains learning_rate, batch_size, two distinct training step parameters 
+ *           (training_steps_fit_b2 for FiT-B/2 and training_steps_fit_xl2 for FiT-XL/2), optimizer type (AdamW), 
+ *           weight_decay, and ema_decay.
+ *           - Note: Although the configuration includes a weight_decay parameter, its value is set to 0.0,
+ *             which effectively means that no weight decay is applied. This detail is consistent with the description.
+ *         • Model: Defines patch_size (set to 2), max_token_length (256), transformer specifics (using "2D RoPE" for positional embedding, 
+ *           "Masked MHSA" for attention, and "SwiGLU" for the FFN), and the path to the pretrained VAE 
+ *           (e.g., "huggingface/stabilityai/sd-vae-ft-ema").
+ *         • Diffusion: Specifies the number of sampling steps (250) and the noise_schedule ("DDPM").
+ *         • Data: Indicates dataset details (e.g., "ImageNet"), maximum resize area (65536 corresponding to 256x256),
+ *           and augmentation type ("Horizontal Flip").
+ *         • Extrapolation and Evaluation: Lists resolution extrapolation methods and evaluation metrics.
+ *
+ * 2. Data Preparation:
+ *    - Instantiate the DatasetLoader class by passing in the loaded configuration.
+ *    - Call DatasetLoader.load_data() to obtain a DataLoader instance.
+ *    - Internally, the DatasetLoader handles:
+ *         • Reading the image dataset (e.g., ImageNet),
+ *         • Applying image transformations that resize high-resolution images so that HW ≤ 256² while preserving aspect ratios,
+ *         • Applying horizontal flip augmentation,
+ *         • Preprocessing steps such as patchifying post-VAE latent outputs and dynamically padding token sequences to a fixed length (L_max = 256).
+ *
+ * 3. Model Initialization:
+ *    - Create an instance of the Model class using the model-specific portion of the configuration.
+ *    - During initialization, the Model:
+ *         • Sets up patchification with patch_size (p = 2) and max_token_length as specified.
+ *         • Configures the transformer backbone with "2D RoPE" for positional encoding,
+ *           "Masked MHSA" for attention, and "SwiGLU" for the feed-forward network block.
+ *         • Loads the pretrained VAE checkpoint by calling Model.load_pretrained_vae(config.model.pretrained_vae),
+ *           using the designated path (e.g., "huggingface/stabilityai/sd-vae-ft-ema").
+ *
+ * 4. Training Setup:
+ *    - Resolve the ambiguity in selecting training steps:
+ *         • The configuration provides two parameters: training_steps_fit_b2 for FiT-B/2 and training_steps_fit_xl2 for FiT-XL/2.
+ *         • main.py should include logic (such as checking a model variant flag in config.model or a command-line argument)
+ *           to determine which training step parameter to use. For instance, if config.model.variant is "B/2",
+ *           then use training_steps_fit_b2; if "XL/2", choose training_steps_fit_xl2. If absent, a default variant (e.g., FiT-B/2) may be selected.
+ *
+ *    - Instantiate the Trainer class with:
+ *         • The Model instance.
+ *         • The DataLoader from DatasetLoader.
+ *         • The complete training configuration, including:
+ *              - learning_rate (1e-4),
+ *              - batch_size (256),
+ *              - the resolved training step parameter,
+ *              - optimizer type ("AdamW"),
+ *              - weight_decay (0.0, as specified in config, indicating no weight decay),
+ *              - ema_decay (0.9999).
+ *
+ *    - The Trainer is responsible for:
+ *         • Executing each training batch where the model's forward pass is performed.
+ *         • Computing the diffusion process loss solely over valid (non-padding) tokens using an attention mask.
+ *         • Updating the optimizer (AdamW) with the specified learning rate and weight decay.
+ *         • Maintaining an exponential moving average (EMA) of the model weights with a decay factor of 0.9999.
+ *         • Saving checkpoints periodically via Trainer.save_checkpoint(epoch).
+ *
+ * 5. Evaluation:
+ *    - Once training completes, instantiate the Evaluation class with:
+ *         • The trained (and EMA-updated) Model.
+ *         • The DataLoader (or a separate evaluation loader if necessary).
+ *         • Evaluation and diffusion settings such as:
+ *              - num_sampling_steps (250),
+ *              - extrapolation methods (["PI", "EI", "NTK", "YaRN", "VisionNTK", "VisionYaRN"]),
+ *              - evaluation metrics (FID, sFID, IS, Precision, Recall).
+ *
+ *    - Call Evaluation.evaluate() to:
+ *         • Run the inference pipeline:
+ *              - Sample noisy tokens from a Gaussian distribution based on the target resolution’s token count.
+ *              - Execute the diffusion denoising process for 250 DDPM iterations.
+ *              - Apply positional embedding interpolation techniques for resolution extrapolation if required.
+ *         • Decode the final latent tokens using the pretrained VAE decoder to generate images.
+ *         • Compute and return evaluation metrics (either via ADM’s TensorFlow evaluation or an equivalent metric computation module).
+ *
+ * 6. Orchestration:
+ *    - The main execution flow in main.py carries out:
+ *         a) Loading and parsing the configuration from "config.yaml".
+ *         b) Initializing the DatasetLoader and acquiring the DataLoader.
+ *         c) Instantiating the Model and loading the pretrained VAE weights.
+ *         d) Determining the model variant to select the appropriate training steps parameter from the config.
+ *         e) Creating a Trainer instance and executing the training loop.
+ *         f) After training, instantiating an Evaluation instance, running evaluation, and printing the metrics.
+ *
+ * 7. Logging & Error Handling:
+ *    - Throughout the pipeline, the program should log key events:
+ *         • Successful configuration loading,
+ *         • Data loading and transformation details,
+ *         • Training progress (loss metrics, token usage statistics, EMA updates),
+ *         • Checkpoint saving events,
+ *         • Evaluation results.
+ *    - Robust error handling must be implemented for configuration reading, data loading failures, training issues, or evaluation exceptions.
+ *
+ * 8. Integration Notes:
+ *    - Ensure that dataset_loader.py, model.py, trainer.py, and evaluation.py strictly conform to their defined interfaces.
+ *    - Use shared helper functions for operations like image patchification, token padding, and attention mask construction.
+ *
+ * Summary:
+ * main.py serves as the high-level controller that integrates:
+ *    • Configuration loading (with explicit logic for selecting training steps based on the model variant),
+ *    • Data loading and preprocessing,
+ *    • Model construction (including pretrained VAE integration and FiT transformer using 2D RoPE, Masked MHSA, and SwiGLU),
+ *    • Training execution via the Trainer (utilizing AdamW with weight_decay set as per config, which is 0.0 here),
+ *    • And evaluation via the Evaluation module.
+ * This revised analysis clarifies that the weight_decay parameter from configuration is actively considered (with its value of 0.0)
+ * and explicitly describes how the appropriate training steps are selected based on the chosen model variant, addressing any potential inconsistencies.
+ *
+ *******************************************************/

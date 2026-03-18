@@ -1,0 +1,48 @@
+{
+  "all": [
+    {
+      "target_func_name": "compute_loss (Eigenbasis Matching Loss)",
+      "severity_level": "high",
+      "critique": "The revised Lₑ loss compares projection matrices U_syn U_synᵀ and U_r U_rᵀ without addressing the potential dimensional mismatch. U_syn is defined with shape (N′, K), while U_r may come from the full graph and have a different number of rows. This discrepancy can render the subtraction and Frobenius norm computation invalid unless both matrices are defined over the same space.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "compute_loss (Discrimination Constraint Loss)",
+      "severity_level": "medium",
+      "critique": "The formulation of L_d relies on external category-level representations (real_cat_repr and synthetic_cat_repr) without defining or enforcing their computation within the Model class. This dependency is only documented verbally, which may lead to integration issues if these representations are not properly computed or passed in from other components.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reconstruct_graph",
+      "severity_level": "medium",
+      "critique": "The reconstruction method calls for the use of normalized eigenvalues but does not specify a concrete normalization procedure. Without a clear and systematic approach for clamping or scaling the eigenvalues, there is a risk of generating synthetic Laplacian or adjacency matrices with improper scaling or symmetry properties.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "update_eigenbasis/update_features",
+      "severity_level": "low",
+      "critique": "The update methods, which are intended to allow manual updates to U_syn and X_syn, are described only as simple wrappers. This loose definition may lead to inconsistencies with standard gradient-based optimizer flows and could break the planned design if not more explicitly integrated with the overall training loop.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "compute_loss (Eigenbasis Matching Loss)",
+      "severity_level": "high",
+      "critique": "The revised Lₑ loss compares projection matrices U_syn U_synᵀ and U_r U_rᵀ without addressing the potential dimensional mismatch. U_syn is defined with shape (N′, K), while U_r may come from the full graph and have a different number of rows. This discrepancy can render the subtraction and Frobenius norm computation invalid unless both matrices are defined over the same space.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "compute_loss (Discrimination Constraint Loss)",
+      "severity_level": "medium",
+      "critique": "The formulation of L_d relies on external category-level representations (real_cat_repr and synthetic_cat_repr) without defining or enforcing their computation within the Model class. This dependency is only documented verbally, which may lead to integration issues if these representations are not properly computed or passed in from other components.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reconstruct_graph",
+      "severity_level": "medium",
+      "critique": "The reconstruction method calls for the use of normalized eigenvalues but does not specify a concrete normalization procedure. Without a clear and systematic approach for clamping or scaling the eigenvalues, there is a risk of generating synthetic Laplacian or adjacency matrices with improper scaling or symmetry properties.",
+      "source": "llm-judge"
+    }
+  ]
+}

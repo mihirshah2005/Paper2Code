@@ -1,0 +1,42 @@
+{
+  "all": [
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "high",
+      "critique": "The logic does not specify explicit error handling or retries for failures in the ChatGPT API call. Relying solely on the utilities in utils.py without detailing how network errors, rate limit issues, or unexpected API errors are handled may break the core functionality.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The fallback strategy when fewer than the required number of questions are extracted is vague. The design mentions reissuing the API call or appending default template questions, but it does not define how these defaults are chosen or integrated, which can lead to unpredictable behavior.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_general_questions",
+      "severity_level": "low",
+      "critique": "The selection mechanism for general questions is ambiguous. The analysis mentions selecting questions in a fixed order or via a reproducible random mechanism without committing to one clear method, which might lead to inconsistency with the configuration file expectations.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "__init__",
+      "severity_level": "low",
+      "critique": "The expected structure and keys of the configuration file (config.yaml) are not clearly defined. This omission could result in misconfigurations, especially given that parameters like the number of questions for different datasets must follow precise values.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "high",
+      "critique": "The logic does not specify explicit error handling or retries for failures in the ChatGPT API call. Relying solely on the utilities in utils.py without detailing how network errors, rate limit issues, or unexpected API errors are handled may break the core functionality.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The fallback strategy when fewer than the required number of questions are extracted is vague. The design mentions reissuing the API call or appending default template questions, but it does not define how these defaults are chosen or integrated, which can lead to unpredictable behavior.",
+      "source": "llm-judge"
+    }
+  ]
+}

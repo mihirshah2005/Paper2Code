@@ -1,0 +1,304 @@
+```python
+"""
+trainer.py
+
+This module implements the Trainer class for the CurBench project.
+The Trainer class encapsulates the training loop for a given backbone model,
+integrating the curriculum learning strategy and tracking both performance
+and complexity (e.g., training time and GPU memory usage).
+
+It requires:
+    - model: a backbone network instance (implementing a callable forward() method)
+    - data: a dictionary with keys "train", "val", and "test" (datasets) provided by DatasetLoader.
+    - curriculum: an instance of CurriculumScheduler (or its subclass) implementing update_schedule(loss: float, epoch: int).
+    - config: a configuration dictionary loaded from config.yaml that includes domain-specific hyperparameters,
+              optimizer settings, and requires an explicit "domain" key (e.g., "cv", "nlp", or "graph").
+
+The Trainer enforces a deterministic domain resolution. If the domain
+information is missing, it raises a ValueError with a clear message.
+It also instantiates the appropriate loss function and optimizer based on the domain,
+wraps training operations in granular try/except blocks, and logs GPU memory usage if available.
+"""
+
+import time
+import math
+import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+
+# Import curriculum scheduler base type for type checking.
+from curriculum import CurriculumScheduler
+
+# For NLP model type checking
+try:
+    from model import LSTMClassifier
+except ImportError:
+    LSTMClassifier = None
+
+# For transformers based NLP models, we check using string in type.
+import types
+
+# Set up module-level logger.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+class Trainer:
+    """
+    Trainer encapsulates the training loop of the model using the provided dataset,
+    curriculum scheduler, and configuration. It validates external dependencies, sets up the optimizer,
+    loss function, and DataLoader, and integrates the curriculum strategy by updating a loss scaling factor.
+
+    Attributes:
+        model (nn.Module): The backbone model.
+        train_loader (DataLoader): Dataloader for the training data.
+        val_loader (DataLoader): Dataloader for the validation data.
+        test_loader (DataLoader): Dataloader for the test data.
+        curriculum (CurriculumScheduler): Instance of the curriculum scheduler.
+        config (dict): The complete configuration dictionary.
+        domain (str): The training domain ("cv", "nlp", or "graph").
+        loss_fn (nn.Module): The loss function (default: CrossEntropyLoss).
+        optimizer (optim.Optimizer): The optimizer instance.
+        device (torch.device): The device on which training will run.
+        num_epochs (int): Total number of epochs to train.
+    """
+
+    def __init__(self, model: nn.Module, data: dict, curriculum: CurriculumScheduler, config: dict) -> None:
+        """
+        Initializes the Trainer instance with model, data, curriculum, and configuration.
+
+        Raises:
+            ValueError: If the domain information is missing in the configuration.
+            TypeError: If any required component does not have the necessary callable methods.
+            KeyError: If the data dictionary does not contain required keys.
+        """
+        self.config = config
+
+        # Domain resolution: require an explicit "domain" key in config.
+        self.domain = self.config.get("domain", None)
+        if self.domain is None:
+            raise ValueError("Domain information missing. Please specify the training domain (e.g., 'cv', 'nlp', or 'graph') in the configuration.")
+
+        # Validate model: must be an instance of nn.Module and have a callable forward() method.
+        if not isinstance(model, nn.Module) or not callable(getattr(model, "forward", None)):
+            raise TypeError("The provided model must be an instance of torch.nn.Module with a callable forward() method.")
+        self.model = model
+
+        # Validate curriculum: must have update_schedule(loss: float, epoch: int) method.
+        if not hasattr(curriculum, "update_schedule") or not callable(getattr(curriculum, "update_schedule")):
+            raise TypeError("The provided curriculum instance must implement update_schedule(loss: float, epoch: int).")
+        self.curriculum = curriculum
+
+        # Validate data dictionary keys.
+        required_data_keys = {"train", "val", "test"}
+        if not required_data_keys.issubset(set(data.keys())):
+            raise KeyError(f"Data dictionary must contain keys {required_data_keys}. Provided keys: {list(data.keys())}")
+        self.data = data
+
+        # Setup device: Use GPU if available.
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Training will run on device: {self.device}")
+        self.model.to(self.device)
+
+        # Prepare DataLoaders from dataset objects.
+        # Determine batch size based on domain-specific training configuration.
+        if self.domain.lower() == "cv":
+            train_config = self.config.get("training", {}).get("cv", {})
+            self.batch_size = int(train_config.get("batch_size", 50))
+            self.learning_rate = float(train_config.get("learning_rate", 0.0001))
+            self.num_epochs = int(train_config.get("epochs", 200))
+            optimizer_choice = train_config.get("optimizer", "Adam")
+        elif self.domain.lower() == "nlp":
+            # Distinguish between LSTM (if model is LSTMClassifier) and transformer models.
+            if LSTMClassifier is not None and isinstance(self.model, LSTMClassifier):
+                train_config = self.config.get("training", {}).get("lstm", {})
+            else:
+                train_config = self.config.get("training", {}).get("transformer", {})
+            self.batch_size = int(train_config.get("batch_size", 50))
+            # For transformer, use learning_rate; for LSTM, if "learning_rate_range" is provided, use the lower bound.
+            if "learning_rate" in train_config:
+                self.learning_rate = float(train_config.get("learning_rate", 0.00002))
+            elif "learning_rate_range" in train_config:
+                # Extract lower bound from range string "min-max"
+                lr_range = str(train_config.get("learning_rate_range"))
+                try:
+                    lr_min = float(lr_range.split("-")[0])
+                except Exception:
+                    lr_min = 0.00001
+                self.learning_rate = lr_min
+            self.num_epochs = int(train_config.get("epochs", 10))
+            optimizer_choice = train_config.get("optimizer", "SGD")
+        elif self.domain.lower() == "graph":
+            train_config = self.config.get("training", {}).get("graph", {})
+            self.batch_size = int(train_config.get("batch_size", 50))
+            # Determine learning rate based on dataset type via inspection of training data.
+            lr_dict = train_config.get("learning_rates", {})
+            # Simple heuristic: check if "ogbg-molhiv" is mentioned in the training dataset representation.
+            train_data_str = str(self.data["train"])
+            if "ogbg-molhiv" in train_data_str.lower():
+                self.learning_rate = float(lr_dict.get("OGB", 0.001))
+            else:
+                self.learning_rate = float(lr_dict.get("TUDataset", 0.01))
+            self.num_epochs = int(train_config.get("epochs", 200))
+            optimizer_choice = train_config.get("optimizer", "Adam")
+        else:
+            raise ValueError(f"Unsupported domain: {self.domain}. Expected 'cv', 'nlp', or 'graph'.")
+
+        # Create DataLoaders for training, validation and test.
+        self.train_loader = DataLoader(self.data["train"], batch_size=self.batch_size, shuffle=True)
+        self.val_loader = DataLoader(self.data["val"], batch_size=self.batch_size, shuffle=False)
+        self.test_loader = DataLoader(self.data["test"], batch_size=self.batch_size, shuffle=False)
+
+        # Initialize loss function (using CrossEntropyLoss for classification tasks).
+        self.loss_fn = nn.CrossEntropyLoss()
+
+        # Initialize optimizer.
+        if "adamw" in optimizer_choice.lower():
+            self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+        elif "sgd" in optimizer_choice.lower():
+            self.optimizer = optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=0.9)
+            # For LSTM with cosine annealing, set up a scheduler.
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.num_epochs)
+        elif "adam" in optimizer_choice.lower():
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        else:
+            logger.warning(f"Optimizer '{optimizer_choice}' not recognized. Defaulting to Adam.")
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+        # Initialize training state tracking.
+        self.training_stats = {
+            "epoch_losses": [],
+            "epoch_times": [],
+            "total_training_time": None
+        }
+
+        logger.info(
+            f"Trainer initialized for domain '{self.domain}' with batch_size={self.batch_size}, "
+            f"learning_rate={self.learning_rate}, epochs={self.num_epochs}, optimizer={optimizer_choice}"
+        )
+
+    def train(self) -> dict:
+        """
+        Performs the full training loop over the specified number of epochs.
+        Integrates curriculum learning updates, handles mini-batch processing with error
+        handling for forward pass, loss computation, backpropagation, and optimizer steps.
+        
+        Returns:
+            dict: Training statistics including epoch losses, times, and overall training duration.
+        """
+        self.model.train()
+        overall_start_time = time.time()
+        for epoch in range(self.num_epochs):
+            epoch_start_time = time.time()
+            running_loss = 0.0
+            batch_count = 0
+
+            logger.info(f"Starting epoch {epoch + 1}/{self.num_epochs}")
+
+            for batch_idx, batch in enumerate(self.train_loader):
+                # Data Preparation: move inputs and labels to device.
+                try:
+                    # Assume that batch is a tuple (inputs, labels) for CV and NLP.
+                    # For graph datasets, batch is a Batch object with attributes.
+                    if self.domain.lower() in ["cv", "nlp"]:
+                        inputs, labels = batch
+                        inputs = inputs.to(self.device)
+                        labels = labels.to(self.device)
+                    elif self.domain.lower() == "graph":
+                        # For graph, assume batch is a Batch object from torch_geometric; move all attributes.
+                        batch = batch.to(self.device)
+                        # Typically, graph data contains attributes: x, edge_index, batch, and y.
+                        inputs = batch  # We pass the entire batch to the model.
+                        # For loss computation, assume batch.y is available.
+                        labels = batch.y.to(self.device)
+                    else:
+                        raise ValueError(f"Unsupported domain '{self.domain}' during data preparation.")
+                except Exception as e:
+                    logger.error(f"Error in data preparation at epoch {epoch}, batch {batch_idx}: {e}")
+                    continue
+
+                # Forward Pass.
+                try:
+                    outputs = self.model(inputs)
+                except Exception as e:
+                    logger.error(f"Forward pass error at epoch {epoch}, batch {batch_idx}: {e}. Skipping batch.")
+                    continue
+
+                # Loss computation.
+                try:
+                    loss = self.loss_fn(outputs, labels)
+                except Exception as e:
+                    logger.error(f"Loss computation error at epoch {epoch}, batch {batch_idx}: {e}. Skipping batch.")
+                    continue
+
+                # Curriculum Scheduler update.
+                weight = 1.0  # Default weight if curriculum update fails.
+                try:
+                    curriculum_output = self.curriculum.update_schedule(loss.item(), epoch)
+                    if isinstance(curriculum_output, dict) and "weight" in curriculum_output:
+                        weight = float(curriculum_output["weight"])
+                    else:
+                        logger.info(f"Curriculum output is not a dict with 'weight'; using default weight=1.0")
+                    logger.debug(f"Epoch {epoch}, batch {batch_idx}: Curriculum output: {curriculum_output}")
+                except Exception as e:
+                    logger.error(f"Curriculum update error at epoch {epoch}, batch {batch_idx}: {e}. Using default weight=1.0.")
+
+                weighted_loss = loss * weight
+
+                # Backpropagation and optimizer step.
+                try:
+                    self.optimizer.zero_grad()
+                    weighted_loss.backward()
+                except Exception as e:
+                    logger.error(f"Backward pass error at epoch {epoch}, batch {batch_idx}: {e}. Skipping optimizer step.")
+                    continue
+
+                try:
+                    self.optimizer.step()
+                except Exception as e:
+                    logger.error(f"Optimizer step error at epoch {epoch}, batch {batch_idx}: {e}.")
+                    continue
+
+                running_loss += loss.item()
+                batch_count += 1
+
+                # Log GPU memory usage if available.
+                if torch.cuda.is_available():
+                    current_gpu_mem = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)  # in MB
+                    logger.debug(f"Epoch {epoch}, batch {batch_idx}: Loss={loss.item():.4f}, "
+                                 f"Weighted Loss={weighted_loss.item():.4f}, GPU Mem={current_gpu_mem:.2f} MB")
+                else:
+                    logger.debug(f"Epoch {epoch}, batch {batch_idx}: Loss={loss.item():.4f}, Weighted Loss={weighted_loss.item():.4f}. GPU not available.")
+
+            # End-of-epoch processing.
+            epoch_time = time.time() - epoch_start_time
+            avg_loss = running_loss / batch_count if batch_count > 0 else float('inf')
+            self.training_stats["epoch_losses"].append(avg_loss)
+            self.training_stats["epoch_times"].append(epoch_time)
+            logger.info(f"Epoch {epoch + 1} completed: Avg Loss={avg_loss:.4f}, Time={epoch_time:.2f}s")
+
+            # Step the learning rate scheduler if using one.
+            if self.domain.lower() == "nlp" and optimizer_choice := self.config.get("training", {}).get("lstm", {}).get("optimizer", "").lower():
+                if "sgd" in optimizer_choice and hasattr(self, "scheduler"):
+                    self.scheduler.step()
+
+            # Optionally: perform validation pass here if needed.
+            # (This code could be extended to compute validation metrics.)
+
+            # Reset GPU memory counters for the next epoch if using GPU.
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+        total_training_time = time.time() - overall_start_time
+        self.training_stats["total_training_time"] = total_training_time
+        logger.info(f"Training complete. Total training time: {total_training_time:.2f}s")
+        return self.training_stats
+```

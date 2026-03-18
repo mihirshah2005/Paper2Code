@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is our review of the logic analysis with notes on issues and their associated severity:\n\n1. Compression Ratio Interpretation  \n – The analysis correctly identifies that the config value of 0.15 (with the “0.15%” comment) must be converted as 0.15/100, yet this dual interpretation (a fraction versus an already normalized value) might lead to confusion. If a user expects a 15% compression ratio and instead gets only 0.15%, the synthetic node count will be far smaller. Although the analysis d",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is our review of the logic analysis with notes on issues and their associated severity:\n\n1. Compression Ratio Interpretation  \n – The analysis correctly identifies that the config value of 0.15 (with the “0.15%” comment) must be converted as 0.15/100, yet this dual interpretation (a fraction versus an already normalized value) might lead to confusion. If a user expects a 15% compression ratio and instead gets only 0.15%, the synthetic node count will be far smaller. Although the analysis d",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

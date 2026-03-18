@@ -1,5 +1,5 @@
 """
-static_analysis.py  
+static_analysis.py  -  Drop into your codes/ directory.
 
 Three zero-token feedback channels + merge/filter helpers.
 """

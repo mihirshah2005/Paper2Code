@@ -1,0 +1,225 @@
+```python
+"""
+model.py
+
+This module implements the Model class for synthetic graph distillation as described 
+in "Graph Distillation with Eigenbasis Matching" (GDEM). The Model class initializes 
+learnable synthetic node features and eigenbasis (U_synth) and computes the composite loss 
+that consists of:
+  - Eigenbasis matching loss (Lₑ): A projection-matrix based loss that compares the subspaces 
+    spanned by the target real eigenbasis and the learned synthetic eigenbasis.
+  - Discrimination constraint loss (L_d): A cosine-similarity loss between the category-level 
+    representations (H and H′) of the real and synthetic graphs.
+  - Orthogonality regularization loss (Lₒ): A loss enforcing an orthonormal property on the 
+    synthetic eigenbasis.
+
+The class further provides methods for manually updating parameters (if required) and for reconstructing 
+the synthetic graph structure (i.e., its synthetic Laplacian and adjacency matrices) by replicating 
+the real spectrum.
+ 
+Dependencies:
+    torch, torch.nn, torch.nn.functional, numpy
+"""
+
+from typing import Dict, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+class Model(nn.Module):
+    """
+    Model for Graph Distillation with Eigenbasis Matching (GDEM).
+
+    Public Methods:
+        __init__(params: dict): Initializes synthetic features and eigenbasis using parameters from config.
+        forward() -> Dict[str, torch.Tensor]: Returns the current synthetic node features and normalized synthetic eigenbasis.
+        compute_loss(real_eigen: torch.Tensor, H: torch.Tensor, H_prime: torch.Tensor) -> torch.Tensor:
+            Computes the total loss L_total = α·Lₑ + β·L_d + γ·Lₒ.
+        update_eigenbasis(gradients: torch.Tensor, lr: float = None) -> None: Manually updates U_synth given gradients.
+        update_features(gradients: torch.Tensor, lr: float = None) -> None: Manually updates X_synth given gradients.
+        reconstruct_graph(real_eigenvalues: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            Reconstructs and returns the synthetic adjacency matrix A′ and synthetic Laplacian L′.
+    """
+
+    def __init__(self, params: dict) -> None:
+        """
+        Initialize the model with synthetic graph parameters.
+        
+        Expected parameters in params (with defaults used if not provided):
+            - "num_synth_nodes": (int) Number of synthetic nodes (N′). Default = 100.
+            - "feature_dim": (int) Dimensionality of the node features (d). Default = 500.
+            - "loss_weights": (dict) Contains "alpha", "beta", "gamma" for weighing the losses. Default each = 1.0.
+            - "learning_rate_eigenvecs": (float) Learning rate for eigenbasis updates. Default = 0.01.
+            - "learning_rate_feat": (float) Learning rate for synthetic features updates. Default = 1e-05.
+            - "r_k": (float) Fraction for lower-frequency eigenbasis selection; used for logging/optional computations.
+              Default = 0.9.
+        
+        The synthetic eigenbasis matrix U_synth ∈ ℝ^(N′×K) is initialized with an orthogonal initialization,
+        where we set K = N′.
+        """
+        super(Model, self).__init__()
+
+        # Retrieve configuration parameters with strong defaults.
+        self.num_synth_nodes: int = int(params.get("num_synth_nodes", 100))
+        self.feature_dim: int = int(params.get("feature_dim", 500))
+        loss_weights_config: dict = params.get("loss_weights", {"alpha": 1.0, "beta": 1.0, "gamma": 1.0})
+        self.alpha: float = float(loss_weights_config.get("alpha", 1.0))
+        self.beta: float = float(loss_weights_config.get("beta", 1.0))
+        self.gamma: float = float(loss_weights_config.get("gamma", 1.0))
+        self.lr_eigenvecs: float = float(params.get("learning_rate_eigenvecs", 0.01))
+        self.lr_features: float = float(params.get("learning_rate_feat", 1e-05))
+        self.r_k: float = float(params.get("r_k", 0.9))
+
+        # For simplicity, set eigenbasis size K = number of synthetic nodes.
+        self.K: int = self.num_synth_nodes
+
+        # Initialize synthetic node features X_synth ∈ ℝ^(N′×d) with random values.
+        self.X_synth: nn.Parameter = nn.Parameter(
+            torch.randn(self.num_synth_nodes, self.feature_dim)
+        )
+
+        # Initialize synthetic eigenbasis U_synth ∈ ℝ^(N′×K) and apply orthogonal initialization.
+        self.U_synth: nn.Parameter = nn.Parameter(
+            torch.randn(self.num_synth_nodes, self.K)
+        )
+        nn.init.orthogonal_(self.U_synth)
+
+    def forward(self) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass returns the current synthetic parameters.
+        
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary with:
+                "X_synth": Synthetic node features (shape: [N′, feature_dim]).
+                "U_synth": Column-normalized synthetic eigenbasis (shape: [N′, K]), where each column has unit norm.
+        """
+        # Normalize U_synth column-wise so that each synthetic eigenvector has unit norm.
+        # Since U_synth shape is (N_synth, K), normalizing over dim=0 normalizes each column.
+        U_synth_normalized = F.normalize(self.U_synth, p=2, dim=0)
+        return {"X_synth": self.X_synth, "U_synth": U_synth_normalized}
+
+    def compute_loss(
+        self, real_eigen: torch.Tensor, H: torch.Tensor, H_prime: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the total loss L_total = α·Lₑ + β·L_d + γ·Lₒ.
+
+        Loss components:
+          - Eigenbasis Matching Loss (Lₑ):
+            Let P_real = real_eigen @ real_eigenᵀ and P_synth = U_synth_normalized @ U_synth_normalizedᵀ,
+            where U_synth_normalized is obtained by column-normalizing U_synth.
+            Lₑ is computed as the squared Frobenius norm ||P_real - P_synth||_F².
+          - Discrimination Constraint Loss (L_d):
+            Both H (real category representations) and H_prime (synthetic category representations) are normalized row-wise.
+            Compute the cosine similarity for each category between corresponding rows and define
+            L_d = 1 - mean(cosine_similarity). It assumes H and H_prime are of shape (C, d).
+          - Orthogonality Loss (Lₒ):
+            For U_synth_normalized, compute the Gram matrix G = U_synth_normalizedᵀ @ U_synth_normalized.
+            Lₒ = ||G - I||_F², where I is the identity matrix of size K.
+
+        Args:
+            real_eigen (torch.Tensor): Target real eigenbasis (assumed pre-normalized) with shape [N′, K].
+            H (torch.Tensor): Real graph's category-level representations of shape [C, d].
+            H_prime (torch.Tensor): Synthetic graph's category-level representations of shape [C, d].
+
+        Returns:
+            torch.Tensor: Total computed loss.
+        """
+        # Get normalized synthetic eigenbasis.
+        model_out = self.forward()
+        U_synth_norm = model_out["U_synth"]
+
+        # Eigenbasis Matching Loss (Lₑ):
+        # Compute projection matrices.
+        P_real = real_eigen @ real_eigen.t()  # shape [N′, N′]
+        P_synth = U_synth_norm @ U_synth_norm.t()  # shape [N′, N′]
+        L_e = torch.norm(P_real - P_synth, p="fro") ** 2
+
+        # Discrimination Constraint Loss (L_d):
+        # Normalize each row (category representation) of H and H_prime.
+        H_normalized = F.normalize(H, p=2, dim=1)
+        H_prime_normalized = F.normalize(H_prime, p=2, dim=1)
+        # Compute cosine similarity row-wise.
+        cosine_sim = F.cosine_similarity(H_normalized, H_prime_normalized, dim=1)
+        mean_cosine_sim = torch.mean(cosine_sim)
+        L_d = 1.0 - mean_cosine_sim
+
+        # Orthogonality Regularization Loss (Lₒ):
+        # Compute Gram matrix of U_synth_norm.
+        G = U_synth_norm.t() @ U_synth_norm  # shape [K, K]
+        identity = torch.eye(self.K, device=G.device)
+        L_o = torch.norm(G - identity, p="fro") ** 2
+
+        # Total Loss.
+        L_total = self.alpha * L_e + self.beta * L_d + self.gamma * L_o
+        return L_total
+
+    def update_eigenbasis(self, gradients: torch.Tensor, lr: float = None) -> None:
+        """
+        Manually update the synthetic eigenbasis parameters using the provided gradients.
+        This function is to be used (optionally) for an alternating update scheme.
+
+        Args:
+            gradients (torch.Tensor): Gradients for U_synth.
+            lr (float, optional): Learning rate for this update. If None, uses self.lr_eigenvecs.
+        """
+        update_lr = lr if lr is not None else self.lr_eigenvecs
+        with torch.no_grad():
+            self.U_synth -= update_lr * gradients
+
+    def update_features(self, gradients: torch.Tensor, lr: float = None) -> None:
+        """
+        Manually update the synthetic node feature parameters using the provided gradients.
+        This function is to be used (optionally) for an alternating update scheme.
+
+        Args:
+            gradients (torch.Tensor): Gradients for X_synth.
+            lr (float, optional): Learning rate for this update. If None, uses self.lr_features.
+        """
+        update_lr = lr if lr is not None else self.lr_features
+        with torch.no_grad():
+            self.X_synth -= update_lr * gradients
+
+    def reconstruct_graph(self, real_eigenvalues: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Reconstruct the synthetic graph structure by replicating the real spectrum with the learned synthetic eigenbasis.
+
+        Reconstruction is performed as follows:
+            - Normalize U_synth column-wise to obtain U_synth_normalized.
+            - Create diagonal matrices:
+                  D₂ = diag(real_eigenvalues) and D₁ = diag(1 - real_eigenvalues),
+              where real_eigenvalues is a 1D tensor of length K.
+            - The synthetic Laplacian is computed as: L′ = U_synth_normalized · D₂ · U_synth_normalizedᵀ.
+            - The synthetic Adjacency is computed as: A′ = U_synth_normalized · D₁ · U_synth_normalizedᵀ.
+
+        Args:
+            real_eigenvalues (torch.Tensor): 1D tensor of real eigenvalues of length K.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple (A_prime, L_prime) where:
+                - A_prime: Reconstructed synthetic adjacency matrix.
+                - L_prime: Reconstructed synthetic Laplacian matrix.
+        """
+        # Normalize synthetic eigenbasis.
+        model_out = self.forward()
+        U_synth_norm = model_out["U_synth"]
+
+        # Ensure real_eigenvalues is a 1D tensor of length K.
+        if real_eigenvalues.dim() != 1 or real_eigenvalues.size(0) != self.K:
+            raise ValueError(
+                f"Expected real_eigenvalues to be a 1D tensor of length {self.K}, "
+                f"but got shape {real_eigenvalues.shape}."
+            )
+
+        # Create diagonal matrices.
+        D2 = torch.diag(real_eigenvalues).to(U_synth_norm.device)
+        D1 = torch.diag(1.0 - real_eigenvalues).to(U_synth_norm.device)
+
+        # Reconstruct synthetic Laplacian and adjacency.
+        L_prime = U_synth_norm @ D2 @ U_synth_norm.t()
+        A_prime = U_synth_norm @ D1 @ U_synth_norm.t()
+
+        return A_prime, L_prime
+```

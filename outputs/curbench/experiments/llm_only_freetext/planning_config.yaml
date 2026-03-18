@@ -1,0 +1,48 @@
+## config.yaml
+training:
+  cv:
+    models: ["LeNet", "ResNet-18", "ViT"]
+    batch_size: 50
+    optimizer: "Adam"
+    learning_rate: 0.0001
+    epochs: 200
+  nlp:
+    lstm:
+      model: "LSTM"
+      batch_size: 50
+      optimizer: "SGD (cosine annealing)"
+      learning_rate_range: "0.00001-1"
+      epochs: 10
+    transformer:
+      models: ["BERT", "GPT2"]
+      batch_size: 50
+      optimizer: "AdamW"
+      learning_rate: 0.00002
+      epochs: 3
+  graph:
+    models: ["GCN", "GAT", "GIN"]
+    batch_size: 50
+    optimizer: "Adam"
+    learning_rates:
+      TUDataset: 0.01
+      OGB: 0.001
+    epochs: 200
+
+curriculum:
+  # Curriculum learning hyperparameters as outlined in Table 7
+  # These values are placeholders; adjust based on experimental requirements.
+  warmup_epochs: null
+  schedule_epochs: null
+  growth_rate: null
+
+reproducibility:
+  seeds: [42, 666, 777, 888, 999]
+
+evaluation:
+  metrics:
+    cv: "accuracy"
+    nlp: ["accuracy", "F1", "Spearman", "Matthews"]
+    graph: "AUC"
+  record_complexity:
+    training_time: true
+    gpu_memory: true

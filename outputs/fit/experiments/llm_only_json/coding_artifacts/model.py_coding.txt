@@ -1,0 +1,462 @@
+## Code: model.py
+```python
+"""
+model.py
+
+This module implements the Model class that encapsulates the FiT (Flexible Vision Transformer)
+architecture for diffusion models. It integrates:
+  - A pretrained VAE encoder/decoder (loaded via load_pretrained_vae).
+  - Latent tokenization by patchifying the VAE latent output with a given patch size (default p=2)
+    and padding the token sequences to a fixed maximum length (L_max = 256).
+  - A transformer backbone composed of stacked TransformerBlocks that each include:
+       • A Masked Multi-Head Self-Attention (MHSA) module with integrated 2D Rotary Positional
+         Embedding (RoPE) applied on the query and key vectors.
+       • A feed-forward network in which the standard MLP is replaced by a SwiGLU block.
+  - Diffusion-specific conditioning: a time embedding computed from the diffusion-conditioning
+    input “t” (e.g., timesteps) is projected and added to the token embeddings.
+    
+The public API of the Model class includes:
+    - __init__(params: dict)
+    - forward(x: Tensor, t: Tensor) -> Tensor
+    - load_pretrained_vae(vae_path: str) -> None
+
+All additional helper routines are implemented as private methods.
+"""
+
+import math
+import os
+from typing import Any, Dict, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# SinusoidalPositionEmbeddings for diffusion time conditioning
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        self.embedding_dim: int = embedding_dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """
+        Create sinusoidal embeddings.
+        Args:
+            timesteps (Tensor): shape [B] or [B, 1]
+        Returns:
+            Tensor: shape [B, embedding_dim]
+        """
+        device = timesteps.device
+        half_dim: int = self.embedding_dim // 2
+        emb_rate: torch.Tensor = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+        emb_freq: torch.Tensor = torch.exp(torch.arange(half_dim, device=device, dtype=timesteps.dtype) * -emb_rate)
+        emb: torch.Tensor = timesteps.unsqueeze(1) * emb_freq.unsqueeze(0)  # [B, half_dim]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        if self.embedding_dim % 2 == 1:  # pad if odd
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+
+# Masked Multi-Head Self-Attention with integrated 2D RoPE
+class MaskedMHSA(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        """
+        Args:
+            hidden_size (int): The transformer hidden dimension.
+            num_heads (int): Number of attention heads.
+        """
+        super().__init__()
+        self.hidden_size: int = hidden_size
+        self.num_heads: int = num_heads
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads.")
+        self.d_head: int = hidden_size // num_heads
+
+        self.q_proj: nn.Linear = nn.Linear(hidden_size, hidden_size)
+        self.k_proj: nn.Linear = nn.Linear(hidden_size, hidden_size)
+        self.v_proj: nn.Linear = nn.Linear(hidden_size, hidden_size)
+        self.out_proj: nn.Linear = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (Tensor): Input tensor of shape [B, L, hidden_size].
+            positions (Tensor): Positional coordinates of shape [B, L, 2]; each token is (row, col).
+            mask (Tensor): Valid token mask of shape [B, L] with 1 for real tokens and 0 for padded tokens.
+        Returns:
+            Tensor: Output of the MHSA module with shape [B, L, hidden_size].
+        """
+        B, L, _ = x.shape
+        num_heads: int = self.num_heads
+        d_head: int = self.d_head
+
+        # Linear projections and reshape for multi-head attention:
+        q: torch.Tensor = self.q_proj(x)  # [B, L, hidden_size]
+        k: torch.Tensor = self.k_proj(x)
+        v: torch.Tensor = self.v_proj(x)
+
+        def reshape_for_heads(z: torch.Tensor) -> torch.Tensor:
+            # Reshape z from [B, L, hidden_size] to [B, num_heads, L, d_head]
+            return z.view(B, L, num_heads, d_head).transpose(1, 2)
+
+        q = reshape_for_heads(q)
+        k = reshape_for_heads(k)
+        v = reshape_for_heads(v)
+
+        # Apply 2D RoPE on q and k:
+        q = self._apply_2d_rope(q, positions)
+        k = self._apply_2d_rope(k, positions)
+
+        # Scaled dot-product attention:
+        scale: float = math.sqrt(d_head)
+        attn: torch.Tensor = torch.matmul(q, k.transpose(-2, -1)) / scale  # [B, num_heads, L, L]
+
+        # Create attention mask: valid tokens have 1, pads 0 -> padded positions set to -1e9.
+        attn_mask: torch.Tensor = (1 - mask.unsqueeze(1).unsqueeze(2)) * -1e9  # [B, 1, 1, L]
+        attn = attn + attn_mask
+        attn = F.softmax(attn, dim=-1)
+
+        out: torch.Tensor = torch.matmul(attn, v)  # [B, num_heads, L, d_head]
+        out = out.transpose(1, 2).contiguous().view(B, L, self.hidden_size)
+        out = self.out_proj(out)
+        return out
+
+    def _apply_2d_rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Apply 2D Rotary Positional Embedding to input tensor.
+        Args:
+            x (Tensor): Shape [B, num_heads, L, d_head].
+            positions (Tensor): Shape [B, L, 2] with (row, col) positions.
+        Returns:
+            Tensor: x after applying 2D RoPE, same shape as input.
+        """
+        B, num_heads, L, d_head = x.shape
+        if d_head % 2 != 0:
+            raise ValueError("d_head must be even for 2D RoPE.")
+        d_half: int = d_head // 2
+        # Split x into two halves for height and width dimensions.
+        x_h: torch.Tensor = x[:, :, :, :d_half]  # [B, num_heads, L, d_half]
+        x_w: torch.Tensor = x[:, :, :, d_half:]  # [B, num_heads, L, d_half]
+
+        # Compute rotary factors for each axis using corresponding positions.
+        sin_h, cos_h = self._compute_rotary_factors(positions[..., 0], d_half)
+        sin_w, cos_w = self._compute_rotary_factors(positions[..., 1], d_half)
+        # Expand rotary factors along head dimension.
+        sin_h, cos_h = sin_h.unsqueeze(1), cos_h.unsqueeze(1)  # [B, 1, L, d_half]
+        sin_w, cos_w = sin_w.unsqueeze(1), cos_w.unsqueeze(1)
+
+        x_h = self._apply_rotary_pos_emb(x_h, sin_h, cos_h)
+        x_w = self._apply_rotary_pos_emb(x_w, sin_w, cos_w)
+        # Concatenate the two halves back together.
+        return torch.cat([x_h, x_w], dim=-1)
+
+    def _compute_rotary_factors(self, pos: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute sinusoidal rotary factors for a given axis.
+        Args:
+            pos (Tensor): Positions for one axis, shape [B, L].
+            dim (int): Dimension for the axis part (must be even).
+        Returns:
+            Tuple[Tensor, Tensor]: sin and cos factors, both of shape [B, L, dim].
+        """
+        if dim % 2 != 0:
+            raise ValueError("dim must be even.")
+        d_pair: int = dim // 2
+        device = pos.device
+        dtype = pos.dtype
+        inv_freq: torch.Tensor = 1.0 / (10000 ** (torch.arange(0, d_pair, device=device, dtype=dtype) / d_pair))
+        # Compute outer product of positions and inverse frequencies:
+        theta: torch.Tensor = pos.unsqueeze(-1) * inv_freq.unsqueeze(0).unsqueeze(0)  # [B, L, d_pair]
+        sin_theta: torch.Tensor = torch.sin(theta)
+        cos_theta: torch.Tensor = torch.cos(theta)
+        # Interleave to obtain shape [B, L, 2*d_pair] == [B, L, dim]
+        sin_theta = sin_theta.repeat_interleave(2, dim=-1)
+        cos_theta = cos_theta.repeat_interleave(2, dim=-1)
+        return sin_theta, cos_theta
+
+    def _apply_rotary_pos_emb(self, x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the rotary transformation: x_rot = x * cos + rotate_half(x) * sin.
+        Args:
+            x (Tensor): Input tensor, shape [..., d] (d even).
+            sin (Tensor): Sinusoidal factors, same shape as x.
+            cos (Tensor): Cosine factors, same shape as x.
+        Returns:
+            Tensor: Transformed tensor, same shape as x.
+        """
+        # Rotate every two: split into even and odd parts and then interleave.
+        x1: torch.Tensor = x[..., ::2]
+        x2: torch.Tensor = x[..., 1::2]
+        # Compute rotated pair:
+        x_rotated: torch.Tensor = torch.cat([-x2, x1], dim=-1)
+        return x * cos + x_rotated * sin
+
+
+# SwiGLU-based Feed-Forward Network Block
+class SwiGLUBlock(nn.Module):
+    def __init__(self, hidden_size: int, ffn_hidden_size: int) -> None:
+        """
+        Args:
+            hidden_size (int): Input and output dimension.
+            ffn_hidden_size (int): Hidden dimension for the FFN (typically 4x hidden_size).
+        """
+        super().__init__()
+        self.fc1: nn.Linear = nn.Linear(hidden_size, ffn_hidden_size * 2)  # To produce gating and activation parts.
+        self.fc2: nn.Linear = nn.Linear(ffn_hidden_size, hidden_size)
+        self.activation = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (Tensor): Input tensor of shape [B, L, hidden_size].
+        Returns:
+            Tensor: Output tensor of shape [B, L, hidden_size].
+        """
+        x_proj: torch.Tensor = self.fc1(x)  # [B, L, 2 * ffn_hidden_size]
+        x1, x2 = x_proj.chunk(2, dim=-1)  # Each of shape [B, L, ffn_hidden_size]
+        x_gate: torch.Tensor = self.activation(x1) * x2
+        return self.fc2(x_gate)
+
+
+# A single Transformer Block with Masked MHSA and SwiGLU-based FFN
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, ffn_hidden_size: int) -> None:
+        """
+        Args:
+            hidden_size (int): Transformer hidden dimension.
+            num_heads (int): Number of attention heads.
+            ffn_hidden_size (int): Hidden dimension for the FFN.
+        """
+        super().__init__()
+        self.norm1: nn.LayerNorm = nn.LayerNorm(hidden_size)
+        self.attn: MaskedMHSA = MaskedMHSA(hidden_size, num_heads)
+        self.norm2: nn.LayerNorm = nn.LayerNorm(hidden_size)
+        self.ffn: SwiGLUBlock = SwiGLUBlock(hidden_size, ffn_hidden_size)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (Tensor): Input tokens of shape [B, L, hidden_size].
+            positions (Tensor): Positional coordinates of shape [B, L, 2].
+            mask (Tensor): Valid token mask of shape [B, L].
+        Returns:
+            Tensor: Output tokens of shape [B, L, hidden_size].
+        """
+        x_attn: torch.Tensor = self.attn(self.norm1(x), positions, mask)
+        x = x + x_attn  # Residual connection
+        x_ffn: torch.Tensor = self.ffn(self.norm2(x))
+        x = x + x_ffn  # Residual connection
+        return x
+
+
+# Main Model class implementing the FiT architecture.
+class Model(nn.Module):
+    def __init__(self, params: Dict[str, Any]) -> None:
+        """
+        Initialize the FiT model with the provided configuration parameters.
+        Args:
+            params (dict): Configuration parameters (loaded from config.yaml).
+        """
+        super().__init__()
+        self.config: Dict[str, Any] = params
+
+        # Model configuration:
+        model_cfg: Dict[str, Any] = self.config.get("model", {})
+        self.patch_size: int = model_cfg.get("patch_size", 2)
+        self.max_token_length: int = model_cfg.get("max_token_length", 256)
+
+        transformer_cfg: Dict[str, Any] = model_cfg.get("transformer", {})
+        self.hidden_size: int = transformer_cfg.get("hidden_size", 768)
+        self.num_heads: int = transformer_cfg.get("num_heads", 12)
+        self.num_layers: int = transformer_cfg.get("num_layers", 12)
+        self.ffn_hidden_size: int = transformer_cfg.get("ffn_hidden_size", self.hidden_size * 4)
+        self.time_embed_dim: int = transformer_cfg.get("time_embed_dim", self.hidden_size)
+
+        # Time embedding module for diffusion conditioning:
+        self.time_embed_layer: nn.Sequential = nn.Sequential(
+            SinusoidalPositionEmbeddings(self.time_embed_dim),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.time_embed_dim, self.hidden_size)
+        )
+
+        # Stack transformer blocks:
+        self.transformer_blocks: nn.ModuleList = nn.ModuleList([
+            TransformerBlock(self.hidden_size, self.num_heads, self.ffn_hidden_size)
+            for _ in range(self.num_layers)
+        ])
+        self.norm_out: nn.LayerNorm = nn.LayerNorm(self.hidden_size)
+        self.output_proj: nn.Linear = nn.Linear(self.hidden_size, self.hidden_size)
+
+        # Pretrained VAE placeholders (encoder and decoder)
+        self.vae_encoder: nn.Module = None
+        self.vae_decoder: nn.Module = None
+
+        # Load pretrained VAE if the path is provided in configuration.
+        pretrained_vae_path: str = model_cfg.get("pretrained_vae", "")
+        if pretrained_vae_path:
+            self.load_pretrained_vae(pretrained_vae_path)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the FiT model.
+        Args:
+            x (Tensor): Input image tensor of shape [B, C, H, W].
+            t (Tensor): Diffusion-conditioning tensor (e.g., timesteps) of shape [B] (or similar).
+        Returns:
+            Tensor: Predicted denoised latent tokens of shape [B, L_max, hidden_size].
+        """
+        if self.vae_encoder is None:
+            raise ValueError("Pretrained VAE encoder not loaded. Please call load_pretrained_vae().")
+
+        # Encode the input image via the pretrained VAE encoder.
+        latent: torch.Tensor = self.vae_encoder(x)
+        # Patchify the latent representation and pad token sequences.
+        tokens, mask, positions = self._patchify_and_pad(latent)
+        # If dimensionality does not match hidden_size, project tokens.
+        if tokens.shape[-1] != self.hidden_size:
+            proj_layer: nn.Linear = nn.Linear(tokens.shape[-1], self.hidden_size).to(tokens.device)
+            tokens = proj_layer(tokens)
+        # Incorporate diffusion-conditioning via time embedding.
+        time_emb: torch.Tensor = self.time_embed_layer(t)  # Shape: [B, hidden_size]
+        tokens = tokens + time_emb.unsqueeze(1)  # Broadcast to add to each token.
+
+        # Pass tokens through the transformer blocks.
+        for block in self.transformer_blocks:
+            tokens = block(tokens, positions, mask)
+        tokens = self.norm_out(tokens)
+        tokens = self.output_proj(tokens)
+        # Tokens represent the predicted denoised latent representations.
+        return tokens
+
+    def load_pretrained_vae(self, vae_path: str) -> None:
+        """
+        Load the pretrained VAE from the provided path.
+        Sets self.vae_encoder and self.vae_decoder.
+        Args:
+            vae_path (str): Path or identifier for the pretrained VAE.
+        Note:
+            For demonstration purposes, this function instantiates dummy VAE encoder/decoder models.
+            In a production setting, replace these with proper VAE loading (e.g., from Hugging Face).
+        """
+        # Dummy implementations as placeholders.
+        self.vae_encoder = DummyVAEEncoder()
+        self.vae_decoder = DummyVAEDecoder()
+
+    def _patchify_and_pad(self, latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Patchify the latent representation (from VAE encoder) using the given patch size, then pad
+        the resulting token sequence to max_token_length.
+        
+        Args:
+            latent (Tensor): Latent representation of shape [B, C, H, W].
+        Returns:
+            tokens (Tensor): Padded token sequences of shape [B, L_max, token_dim].
+            mask (Tensor): Valid token mask of shape [B, L_max] (1 for real tokens, 0 for padding).
+            positions (Tensor): Positional coordinates of shape [B, L_max, 2], with (row, col) for each token.
+        """
+        B, C, H, W = latent.shape
+        patch_size: int = self.patch_size
+        # Adjust H and W to be divisible by patch_size.
+        new_H: int = H - (H % patch_size)
+        new_W: int = W - (W % patch_size)
+        latent = latent[:, :, :new_H, :new_W]
+        num_patches_h: int = new_H // patch_size
+        num_patches_w: int = new_W // patch_size
+        total_tokens: int = num_patches_h * num_patches_w
+
+        # Patchify: reshape latent to tokens.
+        tokens: torch.Tensor = latent.reshape(B, C, num_patches_h, patch_size, num_patches_w, patch_size)
+        tokens = tokens.permute(0, 2, 4, 1, 3, 5)  # [B, num_patches_h, num_patches_w, C, patch_size, patch_size]
+        tokens = tokens.reshape(B, total_tokens, -1)  # [B, total_tokens, C * patch_size * patch_size]
+        token_dim: int = tokens.shape[-1]
+        L_max: int = self.max_token_length
+
+        # Pad tokens if total_tokens < L_max; truncate if greater.
+        if total_tokens < L_max:
+            pad_length: int = L_max - total_tokens
+            pad_tokens: torch.Tensor = torch.zeros(B, pad_length, token_dim, device=latent.device, dtype=latent.dtype)
+            tokens = torch.cat([tokens, pad_tokens], dim=1)
+            mask: torch.Tensor = torch.cat([torch.ones(B, total_tokens, device=latent.device),
+                                              torch.zeros(B, pad_length, device=latent.device)], dim=1)
+        else:
+            tokens = tokens[:, :L_max, :]
+            mask = torch.ones(B, L_max, device=latent.device)
+        # Compute positional coordinates for valid tokens.
+        positions: torch.Tensor = torch.zeros(B, L_max, 2, device=latent.device, dtype=torch.float)
+        grid_h: torch.Tensor = torch.arange(num_patches_h, device=latent.device, dtype=torch.float)
+        grid_w: torch.Tensor = torch.arange(num_patches_w, device=latent.device, dtype=torch.float)
+        grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing="ij")
+        grid: torch.Tensor = torch.stack([grid_h, grid_w], dim=-1).reshape(-1, 2)  # [total_tokens, 2]
+        valid_tokens: int = min(total_tokens, L_max)
+        positions[:, :valid_tokens, :] = grid[:valid_tokens]
+        return tokens, mask, positions
+
+
+# Dummy VAE Encoder (placeholder)
+class DummyVAEEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # Simple convolutional network to simulate encoding.
+        self.conv: nn.Sequential = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1),  # Downsample by factor 2.
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=4, stride=2, padding=1),  # Downsample by factor 2.
+            nn.ReLU()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)  # Expected output shape: [B, 64, H/4, W/4]
+
+
+# Dummy VAE Decoder (placeholder)
+class DummyVAEDecoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # Simple deconvolutional network to simulate decoding.
+        self.deconv: nn.Sequential = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid()  # Output values in [0, 1]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.deconv(x)
+
+
+# For testing this module independently.
+if __name__ == "__main__":
+    import yaml
+
+    CONFIG_PATH: str = "config.yaml"
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r") as config_file:
+            config: Dict[str, Any] = yaml.safe_load(config_file)
+    else:
+        # Default configuration if config.yaml is not found.
+        config = {
+            "model": {
+                "patch_size": 2,
+                "max_token_length": 256,
+                "transformer": {
+                    "hidden_size": 768,
+                    "num_heads": 12,
+                    "num_layers": 6,
+                    "ffn_hidden_size": 3072,
+                    "time_embed_dim": 768,
+                    "positional_embedding": "2D RoPE",
+                    "attention": "Masked MHSA",
+                    "ffn": "SwiGLU"
+                },
+                "pretrained_vae": ""
+            }
+        }
+    # Instantiate the Model.
+    model_instance: Model = Model(config)
+    # Create dummy input: batch size 2, 3-channel, 256x256 images.
+    dummy_input: torch.Tensor = torch.randn(2, 3, 256, 256)
+    # Dummy diffusion-conditioning timesteps.
+    dummy_timesteps: torch.Tensor = torch.randint(0, 1000, (2,))
+    output_tokens: torch.Tensor = model_instance(dummy_input, dummy_timesteps)
+    print("Output tokens shape:", output_tokens.shape)
+```

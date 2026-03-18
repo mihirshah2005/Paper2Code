@@ -1,0 +1,240 @@
+"""main.py
+
+This is the main entry point for executing experiments as described in the CurBench paper.
+It loads the configuration, sets reproducibility seeds, loads data, builds the model,
+initializes the curriculum scheduler, trains the model with curriculum learning, and
+evaluates the final model. The experiments are repeated over multiple seeds, and the
+results are aggregated and logged.
+
+Usage:
+    python main.py
+"""
+
+import os
+import sys
+import time
+import random
+import logging
+import numpy as np
+import torch
+
+# Import project modules
+from config import Config
+from dataset_loader import DatasetLoader
+from model import ModelManager
+from curriculum import SelfPacedScheduler, TeacherGuidedScheduler, LossReweightingScheduler
+from trainer import Trainer
+from evaluation import Evaluation
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("main")
+
+
+def set_global_seeds(seed: int) -> None:
+    """Sets the random seeds for random, numpy, torch and torch.cuda if available.
+
+    Args:
+        seed (int): The seed value to set.
+    """
+    try:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        logger.info(f"Global seeds set to {seed}.")
+    except Exception as e:
+        logger.error("Error setting global seeds.", exc_info=True)
+        raise e
+
+
+def get_domain_and_num_classes(dataset_name: str) -> (str, int):
+    """
+    Infers the domain and number of classes from the dataset identifier.
+
+    Args:
+        dataset_name (str): The dataset identifier (e.g., "cifar10", "rte", etc.)
+
+    Returns:
+        tuple: (domain, num_classes) where domain is one of "cv", "nlp", "graph"
+               and num_classes is an integer.
+    """
+    dataset_name_lower = dataset_name.strip().lower()
+    if dataset_name_lower in ["cifar10"]:
+        return "cv", 10
+    elif dataset_name_lower in ["cifar100"]:
+        return "cv", 100
+    elif dataset_name_lower in ["tinyimagenet"]:
+        return "cv", 200
+    elif dataset_name_lower in ["rte", "mrpc", "stsb", "cola", "sst2", "qnli", "qqp", "mnli"]:
+        # Many GLUE tasks are binary or multi-class; here we assume 2 classes for simplicity.
+        return "nlp", 2
+    elif dataset_name_lower in ["ogbg-molhiv", "mutag", "proteins", "nci1"]:
+        # Graph datasets typically are binary classification in this benchmark.
+        return "graph", 2
+    else:
+        logger.warning(f"Dataset '{dataset_name_lower}' not explicitly handled; defaulting to 'cv' with 10 classes.")
+        return "cv", 10
+
+
+def get_model_name(config: dict, domain: str) -> str:
+    """
+    Retrieves the model name from the configuration based on the domain.
+    For CV and Graph domains, the first model in the list is selected.
+    For NLP, the transformer models are preferred if available; otherwise, fallback to LSTM.
+
+    Args:
+        config (dict): The experiment configuration.
+        domain (str): One of "cv", "nlp", or "graph".
+
+    Returns:
+        str: The model name to be used.
+    """
+    try:
+        if domain == "cv":
+            models_list = config.get("training", {}).get("cv", {}).get("models", ["LeNet"])
+            model_name = models_list[0]
+        elif domain == "graph":
+            models_list = config.get("training", {}).get("graph", {}).get("models", ["GCN"])
+            model_name = models_list[0]
+        elif domain == "nlp":
+            # Prefer transformer models if available, else fallback to LSTM.
+            nlp_config = config.get("training", {}).get("nlp", {})
+            if "transformer" in nlp_config and "models" in nlp_config.get("transformer", {}):
+                models_list = nlp_config["transformer"]["models"]
+                model_name = models_list[0]
+            elif "lstm" in nlp_config and "model" in nlp_config.get("lstm", {}):
+                model_name = nlp_config["lstm"]["model"]
+            else:
+                model_name = "LSTM"
+        else:
+            # Default fallback
+            model_name = "LeNet"
+        logger.info(f"Selected model name for domain '{domain}': {model_name}")
+        return model_name
+    except Exception as e:
+        logger.error("Error retrieving model name from configuration.", exc_info=True)
+        raise e
+
+
+def aggregate_results(results_list: list) -> dict:
+    """
+    Aggregates evaluation results across multiple seeds by computing the mean and standard deviation.
+
+    Args:
+        results_list (list): List of dictionaries containing evaluation results for each seed.
+
+    Returns:
+        dict: A dictionary with aggregated metrics (mean and std).
+    """
+    if not results_list:
+        return {}
+    aggregated = {}
+    keys = results_list[0].keys()
+    for key in keys:
+        values = [res.get(key, float('nan')) for res in results_list]
+        mean_val = np.mean(values)
+        std_val = np.std(values)
+        aggregated[key] = {"mean": mean_val, "std": std_val}
+    return aggregated
+
+
+def main() -> None:
+    """Main function for running the experiment over multiple seeds."""
+    try:
+        # Load configuration from config.yaml
+        config_obj = Config("config.yaml")
+        config_dict = config_obj.config
+        logger.info("Configuration loaded successfully.")
+
+        # Retrieve curriculum update frequency; default to "batch" if not provided.
+        curriculum_config = config_dict.get("curriculum", {})
+        update_frequency = curriculum_config.get("update_frequency", "batch")
+        logger.info(f"Curriculum update frequency set to '{update_frequency}' (default 'batch' if not specified).")
+
+        # Get reproducibility seeds from configuration
+        reproducibility = config_dict.get("reproducibility", {})
+        seeds_list = reproducibility.get("seeds", [42])
+        logger.info(f"Running experiments with seeds: {seeds_list}")
+
+        # Retrieve dataset identifier from config (default "cifar10")
+        dataset_identifier = config_dict.get("dataset", "cifar10")
+        domain, num_classes = get_domain_and_num_classes(dataset_identifier)
+        dataset_props = {"num_classes": num_classes}
+
+        # Obtain model name based on domain from configuration
+        model_name = get_model_name(config_dict, domain)
+
+        # List to store evaluation results over seeds
+        all_results = []
+        all_seed_details = []
+
+        for seed in seeds_list:
+            logger.info(f"----- Starting experiment with seed: {seed} -----")
+            try:
+                # Set all global seeds for reproducibility
+                set_global_seeds(seed)
+
+                # Instantiate and load dataset
+                dataset_loader = DatasetLoader(config_dict)
+                data_splits = dataset_loader.load_data()
+                if not data_splits:
+                    logger.error("Data splits could not be loaded. Skipping seed: %s", seed)
+                    continue
+
+                # Instantiate ModelManager with configuration, domain, model name, and dataset properties
+                model_manager = ModelManager(config_dict, domain, model_name, dataset_props)
+                model = model_manager.build_model()
+                logger.info("Model built successfully.")
+
+                # Instantiate curriculum scheduler.
+                # Default to SelfPacedScheduler; if needed, other schedulers (e.g., TeacherGuidedScheduler) can be chosen.
+                curriculum = SelfPacedScheduler(config_dict)
+                logger.info("Curriculum scheduler instantiated using SelfPacedScheduler.")
+
+                # Instantiate Trainer with model, data, curriculum scheduler, and config.
+                trainer = Trainer(model, data_splits, curriculum, config_dict)
+                logger.info("Trainer initialized; beginning training...")
+                train_start_time = time.time()
+                trained_model = trainer.train()
+                train_duration = time.time() - train_start_time
+                logger.info(f"Training completed in {train_duration:.2f} seconds for seed {seed}.")
+
+                # Evaluate the trained model.
+                evaluator = Evaluation(trained_model, data_splits, config_dict)
+                eval_results = evaluator.evaluate()
+                logger.info(f"Evaluation results for seed {seed}: {eval_results}")
+
+                # Attach training duration to evaluation results.
+                eval_results["training_time_sec"] = train_duration
+
+                # Store individual seed results.
+                all_results.append(eval_results)
+                all_seed_details.append({"seed": seed, "results": eval_results})
+            except Exception as e:
+                logger.error(f"Exception encountered for seed {seed}. Skipping this run.", exc_info=True)
+                continue
+
+        if not all_results:
+            logger.error("No successful runs were completed. Exiting.")
+            sys.exit(1)
+
+        # Aggregate results across seeds.
+        aggregated_results = aggregate_results(all_results)
+        logger.info("----- Aggregated Evaluation Results (Mean and Std) -----")
+        for metric, stats in aggregated_results.items():
+            logger.info(f"{metric}: Mean = {stats['mean']:.4f}, Std = {stats['std']:.4f}")
+
+        logger.info("Experiment completed successfully over all seeds.")
+    except Exception as main_e:
+        logger.error("Fatal error in main experiment loop.", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

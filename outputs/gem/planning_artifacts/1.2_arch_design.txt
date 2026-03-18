@@ -1,0 +1,100 @@
+----------------------------------------
+[Implementation approach]
+We will implement a simple Python software system, leveraging open-source libraries such as PyTorch, NumPy, SciPy, and NetworkX/PyG for graph handling and eigen-decomposition. The system will load a selected graph dataset, compute the normalized Laplacian and its truncated eigen-decomposition, initialize synthetic node features and an eigenbasis, and then perform alternating updates on the synthetic eigenbasis and node features via a composite loss (eigenbasis matching loss, discrimination constraint loss, and orthogonality regularization). Finally, the system will reconstruct the synthetic graph structure and evaluate the performance by training various GNN architectures on the distilled synthetic graph. The system architecture is kept modular with separate components for dataset loading, model definition, training, and evaluation.
+
+----------------------------------------
+[File list]
+- main.py
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+
+----------------------------------------
+[Data structures and interfaces]
+```mermaid
+classDiagram
+    class Main {
+        +__init__(config: dict)
+        +run_experiment() : None
+    }
+    class DatasetLoader {
+        +__init__(config: dict)
+        +load_data() : GraphData
+    }
+    class GraphData {
+        +adjacency: np.ndarray
+        +node_features: np.ndarray
+        +labels: np.ndarray
+        +laplacian: np.ndarray
+        +eigenvalues: np.ndarray
+        +eigenvectors: np.ndarray
+    }
+    class Model {
+        +__init__(params: dict)
+        +forward(x: torch.Tensor) : torch.Tensor
+        +compute_loss(real_eigen: torch.Tensor, synthetic_eigen: torch.Tensor, real_cat_repr: torch.Tensor, synthetic_cat_repr: torch.Tensor) : torch.Tensor
+        +update_eigenbasis(gradients: torch.Tensor) : None
+        +update_features(gradients: torch.Tensor) : None
+        +reconstruct_graph() : tuple
+    }
+    class Trainer {
+        +__init__(model: Model, data: GraphData, config: dict)
+        +train() : None
+    }
+    class Evaluation {
+        +__init__(model: Model, data: GraphData, eval_config: dict)
+        +evaluate() : dict
+    }
+
+    Main --> DatasetLoader
+    Main --> Trainer
+    Main --> Evaluation
+    Trainer --> Model
+    Trainer --> GraphData
+    Evaluation --> Model
+    Evaluation --> GraphData
+```
+
+----------------------------------------
+[Program call flow]
+```mermaid
+sequenceDiagram
+    participant M as Main
+    participant DL as DatasetLoader
+    participant GD as GraphData
+    participant MD as Model
+    participant TR as Trainer
+    participant EV as Evaluation
+
+    M->>DL: __init__(config)
+    M->>DL: load_data()
+    DL-->>M: return GD
+    M->>MD: __init__(params)
+    M->>TR: __init__(model=MD, data=GD, config)
+    TR->>MD: forward(x)  // during training loop
+    MD-->>TR: predictions
+    TR->>MD: compute_loss(real_eigen, synthetic_eigen, real_cat_repr, synthetic_cat_repr)
+    MD-->>TR: loss
+    TR->>MD: update_eigenbasis(grad)
+    TR->>MD: update_features(grad)
+    loop for each epoch
+        TR->>MD: Alternating update steps (tau1, tau2)
+    end
+    TR-->>M: training complete
+    M->>EV: __init__(model=MD, data=GD, eval_config)
+    M->>EV: evaluate()
+    EV->>MD: forward(x) for evaluation
+    MD-->>EV: predictions
+    EV-->>M: return evaluation metrics
+```
+
+----------------------------------------
+[Anything UNCLEAR]
+The exact mathematical formulations and implementations of the loss components (especially L_e for eigenbasis matching and L_d for discrimination constraint) are not fully specified in the paper. Clarification is needed on:
+1. The precise formulation and weighting of the eigenbasis matching loss (L_e): how to compare the real and synthetic eigenbasis (e.g., comparing projection matrices) in detail.
+2. The exact method to compute the category-level representations for the discrimination constraint (L_d).
+3. The detailed algorithm for initializing the synthetic eigenbasis (using a stochastic block model or random orthogonal initialization).
+4. The values and scheduling of alternating updates (tau1, tau2) and how many epochs are recommended per dataset.
+5. The dataset format expected by the DatasetLoader (file formats, parsing details, etc.).
+

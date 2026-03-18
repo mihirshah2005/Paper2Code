@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is my plain‐text critique of the analysis, including the functions or components affected along with an estimate of the severity of each issue:\n\n1. Configuration Handling and Defaults  \n • The analysis does a good job of explaining how configuration should be loaded and validated. However, it says “raise a descriptive error or fallback to a default if defined” when keys are missing. This fallback option is not clearly defined. Using defaults without an explicit warning could silently mask ",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is my plain‐text critique of the analysis, including the functions or components affected along with an estimate of the severity of each issue:\n\n1. Configuration Handling and Defaults  \n • The analysis does a good job of explaining how configuration should be loaded and validated. However, it says “raise a descriptive error or fallback to a default if defined” when keys are missing. This fallback option is not clearly defined. Using defaults without an explicit warning could silently mask ",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

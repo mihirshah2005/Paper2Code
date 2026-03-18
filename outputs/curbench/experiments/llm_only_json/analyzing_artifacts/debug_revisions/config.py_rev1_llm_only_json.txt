@@ -1,0 +1,66 @@
+Below is the detailed logic analysis for config.py. This file is responsible for reading the configuration parameters from the YAML file (config.yaml) and making them available in a unified Python dictionary (or via getter methods). All other modules will import and use this configuration so that hyperparameters, training settings, and curriculum-specific options remain consistent across the project.
+
+────────────────────────────
+1. Initialization and File Loading
+
+• The Config class should be designed so that it takes an optional file path (defaulting to "config.yaml").  
+• It uses a YAML parser (for instance, the PyYAML library) to read the configuration file and parse its content into a Python dictionary.  
+• If the configuration file is not found or is malformed, the class should raise an explicit error or log a clear message.
+
+────────────────────────────
+2. Internal Data Structure and Storage
+
+• Once the YAML file is loaded, the resulting dictionary will include nested keys such as “training”, “curriculum”, “reproducibility”, and “evaluation”.  
+• The Config class will store this dictionary (e.g., in an attribute self.config) and provide access to the different sections when requested.  
+• It is important that no data is modified inadvertently—this dictionary serves as the single source of truth for experiment parameters.
+
+────────────────────────────
+3. Accessibility and Getter Methods
+
+• The class should expose a method (for example, load() or get_config()) so that any module (trainer.py, dataset_loader.py, model.py, etc.) can simply call it to get the configuration dictionary.  
+• Optionally, for clarity in the code, the Config class may provide helper methods such as:
+  – get_training_config(domain: str): Returns the training settings for a given domain (e.g., “cv”, “nlp”, “graph”).  
+  – get_curriculum_params(): Returns the curriculum learning hyperparameters (even if many values are placeholders, these will be passed on for further tuning).  
+  – get_reproducibility_seeds(): Returns the list of seeds defined in the configuration.
+
+────────────────────────────
+4. Validating and Default Handling
+
+• Since the YAML configuration defines keys such as “warmup_epochs”, “schedule_epochs”, and “growth_rate” under curriculum (which are set to null in the file), the Config class should convert these YAML null values to Python’s None.  
+• If there are missing keys or values, the class might either set a default or log a warning, depending on the design choice.  
+• For example, the “training” section is subdivided into “cv”, “nlp” (with LSTM and transformer subkeys) and “graph” sections. The Config class should ensure that these sub-dictionaries are present so that subsequent modules can extract parameters like batch_size, optimizer type (e.g., "Adam" for CV, "AdamW" for transformer models), learning rates, and epochs.
+
+────────────────────────────
+5. Reproducibility and Shared Knowledge
+
+• Under the “reproducibility” section we have the seeds which are crucial for ensuring that all runs (in trainer.py and elsewhere) are repeatable.  
+• The Config class should guarantee that this list is accessible across modules so that the Trainer module can loop over different seeds (42, 666, 777, 888, 999), resetting randomness accordingly.
+  
+────────────────────────────
+6. Usage Consistency Across Modules
+
+• All modules (from dataset_loader.py, model.py, curriculum.py, trainer.py to evaluation.py) need to import the Config class to access experimental settings:  
+  – For example, dataset_loader.py will use the “training” section to decide on batch sizes and to know if noise or imbalance settings should be applied.  
+  – The model.py module will use the “training” section along with domain-specific information to build the appropriate architecture (e.g., selecting “ResNet-18” for CV models, “BERT” for NLP tasks, etc.).  
+  – The curriculum.py module will import the “curriculum” section so that hyperparameters (like warmup epochs) are consistently used in the curriculum scheduling logic.
+
+────────────────────────────
+7. Error Handling and Logging
+
+• In cases where a configuration key is missing or if the file cannot be parsed, error handling should be implemented through exceptions or logging—this will help in debugging and ensuring that all parameters are in place.  
+• A logging statement (or print statement during development) may be included to confirm that the configuration has been successfully loaded and parsed.
+
+────────────────────────────
+8. Summary of the Workflow in config.py
+
+a) Constructor (__init__) accepts an optional file path (default: "config.yaml").  
+b) Within the constructor, the YAML file is read and parsed into a dictionary.  
+c) The parsed dictionary is stored in an attribute (e.g., self.config).  
+d) The class provides one or more public methods (such as load(), get_config(), or domain-specific getters) to allow other modules to retrieve the necessary hyperparameters, training settings, curriculum parameters, and reproducibility seeds.  
+e) The class performs minimal validation (ensuring that keys like “training”, “curriculum”, “reproducibility”, and “evaluation” exist) so that subsequent modules can rely on these settings without ambiguity.
+
+────────────────────────────
+Final Remarks
+
+This analysis is intended to guide the implementation of the Config class in config.py. By carefully structuring configuration loading and ensuring that all modules use the same settings, we support consistency, clarity, and reproducibility of the experiments described in the CurBench paper. This serves as the backbone for the remaining modules to correctly implement their parts of the benchmarking pipeline.
+

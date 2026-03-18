@@ -1,0 +1,275 @@
+"""
+evaluation.py
+
+This module implements the Evaluation class following the GDEM evaluation protocol.
+The Evaluation class takes a distilled synthetic graph from the trained Model,
+trains standard GNN architectures on the synthetic graph, and then evaluates their
+node classification performance on the real graph's test set.
+
+Required packages:
+    numpy==1.21.0
+    torch==1.9.0
+    scipy==1.7.0
+    networkx==2.6.3
+
+Design:
+    - Evaluation.__init__() saves references to the Model (which holds the learned synthetic
+      eigenbasis and synthetic node features), GraphData (loaded via DatasetLoader), and evaluation
+      configuration (from config.yaml).
+    - Evaluation.evaluate() calls model.reconstruct_graph() to obtain the distilled synthetic graph,
+      then for each evaluation architecture (e.g. "GCN", "SGC", "PPNP", "ChebyNet", "BernNet", "GPR-GNN"),
+      it trains a lightweight GNN (here implemented as SimpleGCN) on the synthetic data over a fixed number
+      of epochs and finally tests on a synthetic split of the real graph.
+    - The evaluation is repeated for multiple runs as per configuration and returns average accuracy and variance.
+    
+The module defines a simple GCN (SimpleGCN) to be used as a placeholder for all evaluated architectures.
+"""
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from typing import Any, Dict, Tuple
+
+# Import Model and GraphData from the respective modules.
+from model import Model
+from dataset_loader import GraphData
+
+# =============================================================================
+# Simple GCN for Evaluation
+# =============================================================================
+class SimpleGCN(nn.Module):
+    """
+    A simple 2-layer Graph Convolutional Network (GCN) for evaluation.
+    This network uses symmetric normalization of the adjacency matrix.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, n_layers: int = 2) -> None:
+        super(SimpleGCN, self).__init__()
+        self.n_layers = n_layers
+        self.layers = nn.ModuleList()
+        if n_layers == 2:
+            self.layers.append(nn.Linear(input_dim, hidden_dim))
+            self.layers.append(nn.Linear(hidden_dim, num_classes))
+        else:
+            self.layers.append(nn.Linear(input_dim, hidden_dim))
+            for _ in range(n_layers - 2):
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+            self.layers.append(nn.Linear(hidden_dim, num_classes))
+
+    def forward(self, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        A_norm = self.normalize_adj(A)
+        h = X
+        for i, layer in enumerate(self.layers):
+            h = torch.matmul(A_norm, h)  # Message passing step using normalized adjacency.
+            h = layer(h)
+            if i < len(self.layers) - 1:
+                h = F.relu(h)
+        return h
+
+    def normalize_adj(self, A: torch.Tensor) -> torch.Tensor:
+        """Symmetric normalization: A_hat = D^(-0.5) (A + I) D^(-0.5)."""
+        I = torch.eye(A.size(0), device=A.device)
+        A_hat = A + I
+        D = torch.sum(A_hat, dim=1)
+        D_inv_sqrt = torch.pow(D, -0.5)
+        D_inv_sqrt[torch.isinf(D_inv_sqrt)] = 0.0
+        D_inv_sqrt = torch.diag(D_inv_sqrt)
+        return D_inv_sqrt @ A_hat @ D_inv_sqrt
+
+# =============================================================================
+# Evaluation Class
+# =============================================================================
+class Evaluation:
+    """
+    Evaluation class implements the evaluation protocol.
+    It trains standard GNN architectures on the distilled synthetic graph and evaluates
+    the trained models on the real graph's test set.
+    
+    Attributes:
+        model (Model): Trained synthetic graph distillation model.
+        data (GraphData): Real graph data (adjacency, node features, labels, etc.).
+        eval_config (dict): Configuration dictionary from config.yaml.
+    """
+    def __init__(self, model: Model, data: GraphData, eval_config: Dict[str, Any]) -> None:
+        """
+        Initialize the Evaluation instance.
+        
+        Args:
+            model (Model): An instance of Model from model.py.
+            data (GraphData): An instance of GraphData from dataset_loader.py.
+            eval_config (dict): Evaluation configuration parameters.
+        """
+        self.model: Model = model
+        self.data: GraphData = data
+        self.eval_config: Dict[str, Any] = eval_config
+
+        # Number of independent runs for evaluation.
+        self.num_runs: int = int(eval_config.get("training", {}).get("num_runs", 10))
+        # Evaluation training hyperparameters (defaults provided if not in config)
+        self.eval_epochs: int = int(eval_config.get("evaluation", {}).get("epochs", 200))
+        self.eval_lr: float = float(eval_config.get("evaluation", {}).get("learning_rate", 0.01))
+        # Evaluation architecture settings for spatial and spectral GNNs.
+        self.spatial_config: Dict[str, Any] = eval_config.get("evaluation", {}).get("gnn", {}).get("spatial", {"n_layers": 2, "hidden_units": 256})
+        self.spectral_config: Dict[str, Any] = eval_config.get("evaluation", {}).get("gnn", {}).get("spectral", {"polynomial_order": 10, "hidden_units": 256})
+        # List of GNN architectures to evaluate.
+        self.architectures = ["GCN", "SGC", "PPNP", "ChebyNet", "BernNet", "GPR-GNN"]
+
+    def evaluate(self) -> Dict[str, Dict[str, float]]:
+        """
+        Evaluate cross-architecture performance.
+        
+        Returns:
+            dict: A dictionary mapping each evaluated architecture's name to its
+                  average accuracy and standard deviation on the real test set.
+        """
+        device: torch.device = self.model.device
+        # Reconstruct the synthetic graph using the learned synthetic eigenbasis.
+        # Use the first K eigenvalues from the real graph as the replicated spectrum.
+        K: int = self.model.K
+        real_eigenvalues_np: np.ndarray = self.data.eigenvalues[:K]
+        real_eigenvalues: torch.Tensor = torch.tensor(real_eigenvalues_np, dtype=torch.float32, device=device)
+        A_syn, X_syn = self.model.reconstruct_graph(real_eigenvalues=real_eigenvalues)
+        # A_syn: synthetic adjacency matrix, X_syn: synthetic node features.
+
+        # Prepare synthetic labels (Y_syn) from the real graph labels.
+        # Here we assume that the synthetic graph's nodes inherit labels from the first N_syn nodes.
+        N_syn: int = self.data.synthetic_size
+        Y_syn_np: np.ndarray = self.data.labels[:N_syn]
+        Y_syn: torch.Tensor = torch.tensor(Y_syn_np, dtype=torch.long, device=device)
+
+        # Prepare the real graph for evaluation.
+        A_real_np: np.ndarray = self.data.adjacency  # Full real graph adjacency matrix.
+        X_real_np: np.ndarray = self.data.node_features  # Full real graph node features.
+        Y_real_np: np.ndarray = self.data.labels  # Real graph labels.
+        N_real: int = A_real_np.shape[0]
+        A_real: torch.Tensor = torch.tensor(A_real_np, dtype=torch.float32, device=device)
+        X_real: torch.Tensor = torch.tensor(X_real_np, dtype=torch.float32, device=device)
+        Y_real: torch.Tensor = torch.tensor(Y_real_np, dtype=torch.long, device=device)
+
+        # Create a test split for the real graph.
+        indices: np.ndarray = np.arange(N_real)
+        np.random.seed(42)
+        np.random.shuffle(indices)
+        train_split: int = int(0.6 * N_real)
+        val_split: int = int(0.8 * N_real)
+        test_idx: torch.Tensor = torch.tensor(indices[val_split:], dtype=torch.long, device=device)
+
+        results: Dict[str, Dict[str, float]] = {}
+
+        # Evaluate each architecture.
+        for arch_name in self.architectures:
+            acc_list = []
+            for run in range(self.num_runs):
+                # Determine architecture parameters based on type.
+                if arch_name in ["GCN", "SGC", "PPNP"]:
+                    n_layers: int = int(self.spatial_config.get("n_layers", 2))
+                    hidden_units: int = int(self.spatial_config.get("hidden_units", 256))
+                else:
+                    # For spectral models, use spectral config (polynomial_order is noted but not used here).
+                    n_layers = 2  # fixed for simplicity
+                    hidden_units = int(self.spectral_config.get("hidden_units", 256))
+                # Define input dimension (same as synthetic features) and number of classes.
+                input_dim: int = X_syn.size(1)
+                num_classes: int = int(torch.max(Y_real).item() + 1)
+
+                # Instantiate a simple GCN model for evaluation.
+                model_gnn = SimpleGCN(input_dim=input_dim, hidden_dim=hidden_units,
+                                        num_classes=num_classes, n_layers=n_layers).to(device)
+                optimizer = optim.Adam(model_gnn.parameters(), lr=self.eval_lr)
+                loss_fn = nn.CrossEntropyLoss()
+
+                # Train the evaluation model on the synthetic graph.
+                for epoch in range(self.eval_epochs):
+                    model_gnn.train()
+                    optimizer.zero_grad()
+                    out_syn = model_gnn(A_syn, X_syn)  # Prediction for synthetic graph.
+                    loss = loss_fn(out_syn, Y_syn)
+                    loss.backward()
+                    optimizer.step()
+
+                # After training, evaluate on the real graph's test set.
+                model_gnn.eval()
+                with torch.no_grad():
+                    out_real = model_gnn(A_real, X_real)
+                    preds = torch.argmax(out_real, dim=1)
+                    correct = torch.sum(preds[test_idx] == Y_real[test_idx]).item()
+                    total = test_idx.size(0)
+                    accuracy = correct / total
+                    acc_list.append(accuracy)
+            # Compute mean and standard deviation across runs.
+            mean_acc: float = float(np.mean(acc_list))
+            std_acc: float = float(np.std(acc_list))
+            results[arch_name] = {"mean": mean_acc, "std": std_acc}
+            print(f"Architecture {arch_name}: Mean Accuracy = {mean_acc:.4f}, Std = {std_acc:.4f}")
+        return results
+
+
+# =============================================================================
+# Standalone Testing Block
+# =============================================================================
+if __name__ == "__main__":
+    import yaml
+
+    # Load configuration from config.yaml if available; otherwise, set default configuration.
+    config_file: str = "config.yaml"
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            config: dict = yaml.safe_load(f)
+    else:
+        config = {
+            "training": {
+                "epochs": 1500,
+                "learning_rate_feat": 1e-05,
+                "learning_rate_eigenvecs": 0.01,
+                "tau1": 0,
+                "tau2": 5,
+                "optimizer": "adam",
+                "loss_weights": {"alpha": 1.0, "beta": 1.0, "gamma": 1.0},
+                "num_runs": 10
+            },
+            "synth_graph": {
+                "compression_ratio": 0.15,
+                "r_k": 0.9
+            },
+            "evaluation": {
+                "gnn": {
+                    "spatial": {"n_layers": 2, "hidden_units": 256},
+                    "spectral": {"polynomial_order": 10, "hidden_units": 256},
+                    "epochs": 200,
+                    "learning_rate": 0.01
+                }
+            },
+            "dataset": {
+                "name": "Pubmed",
+                "split_method": "public"
+            }
+        }
+
+    # Import DatasetLoader and instantiate GraphData.
+    from dataset_loader import DatasetLoader
+
+    dataset_loader = DatasetLoader(config)
+    graph_data: GraphData = dataset_loader.load_data()
+
+    # Create a Model instance.
+    N_syn: int = graph_data.synthetic_size
+    d: int = graph_data.node_features.shape[1]
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_instance = Model(config=config, N_syn=N_syn, d=d, device=device).to(device)
+
+    # For demonstration purposes, simulate that the distillation model has been trained.
+    # We copy the corresponding real eigenbasis (first N_syn rows, first K columns) into U_syn.
+    with torch.no_grad():
+        K_val: int = model_instance.K
+        real_eigen_target = torch.tensor(graph_data.eigenvectors[:N_syn, :K_val],
+                                           dtype=torch.float32, device=device)
+        model_instance.U_syn.copy_(real_eigen_target)
+
+    # Initialize the Evaluation instance.
+    eval_instance = Evaluation(model=model_instance, data=graph_data, eval_config=config)
+    # Run evaluation.
+    eval_results: Dict[str, Dict[str, float]] = eval_instance.evaluate()
+    print("Evaluation Results:")
+    print(eval_results)

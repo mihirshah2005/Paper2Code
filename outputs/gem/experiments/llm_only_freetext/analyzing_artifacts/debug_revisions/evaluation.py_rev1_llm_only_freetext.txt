@@ -1,0 +1,118 @@
+Below is a detailed logic analysis for evaluation.py. This module’s main responsibility is to carry out the evaluation protocol as described in the paper: it trains one or more standard GNN classifiers on the distilled (synthetic) graph produced by the distillation process and then tests the trained classifiers on the original real graph’s test set. The evaluation is designed both for a baseline (e.g., a 2‐layer GCN) and for cross-architecture generalization (by training several spatial and spectral GNNs).
+
+──────────────────────────────
+1. Overall Role and Inputs
+
+• The Evaluation class will be initialized with three objects:
+ – A Model instance that, after its training, provides a method (reconstruct_graph) to return the synthetic graph structure (A′ and X′) that was learned during distillation.
+ – A GraphData instance (from dataset_loader.py) carrying the full real graph including:
+  • adjacency matrix (A)
+  • node feature matrix (X)
+  • labels (Y)
+  • (optionally) the train/val/test split indices (according to the “public” split for Pubmed, as set in config)
+ – An evaluation configuration dictionary (sourced from config.yaml, under the “evaluation” section) that specifies hyperparameters for the evaluation GNNs (for spatial models: number of layers and hidden units; for spectral models: polynomial order and hidden units).
+
+──────────────────────────────
+2. Synthetic Graph Retrieval and Data Preparation
+
+• Inside the evaluate() method, the first step is to call the model’s reconstruct_graph() method. This will return the distilled synthetic graph’s structure:
+  – A′ (synthetic adjacency matrix or Laplacian built from the learned synthetic eigenbasis and the real spectrum)
+  – X′ (synthetic node feature matrix)
+  – (Optionally, synthetic node labels may be available or they can be copied from the real training set if the distillation process “transfers” the labels.)
+
+• It is important that the Evaluation class distinguishes between training data (the small, distilled synthetic graph) and the testing data (the real graph’s test split). The GraphData object should already include the ground truth labels and (if available) indices that correspond to the test set for a fair comparison.
+
+──────────────────────────────
+3. Training the GNN Classifier(s)
+
+• The evaluation protocol requires training standard GNNs on the synthetic graph, then evaluating on the test set of the real graph.
+
+• For example, one baseline implementation may involve:
+  – Creating a 2-layer GCN classifier with 256 hidden units, following the “spatial” GNN settings in the evaluation part of config.yaml:
+   • Use evaluation.gnn.spatial.n_layers (which equals 2) and evaluation.gnn.spatial.hidden_units (256).
+
+• In addition, the Evaluation module should support several architectures (such as SGC, PPNP for spatial and ChebyNet, BernNet, GPR-GNN for spectral) so that cross-architecture generalization can be analyzed. The code should loop over a predefined list of these architectures if needed. For each architecture:
+  – Instantiate the network using the parameters from config (e.g., spectral models using evaluation.gnn.spectral.polynomial_order and hidden_units).
+  – Train the network on the synthetic graph data:
+   – Use X′ (node features from synthetic graph) and A′ (synthetic graph structure).
+   – Use the (synthetic) labels, which are generally obtained by transferring the label information from the original graph.
+   – Set up a training loop (with a predetermined number of epochs – if not explicitly in the config, a reasonable default such as 200–500 epochs can be used) and use an optimizer (e.g., Adam with a learning rate that may be the same as the training learning rate for the features or a default value).
+   – Optionally validate on a validation split if it is provided, or simply monitor the training loss.
+   – Log intermediate metrics for debugging (e.g., loss, training accuracy).
+
+──────────────────────────────
+4. Testing and Performance Metrics
+
+• Once the GNN has been trained on the synthetic graph, the next step is to evaluate its performance on the real test set:
+  – Use the full real graph’s node features X (or just the part corresponding to test nodes), the real graph’s original adjacency matrix A, and the corresponding ground truth labels Y.
+  – Pass the test set through the trained GNN classifier to get predictions and then compute the node classification accuracy. (Recall that standard performance metrics such as accuracy are reported in the paper.)
+  – For cross-architecture evaluation, repeat this evaluation step for every GNN architecture, collecting performance (accuracy) and possibly variance metrics.
+
+• The Evaluation class should aggregate results into a dictionary (or similar structure) mapping each architecture name to its test accuracy, making it easy to compare performance across models.
+
+──────────────────────────────
+5. Handling Cross-Architecture Generalization
+
+• To assess the synthetic graph’s generalizability, the evaluation code must support different architectures as detailed in the paper:
+  • Spatial models: GCN, SGC, PPNP (each using 2-layer aggregations).
+  • Spectral models: ChebyNet, BernNet, GPR-GNN (with polynomial order set to 10 according to the config).
+• Use loops or a factory pattern to instantiate and train each architecture separately on the same distilled synthetic graph.
+• Log both the average accuracy and the variance across these architectures, as the paper reports that lower variance among different GNNs suggests improved cross-architecture generalization.
+
+──────────────────────────────
+6. Configuration and Hyperparameter References
+
+• All evaluation parameters (such as the number of layers, hidden unit sizes, and polynomial order) should be read directly from the configuration dictionary provided at initialization. For example:
+  – evaluation.gnn.spatial.n_layers → 2
+  – evaluation.gnn.spatial.hidden_units → 256
+  – evaluation.gnn.spectral.polynomial_order → 10
+  – evaluation.gnn.spectral.hidden_units → 256
+
+• If the training procedure for evaluation requires additional hyperparameters (such as the number of evaluation epochs, optimizer settings, or learning rates) and these are not specified in the config.yaml, reasonable defaults should be set and clearly documented. Consistency with the experimental setup in the paper must be maintained as much as possible.
+
+──────────────────────────────
+7. Logging and Returning Results
+
+• During evaluation, it is important to log key metrics such as training loss per epoch, final training accuracy (on the synthetic graph), test accuracy on the real graph, and cross-model variance.
+• The evaluate() method should return a results dictionary containing these metrics for later analysis and comparison with baselines.
+
+──────────────────────────────
+8. Dependencies and Integration
+
+• The Evaluation module will use:
+ – torch for GNN model implementation, training, and inference.
+ – The GraphData structure (imported from dataset_loader.py) for retrieving real graph data and test-set splits.
+• The module should integrate seamlessly with the other modules (main.py to start evaluation, trainer.py which produces the synthetic graph in Model).
+
+──────────────────────────────
+9. Summary of Logic Flow in evaluation.py
+
+1. Initialization:
+ – Read evaluation-specific config values.
+ – Receive the Model (distilled synthetic graph) and GraphData (real graph data with splitting information).
+
+2. Get the distilled (synthetic) graph:
+ – Call model.reconstruct_graph() to get A′ and X′.
+
+3. For each chosen GNN architecture (starting with the standard 2-layer GCN):
+ a. Instantiate the classifier using parameters from the config.
+ b. Train the classifier on the synthetic graph (using X′, A′, and synthetic labels).
+ c. Once training is complete, test the classifier on the real graph test set (using real X, A, and true labels).
+ d. Log the test accuracy and any additional metrics.
+
+4. (Optionally) Loop over several architectures to assess cross-model performance and compute mean and variance of accuracies.
+
+5. Return/log the results in an aggregated dictionary.
+
+This logic directly mirrors the evaluation protocol described in the paper and adheres to the configuration file settings as well as the modular design specified. All implementation decisions (such as training epochs, optimizer details, architecture instantiation, and loss choices in the evaluation step) will be documented in the code comments so that the process remains transparent and reproducible.
+
+──────────────────────────────
+Conclusion
+
+The evaluation.py module will thus encapsulate the process of:
+ – Extracting the synthetic graph,
+ – Training several GNN classifiers on this condensed data,
+ – Evaluating these classifiers on the test set of the original graph,
+ – And finally reporting performance metrics that reflect both accuracy and cross-architecture generalization.
+
+This logic analysis should serve as a clear blueprint for writing the evaluation.py code in a way that faithfully reproduces the experimental evaluation described in the GDEM paper.

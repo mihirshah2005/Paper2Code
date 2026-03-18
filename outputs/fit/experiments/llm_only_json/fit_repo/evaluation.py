@@ -1,0 +1,313 @@
+"""evaluation.py
+
+This module defines the Evaluation class that conducts inference and evaluation
+of the trained FiT model. It includes the following functionalities:
+
+1. Diffusion Sampling:
+   - Computes the target latent grid dimensions from the desired output resolution,
+     taking into account non-square aspect ratios.
+   - Calculates separate scale factors for height and width based on training latent
+     dimensions (H_train, W_train) and target latent grid dimensions.
+   - Generates initial latent tokens from Gaussian noise.
+   - Invokes a positional embedding interpolation helper function (which must be
+     implemented in the Model class) to adjust the positional embeddings for resolution
+     extrapolation.
+   - Iteratively refines the noisy latent tokens via a simplified denoising (diffusion)
+     process.
+   - Unpatchifies the tokens to construct the latent grid and decodes it using the
+     pretrained VAE decoder to yield the final generated image.
+
+2. Evaluation:
+   - Generates a specified number of images.
+   - (Placeholder) Computes evaluation metrics such as FID, sFID, Inception Score,
+     Precision, and Recall. In this implementation, dummy metric values are returned.
+
+All configuration parameters (e.g., patch size, max_token_length, diffusion steps,
+extrapolation methods, and evaluation resolution) are loaded from the config.yaml file.
+Default values are provided where applicable.
+
+Note:
+    The evaluation process explicitly requires that the Model implement the method
+    interpolate_positional_embeddings and possess an attribute base_positional_embeddings.
+    If these are not present, a NotImplementedError is raised.
+"""
+
+import math
+import os
+from typing import Any, Dict, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# Evaluation class as defined by the design.
+class Evaluation:
+    def __init__(self, model: Any, dataloader: DataLoader, config: Dict[str, Any]) -> None:
+        """
+        Initialize the Evaluation module with the given model, dataloader, and configuration.
+
+        Args:
+            model (Any): An instance of the FiT Model.
+            dataloader (DataLoader): DataLoader yielding evaluation batches.
+            config (dict): Configuration dictionary loaded from config.yaml.
+        """
+        self.model: Any = model
+        self.dataloader: DataLoader = dataloader
+        self.config: Dict[str, Any] = config
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.model.eval()
+
+        # Extrapolation settings from configuration.
+        self.extrapolation_methods = self.config.get("extrapolation", {}).get("methods", ["PI"])
+        # Choose the first method in the list as default.
+        self.chosen_method: str = self.extrapolation_methods[0] if self.extrapolation_methods else "PI"
+
+        # Diffusion sampling steps.
+        self.num_sampling_steps: int = self.config.get("diffusion", {}).get("num_sampling_steps", 250)
+
+        # Evaluation resolution: if not provided, default to [256, 256].
+        eval_res = self.config.get("evaluation", {}).get("resolution", [256, 256])
+        if isinstance(eval_res, list) and len(eval_res) == 2:
+            self.H_test: int = int(eval_res[0])
+            self.W_test: int = int(eval_res[1])
+        else:
+            self.H_test, self.W_test = 256, 256
+
+        # Model configuration: patch size and maximum token length.
+        self.patch_size: int = self.config.get("model", {}).get("patch_size", 2)
+        self.L_max: int = self.config.get("model", {}).get("max_token_length", 256)
+
+        # Training latent grid dimensions:
+        # If provided in evaluation config, use them; otherwise, default to square latent grid:
+        sqrt_Lmax: int = int(math.sqrt(self.L_max))
+        self.H_train: int = self.config.get("evaluation", {}).get("H_train", sqrt_Lmax)
+        self.W_train: int = self.config.get("evaluation", {}).get("W_train", sqrt_Lmax)
+
+    def diffusion_sampling(self, batch_size: int = 1, conditioning: Dict[str, Any] = None) -> torch.Tensor:
+        """
+        Perform the diffusion sampling procedure to generate images.
+
+        Steps:
+            1. Compute latent grid dimensions from output resolution and patch size.
+            2. Compute scale factors (s_h, s_w) based on training latent dimensions.
+            3. Sample initial latent tokens from a Gaussian distribution.
+            4. Generate positional coordinates and adjust them via positional embedding interpolation.
+            5. Iteratively denoise the latent tokens using a simplified Euler update.
+            6. Unpatchify tokens into a latent grid and decode via the pretrained VAE decoder.
+
+        Args:
+            batch_size (int): Number of images to generate.
+            conditioning (dict): Optional conditioning information for conditional generation (unused in this implementation).
+
+        Returns:
+            torch.Tensor: Generated images tensor of shape [B, 3, H, W].
+        """
+        # Compute latent grid dimensions for the target output resolution.
+        H_latent: int = math.ceil(self.H_test / self.patch_size)
+        W_latent: int = math.ceil(self.W_test / self.patch_size)
+        token_count: int = H_latent * W_latent
+
+        # Compute scale factors for height and width.
+        s_h: float = max(H_latent / self.H_train, 1.0)
+        s_w: float = max(W_latent / self.W_train, 1.0)
+
+        # Retrieve hidden size from configuration.
+        hidden_size: int = self.config.get("model", {}).get("transformer", {}).get("hidden_size", 768)
+
+        # Sample initial latent tokens from a standard Gaussian.
+        init_tokens: torch.Tensor = torch.randn(batch_size, token_count, hidden_size, device=self.device)
+
+        # Create a valid token mask (all ones, shape: [B, token_count]).
+        mask: torch.Tensor = torch.ones(batch_size, token_count, device=self.device)
+
+        # Compute positional coordinates for each token in the latent grid.
+        grid_h = torch.arange(H_latent, device=self.device, dtype=torch.float32)
+        grid_w = torch.arange(W_latent, device=self.device, dtype=torch.float32)
+        grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing="ij")
+        positions: torch.Tensor = torch.stack([grid_h, grid_w], dim=-1)  # [H_latent, W_latent, 2]
+        positions = positions.reshape(1, token_count, 2).repeat(batch_size, 1, 1)  # [B, token_count, 2]
+
+        # Positional embedding interpolation:
+        # The Model is expected to have implemented a helper method 'interpolate_positional_embeddings'
+        # and an attribute 'base_positional_embeddings'.
+        if not hasattr(self.model, "interpolate_positional_embeddings"):
+            raise NotImplementedError("Model does not implement interpolate_positional_embeddings required for evaluation.")
+        if not hasattr(self.model, "base_positional_embeddings"):
+            raise NotImplementedError("Model does not have base_positional_embeddings attribute required for interpolation.")
+        original_pe: torch.Tensor = self.model.base_positional_embeddings  # Expected shape: [L_max, embedding_dim]
+        # Call the interpolation helper function.
+        # The new positional embeddings should be adapted to the target latent grid shape.
+        new_pe: torch.Tensor = self.model.interpolate_positional_embeddings(
+            original_pe, (H_latent, W_latent), self.chosen_method, (s_h, s_w)
+        )
+        # Use the interpolated positional embeddings.
+        positions = new_pe  # Expected to be of shape [B, token_count, embedding_dim]
+
+        # Begin the diffusion sampling iterative process.
+        tokens: torch.Tensor = init_tokens  # [B, token_count, hidden_size]
+        num_steps: int = self.num_sampling_steps
+        step_size: float = 1.0 / num_steps  # Simplistic Euler step size
+
+        for step in tqdm(range(num_steps), desc="Diffusion Sampling", unit="step"):
+            # Create a timestep tensor for the current diffusion step.
+            t: torch.Tensor = torch.full((batch_size,), step, device=self.device, dtype=torch.long)
+            # Incorporate diffusion-conditioning: add time embedding to the tokens.
+            time_emb: torch.Tensor = self.model.time_embed_layer(t)  # Shape: [B, hidden_size]
+            tokens_with_time: torch.Tensor = tokens + time_emb.unsqueeze(1)
+            # Forward pass through the transformer blocks.
+            x: torch.Tensor = tokens_with_time
+            for block in self.model.transformer_blocks:
+                x = block(x, positions, mask)
+            x = self.model.norm_out(x)
+            predicted_noise: torch.Tensor = self.model.output_proj(x)  # [B, token_count, hidden_size]
+            # Update tokens using a simple Euler update rule.
+            tokens = tokens - step_size * predicted_noise
+
+        # Unpatchify the tokens to reconstruct the latent grid.
+        # Reshape tokens from [B, token_count, hidden_size] to [B, H_latent, W_latent, hidden_size]
+        # and then permute to [B, hidden_size, H_latent, W_latent].
+        B: int = batch_size
+        latent_grid: torch.Tensor = tokens[:, :token_count, :].reshape(B, H_latent, W_latent, hidden_size)
+        latent_grid = latent_grid.permute(0, 3, 1, 2).contiguous()
+
+        # Decode the latent grid using the pretrained VAE decoder.
+        if self.model.vae_decoder is None:
+            raise ValueError("Model has no VAE decoder loaded for image reconstruction.")
+        generated_images: torch.Tensor = self.model.vae_decoder(latent_grid)
+        return generated_images
+
+    def evaluate(self) -> dict:
+        """
+        Run the evaluation process: generate images using diffusion sampling and compute
+        evaluation metrics.
+
+        Returns:
+            dict: Dictionary containing the generated images tensor and evaluation metrics.
+                  In this implementation, metrics are dummy values.
+        """
+        self.model.eval()
+        generated_image_list = []
+
+        # Number of samples to generate (default provided in config; if not, default to 10).
+        num_samples: int = self.config.get("evaluation", {}).get("num_samples", 10)
+        batch_size: int = 1  # Generate one image per diffusion sampling call.
+        num_generated: int = 0
+
+        with torch.no_grad():
+            while num_generated < num_samples:
+                gen_images: torch.Tensor = self.diffusion_sampling(batch_size=batch_size)
+                generated_image_list.append(gen_images.cpu())
+                num_generated += batch_size
+
+        # Concatenate all generated images.
+        generated_images_tensor: torch.Tensor = torch.cat(generated_image_list, dim=0)
+
+        # Placeholder for evaluation metrics.
+        # In a full implementation, compute FID, sFID, IS, Precision, and Recall using appropriate libraries.
+        metrics: Dict[str, float] = {
+            "FID": 0.0,
+            "sFID": 0.0,
+            "IS": 0.0,
+            "Precision": 0.0,
+            "Recall": 0.0
+        }
+
+        return {"generated_images": generated_images_tensor, "metrics": metrics}
+
+
+# For testing this module independently.
+if __name__ == "__main__":
+    import yaml
+    from torch.utils.data import DataLoader
+
+    # Import DatasetLoader and Model from the local project files.
+    from dataset_loader import DatasetLoader
+    from model import Model
+
+    CONFIG_PATH: str = "config.yaml"
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r") as config_file:
+            config: dict = yaml.safe_load(config_file)
+    else:
+        # Default configuration if config.yaml is not found.
+        config = {
+            "training": {"learning_rate": 1e-4, "batch_size": 256, "training_steps_fit_b2": 400000, "ema_decay": 0.9999},
+            "model": {
+                "patch_size": 2,
+                "max_token_length": 256,
+                "transformer": {
+                    "hidden_size": 768,
+                    "num_heads": 12,
+                    "num_layers": 6,
+                    "ffn_hidden_size": 3072,
+                    "time_embed_dim": 768,
+                    "positional_embedding": "2D RoPE",
+                    "attention": "Masked MHSA",
+                    "ffn": "SwiGLU"
+                },
+                "pretrained_vae": ""
+            },
+            "diffusion": {"num_sampling_steps": 250, "noise_schedule": "DDPM"},
+            "data": {"dataset_path": "./data/imagenet", "resize_max_area": 65536, "augmentation": "Horizontal Flip"},
+            "evaluation": {
+                "fid_steps": 250,
+                "metrics": ["FID", "sFID", "IS", "Precision", "Recall"],
+                "num_samples": 2,
+                "resolution": [256, 256],
+                "H_train": 16,
+                "W_train": 16
+            },
+            "extrapolation": {"methods": ["VisionYaRN", "VisionNTK", "PI"]}
+        }
+
+    # Create a DatasetLoader instance and DataLoader.
+    dataset_loader_instance = DatasetLoader(config)
+    dataloader: DataLoader = dataset_loader_instance.load_data()
+
+    # Instantiate the Model.
+    model_instance: Model = Model(config)
+
+    # For testing purposes, assign a dummy base_positional_embeddings attribute and a dummy
+    # interpolation method to the model instance.
+    hidden_size: int = config["model"]["transformer"].get("hidden_size", 768)
+    L_max: int = config["model"].get("max_token_length", 256)
+    model_instance.base_positional_embeddings = torch.randn(L_max, hidden_size, device=model_instance.transformer_blocks[0].attn.out_proj.weight.device)
+
+    def dummy_interpolate_positional_embeddings(original_pe: torch.Tensor, target_shape: Tuple[int, int],
+                                                 method: str, scale_factors: Tuple[float, float]) -> torch.Tensor:
+        """
+        Dummy positional embedding interpolation function.
+        This simplistic implementation creates a new positional embedding grid by linearly
+        selecting rows from the original embedding.
+        
+        Args:
+            original_pe (Tensor): Original positional embeddings of shape [L_max, embedding_dim].
+            target_shape (tuple): Target latent grid dimensions (H_latent, W_latent).
+            method (str): The chosen interpolation method (e.g., "PI", "VisionYaRN").
+            scale_factors (tuple): Scale factors for height and width (s_h, s_w).
+        
+        Returns:
+            Tensor: Interpolated positional embeddings of shape [1, H_latent * W_latent, embedding_dim].
+        """
+        H_latent, W_latent = target_shape
+        token_count = H_latent * W_latent
+        embedding_dim = original_pe.shape[1]
+        # This dummy implementation simply repeats the first L_max embeddings to fill the grid.
+        interpolated = torch.zeros(1, token_count, embedding_dim, device=original_pe.device)
+        for i in range(token_count):
+            idx = i % original_pe.shape[0]
+            interpolated[0, i] = original_pe[idx]
+        return interpolated
+
+    # Assign the dummy interpolation function to the model.
+    model_instance.interpolate_positional_embeddings = dummy_interpolate_positional_embeddings
+
+    # Instantiate Evaluation and run the evaluation.
+    evaluation_instance = Evaluation(model_instance, dataloader, config)
+    results = evaluation_instance.evaluate()
+
+    print("Evaluation Results Metrics:")
+    print(results["metrics"])
+    print("Generated Images Tensor Shape:", results["generated_images"].shape)

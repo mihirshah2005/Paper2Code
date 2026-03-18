@@ -1,0 +1,103 @@
+Below is a detailed logic analysis for writing main.py. This file will serve as the main entry point of the application and coordinate the execution of the complete pipeline. The analysis is structured to align with the paper’s methodology, the project design, and the values provided in the config.yaml file.
+
+──────────────────────────────
+1. Load Configuration
+
+• At startup, main.py must first load the configuration settings from config.yaml.  
+  – Use a YAML parser (e.g., PyYAML) to read all sections: training (epochs, learning rates, tau1/tau2, loss_weights, num_runs), synth_graph (compression_ratio, r_k), evaluation (GNN architecture details for spatial and spectral models), and dataset (name, split_method).  
+  – Store settings in a common configuration dictionary that is later passed to all modules.
+
+──────────────────────────────
+2. Instantiate DatasetLoader and Load the Dataset
+
+• Create an instance of the DatasetLoader class using the configuration (particularly the dataset information such as “name”: “Pubmed” and split_method “public”).  
+  – Call the load_data() method to load and preprocess the graph data.  
+  – This method will compute the normalized Laplacian, perform the eigen-decomposition (truncated to your required K eigenvectors), and package results into a GraphData object (including the adjacency, node_features, labels, Laplacian, eigenvalues, and eigenvectors).
+  – Log these steps to confirm successful loading and preprocessing.
+
+──────────────────────────────
+3. Initialize the Model
+
+• Instantiate the Model class by providing it with the appropriate parameters gathered from the config as well as any additional hyperparameters.
+  – Pass along the training hyperparameters (learning_rate_feat, learning_rate_eigenvecs, loss_weights) and the synthetic graph settings (compression_ratio, r_k) so that the Model can initialize synthetic node features (X′) and the synthetic eigenbasis (U′_K).
+  – The Model should have methods to:
+   ○ Run a forward pass (compute synthetic graph properties).
+   ○ Compute the three loss components:
+    – L_e: Eigenbasis matching loss (comparing real eigenbasis U_K with synthetic eigenbasis U′_K using, for example, the Frobenius norm of their projection matrices),
+    – L_d: Discrimination constraint loss (which may involve computing category-level representations from node features and enforcing cosine similarity),
+    – L_o: Orthogonality regularization loss for keeping the synthetic eigenbasis orthonormal.
+   ○ Reconstruct the synthetic graph (by combining U′_K with the real spectrum, i.e., using L′ = ∑ (λ_k · u′_k u′_k^T) or the corresponding formula for A′).
+  – Ensure that all hyperparameters drawn from config (especially for training and eigenbasis initialization) are used exactly as provided.
+
+──────────────────────────────
+4. Set Up the Trainer and Run the Training Loop
+
+• Create a Trainer instance by passing the Model instance, the GraphData object, and the training configuration.  
+  – The Trainer’s responsibility is to run the training loop for the specified number of epochs (1500 as per config).  
+  – It will alternate updates between the synthetic eigenbasis and the synthetic node features based on the configured intervals (tau1 = 0 and tau2 = 5).  
+   ○ For each iteration, check if (current iteration modulo (tau1 + tau2)) < tau1; if so, update U′_K with learning rate learning_rate_eigenvecs; otherwise update X′ with learning_rate_feat.
+  – During each training iteration:
+   ○ Call the Model’s forward() (or similar) to compute intermediate outputs.
+   ○ Compute losses by invoking compute_loss() that aggregates L_e, L_d, and L_o weighted by alpha, beta, and gamma (each set to 1.0 in config).
+   ○ Backpropagate the losses and update the corresponding parameters using the Adam optimizer.
+  – Log intermediate loss values (and potentially metrics such as total variation) for debugging and monitoring convergence.
+  – If num_runs is greater than 1 (num_runs: 10 in config), then wrap the training loop in an outer loop over multiple runs and track the variance of evaluation metrics.
+
+──────────────────────────────
+5. Reconstruct and Save the Synthetic Graph
+
+• Once training finishes, call the Model.reconstruct_graph() method.  
+  – This method uses the learned synthetic eigenbasis along with the real eigenvalues to reconstruct the synthetic Laplacian (L′) and/or the synthetic adjacency (A′) exactly as described in the paper.
+  – Optionally, save or log the synthetic graph structure (A′ and X′) for further analysis later.
+
+──────────────────────────────
+6. Run Evaluation
+
+• With the distilled synthetic graph now available, instantiate the Evaluation class.  
+  – Pass the Model and the full GraphData along with evaluation configuration.  
+  – The evaluation configuration from config.yaml provides details such as the GNN architecture for spatial (n_layers and hidden_units) and spectral (polynomial_order and hidden_units) models.  
+• Call the evaluate() method:
+  – Internally, Evaluation should load or build several GNN architectures (e.g., a 2-layer GCN for baseline evaluation and possibly other spatial and spectral GNNs for cross-architecture generalization experiments).
+  – It trains these GNNs on the synthetic graph (using the distilled node features and reconstructed structure) and then tests them on the original testing split from the GraphData.
+  – The evaluation module will return metrics (accuracy, average accuracy, variance across different GNNs, etc.) as detailed in the paper.
+• Print or log the evaluation results to verify that the synthetic graph is producing comparable performance to training on the full real graph.
+
+──────────────────────────────
+7. Overall Execution Flow in main.py
+
+The main flow of main.py should, therefore, be as follows:
+
+a) Load the configuration from config.yaml and log the loaded settings.  
+b) Instantiate DatasetLoader and call load_data() to obtain a GraphData instance.  
+c) Create the Model instance using the training and synth_graph parameters from the configuration.  
+d) Instantiate the Trainer with the Model, GraphData, and training configuration and then call trainer.train() to run the distillation process.
+e) After training completes, use model.reconstruct_graph() (if applicable) to finalize the synthetic graph.
+f) Instantiate the Evaluation module with Model, GraphData, and the evaluation configuration.  
+g) Call evaluate() and obtain performance metrics; then log or print these metrics.
+h) Optionally, if multiple runs are required (as specified by num_runs), loop through these steps, gather the results, and compute summary statistics (e.g., average and variance).
+
+──────────────────────────────
+8. Logging and CRUD Operations
+
+• main.py must also handle:
+  – Initialization and potential persistence (CRUD) of configuration objects (e.g., saving updated configs or experiment logs).
+  – Logging of intermediate and final results.
+  – Error handling to ensure that if any stage (data loading, training, or evaluation) fails, appropriate messages are logged.
+
+──────────────────────────────
+9. Dependencies and Imports
+
+• main.py will import classes from dataset_loader.py, model.py, trainer.py, and evaluation.py.  
+• It must ensure that all required packages (numpy, torch, scipy, networkx) are available as specified.
+• All configuration parameters must be passed along to each module to ensure full reproducibility and alignment with the paper’s reported settings.
+
+──────────────────────────────
+Summary
+
+The main.py file will serve as the orchestrator:
+  – Load configuration and set global hyperparameters.
+  – Manage the data loading, model setup, and training (with proper alternate update scheduling).
+  – Finally, trigger evaluations using various GNN architectures on the distilled synthetic graph and report the results.
+Adhering precisely to these steps ensures that the implementation faithfully reproduces the experiment methodology of the paper and respects the design decisions and configurations provided.
+
+This detailed logic analysis will guide the subsequent step-by-step coding of main.py and integration of all modules.

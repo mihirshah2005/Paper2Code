@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is a plain‐English review of the analysis, with notes on potential issues and their estimated severity:\n\n1. Synthetic Label Mapping  \n • The analysis does a good job of outlining two cases (using embedded synthetic labels versus transferring labels via a maintained index mapping). However, it assumes that a mapping between synthetic nodes and real training nodes exists and is reliably maintained (either in Model or GraphData). In practice, if this mapping is missing or mis‐aligned, the syn",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Below is a plain‐English review of the analysis, with notes on potential issues and their estimated severity:\n\n1. Synthetic Label Mapping  \n • The analysis does a good job of outlining two cases (using embedded synthetic labels versus transferring labels via a maintained index mapping). However, it assumes that a mapping between synthetic nodes and real training nodes exists and is reliably maintained (either in Model or GraphData). In practice, if this mapping is missing or mis‐aligned, the syn",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

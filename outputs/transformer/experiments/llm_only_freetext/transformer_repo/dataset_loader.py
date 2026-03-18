@@ -1,0 +1,400 @@
+"""dataset_loader.py
+
+This module implements the DatasetLoader class which provides data loading,
+tokenization (using SentencePiece), dynamic batching with maximum-length estimation,
+and creation of PyTorch DataLoader objects for training, validation, and test splits.
+It supports both translation and parsing tasks.
+
+The dynamic batching strategy uses a maximum-length estimation:
+    Effective_source_tokens = max_source_length * number_of_examples
+    Effective_target_tokens = max_target_length * number_of_examples
+A batch is accepted only if both of these values are ≤ config.training.batch_size_tokens.
+"""
+
+import os
+import logging
+import random
+import tempfile
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, Sampler
+
+import sentencepiece as spm
+
+# Setup logging configuration
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+# ---------------------------
+# Custom Dataset Classes
+# ---------------------------
+class TranslationDataset(Dataset):
+    """Dataset for translation tasks.
+    
+    Each example is a tuple (source_ids, target_ids), where both are lists of token IDs.
+    A special beginning-of-sequence (BOS) and end-of-sequence (EOS) tokens are added.
+    """
+    def __init__(self, examples: List[Tuple[List[int], List[int]]]) -> None:
+        self.examples = examples
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], List[int]]:
+        return self.examples[idx]
+
+
+class ParsingDataset(Dataset):
+    """Dataset for parsing tasks.
+    
+    Each example is a tuple (input_ids, parse_ids). This implementation is analogous
+    to TranslationDataset.
+    """
+    def __init__(self, examples: List[Tuple[List[int], List[int]]]) -> None:
+        self.examples = examples
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], List[int]]:
+        return self.examples[idx]
+
+
+# ---------------------------
+# Custom Dynamic Batch Sampler
+# ---------------------------
+class DynamicBatchSampler(Sampler):
+    """
+    A custom batch sampler that groups examples so that the effective number of tokens
+    (max_length * batch_size) for both source and target does not exceed a given threshold.
+
+    Args:
+        dataset: The dataset object. It is assumed that dataset[i] returns a tuple (src_ids, tgt_ids).
+        batch_token_threshold: Maximum allowed tokens per batch for source and target (int).
+        shuffle: If True, shuffles the indices before batching.
+    """
+    def __init__(self, dataset: Dataset, batch_token_threshold: int, shuffle: bool = True) -> None:
+        self.dataset = dataset
+        self.batch_token_threshold = int(batch_token_threshold)
+        self.shuffle = shuffle
+        self.indices = list(range(len(self.dataset)))
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.indices)
+
+        batch = []
+        current_max_src = 0
+        current_max_tgt = 0
+
+        for idx in self.indices:
+            src_ids, tgt_ids = self.dataset[idx]
+            src_len = len(src_ids)
+            tgt_len = len(tgt_ids)
+
+            # Compute new max lengths if this index is added.
+            new_max_src = max(current_max_src, src_len)
+            new_max_tgt = max(current_max_tgt, tgt_len)
+            candidate_batch_size = len(batch) + 1
+
+            # Calculate effective tokens on both sides.
+            effective_src = new_max_src * candidate_batch_size
+            effective_tgt = new_max_tgt * candidate_batch_size
+
+            if effective_src <= self.batch_token_threshold and effective_tgt <= self.batch_token_threshold:
+                batch.append(idx)
+                current_max_src = new_max_src
+                current_max_tgt = new_max_tgt
+            else:
+                if batch:
+                    yield batch
+                # Start a new batch with the current index.
+                batch = [idx]
+                current_max_src = src_len
+                current_max_tgt = tgt_len
+
+        if batch:
+            yield batch
+
+    def __len__(self) -> int:
+        # Length is not trivial to calculate; return an estimated count.
+        return len(self.indices) // 2  # rough estimate
+
+
+# ---------------------------
+# Collate Functions
+# ---------------------------
+def collate_fn_translation(batch: List[Tuple[List[int], List[int]]],
+                           pad_id: int) -> Dict[str, torch.Tensor]:
+    """
+    Collate function to pad translation examples in a batch.
+    Each example is (src_ids, tgt_ids). Padding is performed to the maximum length in the batch.
+    Returns a dictionary with padded tensors and their original lengths.
+    """
+    # Get maximum lengths
+    max_src_len = max(len(src) for src, _ in batch)
+    max_tgt_len = max(len(tgt) for _, tgt in batch)
+    batch_size = len(batch)
+
+    padded_src = torch.full((batch_size, max_src_len), pad_id, dtype=torch.long)
+    padded_tgt = torch.full((batch_size, max_tgt_len), pad_id, dtype=torch.long)
+    src_lengths = torch.zeros(batch_size, dtype=torch.long)
+    tgt_lengths = torch.zeros(batch_size, dtype=torch.long)
+
+    for i, (src, tgt) in enumerate(batch):
+        src_len = len(src)
+        tgt_len = len(tgt)
+        padded_src[i, :src_len] = torch.tensor(src, dtype=torch.long)
+        padded_tgt[i, :tgt_len] = torch.tensor(tgt, dtype=torch.long)
+        src_lengths[i] = src_len
+        tgt_lengths[i] = tgt_len
+
+    return {"src": padded_src, "tgt": padded_tgt, "src_lengths": src_lengths, "tgt_lengths": tgt_lengths}
+
+
+def collate_fn_parsing(batch: List[Tuple[List[int], List[int]]],
+                       pad_id: int) -> Dict[str, torch.Tensor]:
+    """
+    Collate function for parsing tasks.
+    """
+    # For parsing, we use the same padding mechanism.
+    return collate_fn_translation(batch, pad_id)
+
+
+# ---------------------------
+# SentencePiece Utilities
+# ---------------------------
+def _train_sentencepiece_model(training_sentences: List[str],
+                               model_prefix: str,
+                               vocab_size: int) -> str:
+    """
+    Trains a SentencePiece model using the provided training sentences.
+    Returns the generated model file path.
+    """
+    # Create a temporary file to store training sentences.
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as tmp_file:
+        for sentence in training_sentences:
+            tmp_file.write(sentence.strip() + "\n")
+        tmp_file_path = tmp_file.name
+
+    model_path = f"{model_prefix}.model"
+    spm.SentencePieceTrainer.train(
+        input=tmp_file_path,
+        model_prefix=model_prefix,
+        vocab_size=int(vocab_size),
+        pad_id=0,
+        bos_id=1,
+        eos_id=2,
+        unk_id=3,
+        user_defined_symbols=""
+    )
+    os.remove(tmp_file_path)
+    logging.info(f"Trained new SentencePiece model: {model_path}")
+    return model_path
+
+
+def _load_sentencepiece_processor(model_path: str) -> spm.SentencePieceProcessor:
+    """
+    Loads a SentencePieceProcessor from the given model_path.
+    """
+    sp = spm.SentencePieceProcessor()
+    sp.Load(model_path)
+    logging.info(f"Loaded SentencePiece model from {model_path}")
+    return sp
+
+
+# ---------------------------
+# DatasetLoader Class
+# ---------------------------
+class DatasetLoader:
+    """
+    The DatasetLoader class handles loading raw dataset files for translation and parsing tasks,
+    applies SentencePiece tokenization (using an existing model or training a new one),
+    constructs PyTorch Dataset objects, and creates DataLoader instances with dynamic batching.
+    
+    Attributes:
+        config: Configuration dictionary loaded from config.yaml.
+        task: Task type, either 'translation' or 'parsing'. Defaults to 'translation'.
+        dataset_name: For translation tasks, the specific dataset identifier (e.g., 'english_german').
+                      For parsing tasks, it is not used.
+        sp: SentencePieceProcessor for tokenization.
+        pad_id, bos_id, eos_id: Special token IDs.
+    """
+    def __init__(self, config: dict, task: str = "translation", dataset_name: Optional[str] = None) -> None:
+        self.config = config
+        self.task = task.lower()
+        if self.task == "translation":
+            # Default to english_german if not specified.
+            self.dataset_name = dataset_name if dataset_name is not None else "english_german"
+            # Get expected vocabulary size
+            self.vocab_size = int(self.config["data"]["translation"]["vocabulary"].get(self.dataset_name, 37000))
+            # Define a model prefix for SentencePiece. e.g., "spm_WMT14_en_de" for english_german.
+            self.sp_model_prefix = f"spm_{self.dataset_name}"
+        elif self.task == "parsing":
+            self.dataset_name = self.config["data"]["parsing"]["dataset"]
+            # For parsing, choose vocabulary size based on setting.
+            # Default to wsj_only if not specified.
+            self.vocab_size = int(self.config["data"]["parsing"]["vocabulary"].get("wsj_only", 16000))
+            self.sp_model_prefix = f"spm_{self.dataset_name}"
+        else:
+            raise ValueError("Unsupported task type. Must be 'translation' or 'parsing'.")
+
+        # Set dynamic batching threshold: tokens per side per batch.
+        self.batch_token_threshold = int(self.config["training"]["batch_size_tokens"])
+
+        # Define special token IDs (should match SentencePiece training settings):
+        self.pad_id = 0
+        self.bos_id = 1
+        self.eos_id = 2
+
+        # Load or train SentencePiece model.
+        self.sp_model_path = f"{self.sp_model_prefix}.model"
+        if os.path.exists(self.sp_model_path):
+            self.spm_processor = _load_sentencepiece_processor(self.sp_model_path)
+        else:
+            # For training, combine all source and target sentences from the training split.
+            raw_train = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="train")
+            sentences = []
+            if self.task == "translation":
+                # Combine source and target for training the subword model.
+                for src, tgt in raw_train:
+                    sentences.append(src)
+                    sentences.append(tgt)
+            else:
+                # For parsing, use the input sentences.
+                for sent, _ in raw_train:
+                    sentences.append(sent)
+            # Train SentencePiece model
+            _train_sentencepiece_model(sentences, self.sp_model_prefix, self.vocab_size)
+            self.spm_processor = _load_sentencepiece_processor(self.sp_model_path)
+
+    def load_data(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        """
+        Loads the dataset for the task, tokenizes the raw data using SentencePiece,
+        creates PyTorch Dataset objects, and returns DataLoader objects for train,
+        validation, and test splits.
+        """
+        if self.task == "translation":
+            raw_train = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="train")
+            raw_val = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="val")
+            raw_test = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="test")
+
+            # Tokenize and add BOS and EOS tokens.
+            train_examples = self._tokenize_translation_examples(raw_train)
+            val_examples = self._tokenize_translation_examples(raw_val)
+            test_examples = self._tokenize_translation_examples(raw_test)
+
+            train_dataset = TranslationDataset(train_examples)
+            val_dataset = TranslationDataset(val_examples)
+            test_dataset = TranslationDataset(test_examples)
+
+            collate_fn = lambda batch: collate_fn_translation(batch, self.pad_id)
+
+        elif self.task == "parsing":
+            raw_train = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="train")
+            raw_val = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="val")
+            raw_test = self._load_raw_dataset(dataset_identifier=self.dataset_name, split="test")
+
+            train_examples = self._tokenize_parsing_examples(raw_train)
+            val_examples = self._tokenize_parsing_examples(raw_val)
+            test_examples = self._tokenize_parsing_examples(raw_test)
+
+            train_dataset = ParsingDataset(train_examples)
+            val_dataset = ParsingDataset(val_examples)
+            test_dataset = ParsingDataset(test_examples)
+
+            collate_fn = lambda batch: collate_fn_parsing(batch, self.pad_id)
+        else:
+            raise ValueError("Unsupported task type encountered in load_data().")
+
+        # Log the number of examples.
+        logging.info(f"Task: {self.task}, Dataset: {self.dataset_name}")
+        logging.info(f"Train examples: {len(train_dataset)}, Val examples: {len(val_dataset)}, Test examples: {len(test_dataset)}")
+        logging.info(f"Vocabulary size (from SentencePiece): {self.spm_processor.get_piece_size()}")
+
+        # Create dynamic batch samplers and DataLoader objects.
+        train_sampler = DynamicBatchSampler(train_dataset, self.batch_token_threshold, shuffle=True)
+        val_sampler = DynamicBatchSampler(val_dataset, self.batch_token_threshold, shuffle=False)
+        test_sampler = DynamicBatchSampler(test_dataset, self.batch_token_threshold, shuffle=False)
+
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                  collate_fn=collate_fn, num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
+                                collate_fn=collate_fn, num_workers=0, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_sampler=test_sampler,
+                                 collate_fn=collate_fn, num_workers=0, pin_memory=True)
+
+        return train_loader, val_loader, test_loader
+
+    # ---------------------------
+    # Helper Methods for Loading and Tokenization
+    # ---------------------------
+    def _load_raw_dataset(self, dataset_identifier: str, split: str) -> List[Tuple[str, str]]:
+        """
+        Loads a raw dataset from files.
+        For translation, expects files at "data/{dataset_identifier}/{split}.txt" with each line formatted as:
+            source_sentence[TAB]target_sentence
+        For parsing, expects lines formatted as:
+            sentence[TAB]parse_representation
+
+        If the file does not exist, returns a dummy example list.
+        """
+        file_path = os.path.join("data", dataset_identifier, f"{split}.txt")
+        examples = []
+        if os.path.exists(file_path):
+            with open(file_path, mode="r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    # For translation, expect exactly two parts.
+                    if len(parts) >= 2:
+                        src, tgt = parts[0].strip(), parts[1].strip()
+                    else:
+                        # For parsing, it might be one sentence or two parts.
+                        src, tgt = parts[0].strip(), ""
+                    examples.append((src, tgt))
+            logging.info(f"Loaded {len(examples)} examples from {file_path}")
+        else:
+            # If file not found, create dummy examples.
+            logging.warning(f"File {file_path} not found. Using dummy examples for split '{split}'.")
+            if self.task == "translation":
+                examples = [
+                    ("This is a source sentence.", "This is a target sentence."),
+                    ("Another source sentence.", "Another target sentence.")
+                ]
+            else:
+                examples = [
+                    ("This is a sentence for parsing.", "(S (NP This) (VP is (NP parsing)))"),
+                    ("Another sentence.", "(S (NP Another) (VP sentence))")
+                ]
+        return examples
+
+    def _tokenize_translation_examples(self, raw_examples: List[Tuple[str, str]]) -> List[Tuple[List[int], List[int]]]:
+        """
+        Tokenizes translation examples using the SentencePiece processor.
+        Adds BOS and EOS tokens to both source and target sequences.
+        """
+        tokenized = []
+        for src, tgt in raw_examples:
+            # Encode sentences as token IDs.
+            src_ids = [self.bos_id] + self.spm_processor.encode(src, out_type=int) + [self.eos_id]
+            tgt_ids = [self.bos_id] + self.spm_processor.encode(tgt, out_type=int) + [self.eos_id]
+            tokenized.append((src_ids, tgt_ids))
+        return tokenized
+
+    def _tokenize_parsing_examples(self, raw_examples: List[Tuple[str, str]]) -> List[Tuple[List[int], List[int]]]:
+        """
+        Tokenizes parsing examples. For simplicity, treats the parse representation as text,
+        tokenizing it in the same manner as the sentence. In practice, parse representations
+        may require special processing.
+        """
+        tokenized = []
+        for sent, parse in raw_examples:
+            sent_ids = [self.bos_id] + self.spm_processor.encode(sent, out_type=int) + [self.eos_id]
+            parse_ids = [self.bos_id] + self.spm_processor.encode(parse, out_type=int) + [self.eos_id]
+            tokenized.append((sent_ids, parse_ids))
+        return tokenized

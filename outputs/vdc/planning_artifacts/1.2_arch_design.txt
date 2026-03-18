@@ -1,0 +1,114 @@
+----------------------------------------
+[Implementation approach]
+We will design a modular Python system that reproduces the VDC method. The system will load datasets (e.g., CIFAR-10, ImageNet-100, ImageNet-Dog) using open-source libraries (e.g., TorchVision), inject noisy labels/backdoor triggers as needed, and then run a detection pipeline composed of three modules: Visual Question Generation (VQG), Visual Question Answering (VQA), and Visual Answer Evaluation (VAE). VQG generates both fixed general questions from a template and label-specific questions via the ChatGPT API. VQA answers these questions using a multimodal model (Instruct-BLIP via HuggingFace/other libraries). VAE then evaluates the answers (using simple string matching for deterministic cases or by invoking ChatGPT for more complex general answers) and computes a vote-based matching score. Any sample with a score below an alpha threshold (0.5) is marked as dirty and later removed. Finally, a ResNet-18 model (implemented in PyTorch) is retrained on the purified dataset and evaluation metrics (TPR, FPR, ASR, ACC) are recorded.
+
+----------------------------------------
+[File list]
+- main.py
+- dataset_loader.py
+- vqg.py
+- vqa.py
+- vae.py
+- detection.py
+- trainer.py
+- evaluation.py
+- utils.py
+
+----------------------------------------
+[Data structures and interfaces]
+classDiagram
+    class Main {
+        +__init__(config: dict)
+        +run_experiment() -> None
+    }
+    class DatasetLoader {
+        +__init__(config: dict)
+        +load_data() -> dict
+        +inject_dirty_samples(data: dict) -> dict
+    }
+    class VQG {
+        +__init__(templates: List[str], labelPrompts: dict)
+        +generate_general_questions(label: str) -> List[str]
+        +generate_label_specific_questions(label: str) -> List[str]
+    }
+    class VQA {
+        +__init__(model_config: dict)
+        +answer_question(image: Any, question: str) -> str
+    }
+    class VAE {
+        +__init__(eval_config: dict)
+        +evaluate_answer(answer: str, expected: str, question_type: str) -> bool
+    }
+    class VDCDetector {
+        +__init__(vqg: VQG, vqa: VQA, vae: VAE, threshold: float)
+        +detect_sample(image: Any, label: str) -> bool
+    }
+    class Trainer {
+        +__init__(model: Any, train_data: dict, hyperparams: dict)
+        +train() -> None
+    }
+    class Evaluation {
+        +__init__(model: Any, test_data: dict)
+        +evaluate() -> dict
+    }
+    Main --> DatasetLoader
+    Main --> VDCDetector
+    VDCDetector --> VQG
+    VDCDetector --> VQA
+    VDCDetector --> VAE
+    Main --> Trainer
+    Main --> Evaluation
+
+
+----------------------------------------
+[Program call flow]
+sequenceDiagram
+    participant M as Main
+    participant DL as DatasetLoader
+    participant VQG as VQG
+    participant VQA as VQA
+    participant VAE as VAE
+    participant VDC as VDCDetector
+    participant TR as Trainer
+    participant EV as Evaluation
+
+    M->>DL: load_data()
+    DL-->>M: Return {train_data, test_data}
+    DL->>DL: inject_dirty_samples(train_data)
+    M->>VQG: initialize with templates and prompts
+    M->>VQA: initialize with model_config
+    M->>VAE: initialize with eval_config
+    M->>VDC: instantiate VDCDetector(vqg, vqa, vae, threshold=0.5)
+
+    loop For each image sample in train_data
+        M->>VDC: detect_sample(image, label)
+        VDC->>VQG: generate_general_questions(label)
+        VQG-->>VDC: list of general_questions
+        VDC->>VQG: generate_label_specific_questions(label)
+        VQG-->>VDC: list of label_specific_questions
+        loop For each question in union(general, label-specific)
+            VDC->>VQA: answer_question(image, question)
+            VQA-->>VDC: answer text
+            VDC->>VAE: evaluate_answer(answer, expected_answer, question_type)
+            VAE-->>VDC: boolean result (True/False)
+        end
+        VDC->>VDC: compute matching score (votes / total questions)
+        VDC-->>M: return detection decision (clean or dirty)
+    end
+
+    M->>DL: Purify dataset (remove dirty samples)
+    M->>TR: initialize Trainer with purified dataset and model (ResNet-18)
+    TR->>TR: train() [using SGD, epochs, lr schedule]
+    M->>EV: initialize Evaluation with trained model and test_data
+    EV->>EV: evaluate() [compute ASR, ACC, TPR, FPR]
+    EV-->>M: return metrics
+
+
+----------------------------------------
+[Anything UNCLEAR]
+Some clarifications are needed regarding:
+- The exact format and preprocessing steps for ImageNet-100 and ImageNet-Dog datasets.
+- Detailed implementation parameters for backdoor trigger generation (especially for SSBA and WaNet attacks).
+- The API usage specifics (e.g., rate limits, caching strategies) for ChatGPT and Instruct-BLIP model calls.
+- How to design expected answers for VAE evaluation in label-specific questions (the paper assumes deterministic answers via string matching).
+

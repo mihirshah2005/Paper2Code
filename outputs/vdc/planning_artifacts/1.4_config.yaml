@@ -1,0 +1,43 @@
+## config.yaml
+training:
+  epochs: 100
+  optimizer: "SGD"
+  learning_rate: 0.1
+  batch_size:
+    CIFAR-10: 128
+    ImageNet-100: 64
+    ImageNet-Dog: 64
+  lr_decay_schedule:
+    CIFAR-10:
+      - epoch: 50
+      - epoch: 75
+    ImageNet-100:
+      - epoch: 30
+      - epoch: 60
+    ImageNet-Dog:
+      - epoch: 30
+      - epoch: 60
+detection:
+  threshold: 0.5
+  general_questions_count: 2
+  label_specific_questions:
+    CIFAR-10: 4
+    ImageNet-100: 6
+    ImageNet-Dog: 4
+dirty_sample_generation:
+  noisy_ratio: 0.4
+  poisoning:
+    CIFAR-10:
+      samples_per_class: [50, 500]
+    ImageNet-100:
+      samples_per_class: [5, 50]
+    ImageNet-Dog:
+      samples_per_class: 80
+models:
+  detector: "VDC"
+  classifier: "ResNet-18"
+api:
+  chatgpt:
+    model: "gpt-3.5-turbo"
+  instruct_blip:
+    model: "Instruct-BLIP"

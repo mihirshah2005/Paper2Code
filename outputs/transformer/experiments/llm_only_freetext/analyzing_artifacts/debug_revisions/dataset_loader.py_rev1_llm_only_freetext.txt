@@ -1,0 +1,97 @@
+Below is the detailed logic analysis for the DatasetLoader module, explaining how to load and preprocess both the translation and parsing datasets per the paper and configuration file. The DatasetLoader class is responsible for:
+
+• Loading raw data (using torchtext or HuggingFace datasets)  
+• Applying subword tokenization via SentencePiece (with training of a shared vocabulary as needed)  
+• Constructing vocabulary files based on the config‐specified sizes  
+• Creating PyTorch DataLoader objects for train, validation, and test splits  
+• Batching examples based on an approximate token count (e.g. 25,000 tokens per batch for both source and target)
+
+The analysis is detailed step by step:
+
+─────────────────────────────  
+1. Initialization and Configuration  
+ – The __init__ method accepts a configuration dictionary (parsed from config.yaml).  
+ – It reads relevant settings from the config:
+  • Under “data”, determine which dataset to load. For translation, the keys “translation→datasets” and “translation→vocabulary” provide both the dataset name (e.g., "WMT14_en_de" or "WMT14_en_fr") and the target vocabulary size (e.g., 37000 or 32000).
+  • For parsing, it will use the “parsing→dataset” (e.g., "WSJ_Penn_Treebank") and corresponding vocabulary sizes (e.g., 16000 for wsj_only or 32000 for semi_supervised).
+ – It also retrieves the batch size token threshold (batch_size_tokens = 25000) so that each batch approximately contains 25,000 source tokens and 25,000 target tokens.
+ – The class should allow—for extensibility—a way to specify the task type (translation versus parsing), although by default the loader may focus on translation as that is most detailed in the paper.
+
+─────────────────────────────  
+2. Loading Raw Datasets  
+ A. Translation Data  
+  – Use torchtext (or HuggingFace datasets) to download and load the WMT datasets.  
+  – For each translation task, load the parallel corpus where each example is a (source, target) pair.
+  – If the dataset loader library automatically provides proper splits (train/validation/test) then use these; otherwise, implement a splitting strategy.
+  – Log the number of examples in each split.
+
+ B. Parsing Data  
+  – Load the WSJ Penn Treebank dataset. (For WSJ-only experiments, follow the standard split—for example, sections 2–21 as training, section 22 as development, and section 23 as test.)
+  – If additional semi-supervised data exists, check for proper configuration.
+  – Again, log the count of examples per split.
+
+─────────────────────────────  
+3. Subword Tokenization with SentencePiece  
+ – Check whether a pre-trained SentencePiece model already exists (using a naming convention based on the dataset, e.g. “spm_WMT14_en_de.model”).  
+ – If the model does not exist, train a new SentencePiece model using the training split’s text:
+  • For translation, since the paper uses a shared source–target vocabulary, combine the text from both source and target sentences.
+  • Use the vocabulary size from config (e.g., 37000 for English–German).
+  • Call sentencepiece.SentencePieceTrainer.train() with appropriate parameters.
+ – Once the SentencePiece model is available, load it using sentencepiece.SentencePieceProcessor.
+ – For each data sample, use the SentencePiece model to tokenize the text into subword token IDs.
+ – Make sure to include or handle special tokens (e.g., <s>, </s>, <unk>, and <pad>).
+
+─────────────────────────────  
+4. Constructing the Vocabulary  
+ – With SentencePiece, the vocabulary is embedded in the model file.  
+ – Validate that the tokenizer’s vocabulary size matches the expected value in config.
+ – Save or cache the vocabulary file/model if it was newly created so that future runs avoid re-training the SentencePiece model.
+
+─────────────────────────────  
+5. Preprocessing and Data Pair Construction  
+ A. For Translation  
+  – Process each (source, target) pair:
+   • Tokenize both sides using the loaded SentencePiece processor.
+   • Optionally, add start-of-sequence and end-of-sequence tokens.
+  – Create a custom Dataset object (e.g., a subclass of torch.utils.data.Dataset) that returns a tuple (source_ids, target_ids).
+  – Optionally, sort or bucket data by sentence length to facilitate efficient dynamic batching.
+
+ B. For Parsing  
+  – Process textual sentences into tokenized forms.
+  – If the target is a structured parse (a string representation of the parse tree), tokenize that too.
+  – Build a custom Dataset that returns (input_tokens, parse_tokens).
+
+─────────────────────────────  
+6. Batching and Dynamic Collation  
+ – Since the configuration specifies “batch_size_tokens” (25000 tokens per side), implement a custom collate_fn function:
+  • The collate function should collect examples until the total number of tokens (e.g., computed as the sum of sentence lengths or using the maximum sentence length times the number of examples) reaches the predefined token threshold.
+  • Pad sequences appropriately so that all examples in a batch have equal length.
+  • For parallel corpora, batch both source and target sequences separately, ensuring that each side meets the token budget.
+ – Alternatively, use an iterator (like torchtext’s BucketIterator) that groups examples with similar lengths.
+ – Ensure that training data is optionally shuffled, while validation/test splits are not.
+
+─────────────────────────────  
+7. DataLoader Construction and Return  
+ – For each of the three splits (train, validation, and test), create a PyTorch DataLoader:
+  • Pass the custom dataset created above.
+  • Set the batch size based on dynamic batching (using the custom collate_fn) rather than a fixed number of examples.
+  • Configure DataLoader parameters such as shuffle (True for training), num_workers, and pin_memory if needed.
+ – The load_data() method should then return a tuple of (train_loader, val_loader, test_loader) to be used by the Trainer and Evaluation modules.
+
+─────────────────────────────  
+8. Logging and Error Handling  
+ – Log key information: number of examples loaded per split, vocabulary size, and whether a pre-trained SentencePiece model was found or created.
+ – Include proper error handling in case the dataset files cannot be found or the tokenization fails.
+ – Optionally, include a caching mechanism so that tokenized examples do not need to be processed in every run (improving reproducibility and runtime efficiency).
+
+─────────────────────────────  
+9. Extensibility and Clarifications  
+ – The design should be modular to allow switching between translation and parsing tasks (e.g., via an additional parameter in the config or as an argument to the __init__ method).  
+ – Although the exact file formats for the raw datasets may vary, an abstraction should be maintained so that if the underlying data source is replaced (from torchtext to HuggingFace datasets, for example), the rest of the pipeline (tokenization, batching) remains unchanged.  
+ – Ensure the batching strategy strictly adheres to the “approximate token count per batch” as specified by the config (25000 tokens for source and target), which is key for reproducibility of the Transformer experiments.
+
+─────────────────────────────  
+Summary  
+The DatasetLoader module will combine configurable dataset loading with robust subword tokenization (via SentencePiece) and a dynamic batching strategy. It leverages configuration values from config.yaml for vocabulary sizes, dataset names, and batching thresholds. This design ensures that the downstream training and evaluation modules receive properly tokenized and batched data in line with the experimental design of “Attention Is All You Need.”
+
+This thorough logic analysis forms the blueprint for writing dataset_loader.py without deviating from the provided design and configuration specifications.

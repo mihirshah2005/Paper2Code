@@ -1,0 +1,130 @@
+Below is a detailed logic analysis for the Model class in model.py. This class is responsible for holding and updating the learnable parameters (the synthetic node features X′ and the synthetic eigenbasis U′ₖ), computing the three loss terms (Lₑ, L_d, and Lₒ), and reconstructing the synthetic graph (in particular, its Laplacian and adjacency) using the learned U′ₖ together with the real graph spectrum. The analysis is written in terms of torch tensors and follows the design, paper description, and configuration settings.
+
+──────────────────────────────
+1. Class Initialization ( __init__ )
+──────────────────────────────
+• Expected inputs (via a params or config dictionary):
+ – The number of synthetic nodes, N′. (This is computed from the compression ratio in config and the real graph’s node count.)
+ – The feature dimension, d (which should match the real node feature dimension).
+ – The eigenbasis size, K. According to the paper and design, K is computed as K = K₁ + K₂. With rₖ given (e.g., 0.9) and using N′ as total synthetic nodes, one can set K₁ = round(rₖ · N′) and K₂ = N′ – K₁. (For simplicity, one may choose K = N′.)
+ – Loss weights α, β, γ (all set to 1.0 as per the config.yaml in our example).
+ – (Optionally) Any other hyperparameters that might be needed.
+
+• What to initialize:
+ – A learnable synthetic node feature matrix X′ of shape (N′, d). This will be stored as a torch.nn.Parameter.
+ – A learnable synthetic eigenbasis matrix U′ₖ of shape (N′, K). Even though U′ₖ is meant to “match” a set of selected eigenvectors of the real graph, its entries are learned independently. To encourage a good starting point, it is recommended to use orthogonal (or near‐orthogonal) initialization. For example, one can use torch.nn.init.orthogonal_.
+
+• Summary of initialization steps:
+ 1. Read N′, d, and K from the provided parameters.
+ 2. Create X′ ← torch.nn.Parameter(torch.randn(N′, d)) (or another initialization as desired).
+ 3. Create U′ₖ ← torch.nn.Parameter(torch.randn(N′, K)) and immediately (if desired) orthogonalize it.
+ 4. Store the loss weights (α, β, γ) as attributes to be used later in loss calculation.
+
+──────────────────────────────
+2. Forward Method ( forward )
+──────────────────────────────
+• Purpose:
+ – The forward() method here is not used to perform a standard GNN forward pass but rather to output the current synthetic parameters.
+ – In this design, it returns a dictionary (or tuple) containing the synthetic node features and a “normalized” version of U′ₖ. Normalization of U′ₖ is performed column‐wise (i.e. each “eigenvector” is normalized to unit length) to make the cosine‐similarity computations meaningful.
+
+• Implementation details:
+ – Compute normalized synthetic eigenbasis:
+  • For U′ₖ (of shape (N′, K)), normalize each column; e.g.,
+   U_synth = normalize(U′ₖ, dim=0) (using torch.nn.functional.normalize).
+ – Return:
+  {
+   "X_synth": self.synthetic_features,
+   "U_synth": U_synth
+  }
+ This output is then used by the loss function computation and, later, in reconstruct_graph.
+
+──────────────────────────────
+3. Loss Computation ( compute_loss )
+──────────────────────────────
+• Purpose:
+ – To compute the three components of the total loss L_total = α·Lₑ + β·L_d + γ·Lₒ. The three loss components are:
+
+  A. Eigenbasis Matching Loss (Lₑ)
+   • Goal: Make the learned synthetic eigenbasis U′ₖ match the “target” eigenbasis Uₖ from the real graph.
+   • Proposed implementation:
+    – Assume that the real eigenbasis is provided (from the dataset loader) in a preprocessed form. For consistency, we assume that the target real eigenbasis is already “adjusted” to have the same number of rows as the synthetic graph (for example, via subsampling or interpolation) so that both real and synthetic eigenvectors are represented as vectors in ℝ^(N′).
+    – For each column k (ranging from 1 to K), compute the cosine similarity between the kth column of the real eigenbasis and the kth column of U_synth (obtained from forward()). Because eigenvectors are unique only up to sign, take the absolute value of the cosine similarity.
+    – Loss for each k is: 1 – |cos( u_real_k, u_synth_k )|. Then Lₑ can be the mean (or sum) over all K columns.
+     Lₑ = (1/K) Σ[k=1,..,K] (1 – |cosine(u_real[:, k], U_synth[:, k])|).
+
+  B. Discrimination Constraint Loss (L_d)
+   • Goal: Ensure that the synthetic graph preserves category‐level (class) information.
+   • Implementation:
+    – This loss compares the “category-level representations” of the real and synthetic graphs.
+    – These representations (denoted H for the real graph and H′ for the synthetic graph) are assumed to be computed externally (e.g., H = Xᵀ A Y, where Y are class indicators). They are passed in as arguments.
+    – Use cosine similarity (or 1 minus cosine similarity) as the loss:
+     L_d = 1 – cosine_similarity(H, H′)
+    – (This can be computed using torch.nn.functional.cosine_similarity; if H and H′ are matrices, one may average the cosine similarity value over the appropriate dimension.)
+
+  C. Orthogonality Loss (Lₒ)
+   • Goal: Ensure that the learned synthetic eigenbasis remains an orthonormal basis (i.e., U_synthᵀ U_synth should be close to the identity).
+   • Implementation:
+    – Compute the Gram matrix of U_synth: G = U_synthᵀ @ U_synth.
+    – Compute the deviation from orthonormality: Lₒ = ||G – I||_F²,
+     where I is the K×K identity matrix (use torch.eye(K) for identity).
+    – Use a Frobenius norm function (for instance, torch.norm(G – I, p='fro')²).
+
+• Finally, combine the losses:
+ L_total = α · Lₑ + β · L_d + γ · Lₒ
+ where α, β, γ are taken directly from the configuration (in our config.yaml, each is 1.0).
+
+• The compute_loss method should thus take as arguments:
+ – real_eigen: the target eigenbasis (assumed to be a torch.Tensor with shape (N′, K) after any preprocessing)
+ – real_cat_repr and synthetic_cat_repr (both torch.Tensors) for the discrimination constraint.
+ It then returns the total loss (and optionally, the individual losses for logging).
+
+──────────────────────────────
+4. Parameter Updates ( update_eigenbasis and update_features )
+──────────────────────────────
+• Although optimizer steps are usually performed by the Trainer module, the Model class design includes public member functions for updating the synthetic parameters.
+• update_eigenbasis(gradients):
+ – This method will take a gradient tensor as input and then update self.synthetic_eigen by subtracting ηₑ·gradients, where ηₑ is the learning rate for eigenbasis updates (from config.learning_rate_eigenvecs).
+• update_features(gradients):
+ – Similarly, update self.synthetic_features using the provided gradient and a learning rate (config.learning_rate_feat).
+• Note: In practice, these updates are often handled automatically by torch.optim.Adam. Including these functions (as per design) provides an explicit alternative update step if needed.
+
+──────────────────────────────
+5. Graph Reconstruction ( reconstruct_graph )
+──────────────────────────────
+• Purpose:
+ – To “rebuild” the synthetic graph’s structure (both its Laplacian and adjacency matrix) using the learned synthetic eigenbasis and the real graph’s spectrum.
+• Inputs:
+ – real_eigenvalues: A torch.Tensor containing the selected eigenvalues (of length K) from the real graph’s Laplacian.
+  The real eigenvalues should correspond to the same indices as the real eigenbasis used for computing Lₑ.
+• Steps:
+ 1. Normalize the current synthetic eigenbasis U′ₖ along the columns (produce U_synth, as in forward()).
+ 2. Create two diagonal matrices:
+  – D₁ = diag(1 – λₖ) for k = 1, …, K.
+  – D₂ = diag(λₖ) for k = 1, …, K.
+ 3. Compute the synthetic adjacency matrix:
+  A′ = U_synth @ D₁ @ U_synthᵀ
+ 4. Compute the synthetic Laplacian:
+  L′ = U_synth @ D₂ @ U_synthᵀ
+• Return a tuple (A′, L′), taking care that these computations are differentiable if needed for further analysis.
+
+──────────────────────────────
+6. Summary of Interface
+──────────────────────────────
+The Model class in model.py will have these public functions:
+ – __init__(params: dict): Initializes the learnable synthetic node features and synthetic eigenbasis, along with storing loss weights.
+ – forward(x: torch.Tensor): Returns a dictionary with entries “X_synth” (the synthetic node features) and “U_synth” (the column‑normalized synthetic eigenbasis). This is used later for loss computations.
+ – compute_loss(real_eigen, real_cat_repr, synthetic_cat_repr): Computes Lₑ, L_d, and Lₒ as described and returns the total loss.
+ – update_eigenbasis(gradients: torch.Tensor) and update_features(gradients: torch.Tensor): Provide explicit parameter update methods (if not using an external optimizer).
+ – reconstruct_graph(real_eigenvalues: torch.Tensor): Reconstructs and returns (A′, L′) for subsequent evaluation.
+
+──────────────────────────────
+7. Implementation Ambiguities / Points for Clarification
+──────────────────────────────
+• The paper does not fully specify the exact mathematical formulation of Lₑ and L_d. Here we choose a column-wise cosine similarity loss for Lₑ and a 1 minus cosine similarity loss for L_d.
+• The real eigenbasis provided to the model must be preprocessed so that its dimensions are comparable with the synthetic eigenbasis (e.g., both having N′ rows). This preprocessing step occurs in dataset_loader.py.
+• The initialization of the synthetic eigenbasis: The paper mentions an SBM-based initialization. In our implementation we opt for a random orthogonal initialization (using torch.nn.init.orthogonal_) unless more details are provided.
+• The alternating update schedule (tau1 and tau2) and the number of epochs are handled externally in the Trainer module; the Model class only provides the functions to update its parameters.
+
+By following this logic, the Model class will faithfully implement the key components of the GDEM method as described in the paper while remaining consistent with the overall design and configuration settings.
+
+This concludes the logic analysis for model.py.

@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is my plain‐text critique of the analysis:\n\n1. Noise Injection Details (Medium):\n The description of how diffusion noise is injected is a bit vague. The analysis notes that a DDPM-inspired noise schedule is used and that a diffusion timestep t is determined, but it doesn’t clearly specify how t is sampled or how exactly the noise is applied to the latent tokens. Because this is a central part of the diffusion model’s functioning, more precise details would help ensure that the noise inject",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is my plain‐text critique of the analysis:\n\n1. Noise Injection Details (Medium):\n The description of how diffusion noise is injected is a bit vague. The analysis notes that a DDPM-inspired noise schedule is used and that a diffusion timestep t is determined, but it doesn’t clearly specify how t is sampled or how exactly the noise is applied to the latent tokens. Because this is a central part of the diffusion model’s functioning, more precise details would help ensure that the noise inject",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

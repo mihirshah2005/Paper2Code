@@ -1,0 +1,61 @@
+Below is the detailed logic analysis for config.py. This module is central for keeping all experiment settings consistent across modules. The Config class will load the configuration parameters from the YAML file (config.yaml) and expose them in a dictionary format that other parts of the system—such as dataset loading, model instantiation, curriculum learning, training, and evaluation—can import and use.
+
+────────────────────────────
+1. Purpose of Config.py
+
+• The Config class is responsible for reading the YAML configuration file and converting its contents into a Python dictionary.  
+• It ensures that all modules use exactly the same hyperparameters, dataset paths, training settings, and curriculum learning method parameters as specified in the configuration file.  
+• By centralizing configuration, we guarantee reproducibility (using fixed random seeds), consistency (all modules see the same values), and easier debugging if any parameter needs adjustment.
+
+────────────────────────────
+2. Key Steps and Responsibilities
+
+a) Initialization and File Loading  
+  – The Config class should have an __init__ method that accepts an optional configuration file path (defaulting to "config.yaml").  
+  – It reads the file (using the PyYAML library) and parses the YAML content into an internal dictionary (e.g., self.config_dict).  
+  – Any errors in reading or parsing should be caught and properly reported.  
+  – (Optionally) The __init__ may also perform basic validation to check that required keys (such as 'training', 'curriculum', 'reproducibility', 'evaluation') are present.
+
+b) Configuration Structure  
+  – The returned dictionary will mirror the structure as defined in config.yaml:  
+    • training: Contains subsections for cv, nlp (with separate configurations for lstm and transformer), and graph (including learning_rates for different graph datasets).  
+    • curriculum: Holds hyperparameters such as warmup_epochs, schedule_epochs, and growth_rate. Notice that these values might be null, so the modules using them must account for missing (None) values.  
+    • reproducibility: Includes a list of seeds that every experiment should loop over.  
+    • evaluation: Defines which performance metrics to use for each domain and flags for recording GPU memory and training time.
+  
+c) Interface  
+  – The primary method (e.g., load() or property getter) will return the configuration dictionary so that Main or any other module can use it to instantiate their own settings.  
+  – The design must strictly follow and not change any of the keys as outlined in the configuration file. This ensures that any calls in module classes (e.g., in DatasetLoader, ModelManager, Trainer, Evaluation) that expect a certain key will succeed.
+
+d) Consistency and Reproducibility  
+  – Since many modules will import Config, the Config class should encapsulate all randomness-related configurations (like the seeds list).  
+  – It should be designed to eventually support additional validation or even default settings if the YAML file lacks any expected key, but at this stage, we must use exactly the values as specified in the config.yaml.  
+  – The Config class serves as a single point of truth, ensuring that any changes in the YAML are reflected system-wide without redundant hard-coded values.
+
+────────────────────────────
+3. Example Logical Flow in Config.py
+
+• When Main calls Config.load() (or instantiates Config and accesses its config_dict), the following steps should occur:  
+  1. The Config constructor is called with the path (default: "config.yaml").  
+  2. The YAML file is opened and read.  
+  3. The file contents are parsed and stored internally (e.g., self.config_dict).  
+  4. The configuration dictionary is returned or made accessible as a public member.  
+  5. Other modules (DatasetLoader, ModelManager, Trainer, CurriculumScheduler, Evaluation) will import this module to get consistent access to settings like batch_size, learning_rate, optimizer types, curriculum hyperparameters, seed values, and evaluation metric names.
+
+────────────────────────────
+4. Considerations Specific to Our Design
+
+• Do not alter the structure as the design already specifies the keys and expected dictionary layout.  
+• The Config class must not create any extra public member functions beyond those defined in the “Data structures and interfaces” diagram.  
+• It should also not assume any default values outside those provided in config.yaml; for instance, if curriculum hyperparameters are null in the YAML, they must be passed as None.
+• Ensure compatibility of the loaded configuration with downstream modules (e.g., “training.cv”, “training.nlp.lstm”, “training.nlp.transformer”, “training.graph”, “evaluation.metrics”, etc.)
+
+────────────────────────────
+5. Summary
+
+The logic in config.py is straightforward:  
+– Load the YAML file, parse it, and expose it as a dictionary.  
+– Guarantee that each configuration parameter (from training details for CV, NLP, and Graph to curriculum parameters and reproducibility seeds) remains the single source of truth.  
+– This module will be imported by all other modules (dataset_loader.py, model.py, curriculum.py, trainer.py, evaluation.py, main.py) to ensure that the entire system uses the same hyperparameters and settings described in the research paper and outlined in the provided config.yaml.
+
+This analysis should serve as a detailed guide when writing the actual code for config.py, anchoring all other experiments in a consistently reproducible configuration.

@@ -1,0 +1,215 @@
+## Code: detection.py
+```python
+"""
+detection.py
+
+This module implements the VDCDetector class for the Versatile Data Cleanser (VDC) pipeline.
+It integrates the Visual Question Generation (VQG), Visual Question Answering (VQA), and 
+Visual Answer Evaluation (VAE) modules to detect whether a given image-label pair is "clean" 
+or "dirty" based on the semantic consistency between the visual content and the given label.
+
+The detection process consists of:
+  1. Generating two sets of questions using VQG:
+     - General questions (predefined templates)
+     - Label-specific questions (generated via ChatGPT API)
+     In case of exceptions during generation, default question lists stored in the VQG instance are used.
+     
+  2. For each generated question, calling the VQA module to obtain an answer.
+     If an error occurs, the answer is set to None and later marked as an incorrect evaluation.
+     
+  3. Evaluating each answer using the VAE module:
+     - For label-specific questions, the expected answer is "yes" (checked using deterministic string matching).
+     - For general questions, the evaluation relies on ChatGPT-based analysis through VAE.
+     Exceptions during evaluation lead to marking the question as incorrect.
+     
+  4. Computing the vote-based matching score: (number of correctly evaluated answers) / (total number of questions).
+  
+  5. If the matching score is greater than or equal to the threshold (alpha, default 0.5 from config),
+     the sample is considered clean (True); otherwise, it is marked as dirty (False).
+     
+All API calls and critical steps are wrapped with robust exception handling to ensure that 
+failures at any stage result in a conservative (i.e., negative) vote for the sample.
+"""
+
+import logging
+from typing import Any, List, Tuple
+
+# Import modules for question generation, answering, and evaluation.
+from vqg import VQG
+from vqa import VQA
+from vae import VAE
+
+# Set up module-level logger.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+class VDCDetector:
+    """
+    VDCDetector integrates the VQG, VQA, and VAE modules to detect dirty samples
+    based on visual-linguistic inconsistency.
+    
+    Attributes:
+        vqg (VQG): Instance of the Visual Question Generation module.
+        vqa (VQA): Instance of the Visual Question Answering module.
+        vae (VAE): Instance of the Visual Answer Evaluation module.
+        threshold (float): Matching score threshold to decide if a sample is clean (>= threshold) or dirty.
+    """
+    def __init__(self, vqg: VQG, vqa: VQA, vae: VAE, threshold: float = 0.5) -> None:
+        """
+        Initializes the VDCDetector with the given module instances and threshold.
+        
+        Args:
+            vqg (VQG): Instance of VQG.
+            vqa (VQA): Instance of VQA.
+            vae (VAE): Instance of VAE.
+            threshold (float): Decision threshold (default is 0.5).
+        """
+        self.vqg = vqg
+        self.vqa = vqa
+        self.vae = vae
+        self.threshold = threshold
+        logger.info(f"VDCDetector initialized with threshold = {self.threshold}")
+
+    def detect_sample(self, image: Any, label: str) -> bool:
+        """
+        Processes a single image-label sample through the VDC pipeline and decides whether the sample is clean.
+        
+        The process:
+          1. Generate general and label-specific questions using VQG.
+          2. For each question, query the VQA module to obtain an answer.
+             If VQA fails, the answer is marked as failed.
+          3. Evaluate each answer using VAE:
+             - For label-specific questions, the expected answer is "yes".
+             - For general questions, expected answer is None to trigger ChatGPT-based evaluation.
+          4. Compute the matching score as the proportion of questions evaluated as correct.
+          5. Return True (clean) if matching score >= threshold, else False (dirty).
+        
+        Args:
+            image (Any): The input image (PIL.Image or convertible image).
+            label (str): The label associated with the image.
+        
+        Returns:
+            bool: True if the sample is considered clean (matching score >= threshold), False otherwise.
+        """
+        # Step 1: Generate questions using VQG.
+        try:
+            general_questions: List[str] = self.vqg.generate_general_questions(label)
+            logger.info(f"Generated {len(general_questions)} general questions for label '{label}'.")
+        except Exception as e:
+            logger.exception(f"Error generating general questions for label '{label}': {e}. Using fallback general questions.")
+            # Fallback: use the internal default general templates, if available.
+            general_questions = (
+                self.vqg.general_templates
+                if hasattr(self.vqg, "general_templates") and self.vqg.general_templates
+                else ["Describe the image briefly."]
+            )
+
+        try:
+            label_specific_questions: List[str] = self.vqg.generate_label_specific_questions(label)
+            logger.info(f"Generated {len(label_specific_questions)} label-specific questions for label '{label}'.")
+        except Exception as e:
+            logger.exception(f"Error generating label-specific questions for label '{label}': {e}. Using fallback label-specific questions.")
+            # Fallback: if available in cache, use it; otherwise generate a default list.
+            if hasattr(self.vqg, "cache") and label in self.vqg.cache:
+                label_specific_questions = self.vqg.cache[label]
+            else:
+                count = getattr(self.vqg, "label_specific_count", 4)
+                label_specific_questions = [f"Does the image depict a typical {label}?" for _ in range(count)]
+
+        # Combine questions with their types.
+        all_questions: List[Tuple[str, str]] = []
+        for q in general_questions:
+            all_questions.append((q, "general"))
+        for q in label_specific_questions:
+            all_questions.append((q, "label_specific"))
+
+        total_questions: int = len(all_questions)
+        correct_count: int = 0
+
+        # Step 2 & 3: For each question, obtain answer via VQA and evaluate via VAE.
+        for question, q_type in all_questions:
+            try:
+                answer: str = self.vqa.answer_question(image, question)
+                logger.info(f"VQA answer for question '{question}' [{q_type}]: {answer}")
+            except Exception as e:
+                logger.exception(f"Error during VQA.answer_question for question '{question}': {e}. Marking as failed.")
+                answer = None  # Mark as failure.
+
+            # Determine expected answer for evaluation:
+            expected_answer: str = "yes" if q_type == "label_specific" else None
+
+            try:
+                if answer is None:
+                    evaluation_correct: bool = False
+                else:
+                    evaluation_correct = self.vae.evaluate_answer(answer, expected_answer, q_type)
+                logger.info(f"Evaluation of question '{question}' [{q_type}]: {evaluation_correct}")
+            except Exception as e:
+                logger.exception(f"Error during VAE.evaluate_answer for question '{question}': {e}. Marking as failed.")
+                evaluation_correct = False
+
+            if evaluation_correct:
+                correct_count += 1
+
+        # Step 4: Compute matching score.
+        matching_score: float = (correct_count / total_questions) if total_questions > 0 else 0.0
+        logger.info(f"Computed matching score for label '{label}': {matching_score} (Correct: {correct_count} / Total: {total_questions})")
+
+        # Step 5: Decision Making.
+        # Sample is considered clean if matching score >= threshold.
+        is_clean: bool = matching_score >= self.threshold
+        logger.info(f"Detection decision for label '{label}': {'Clean' if is_clean else 'Dirty'} (Threshold: {self.threshold})")
+        return is_clean
+
+
+if __name__ == "__main__":
+    # Demonstration of VDCDetector usage.
+    import sys
+    from PIL import Image
+
+    # For demonstration, instantiate dummy or default module instances.
+    # Normally these modules are properly configured and loaded.
+    try:
+        # Import configurations if needed from config.yaml using utils.load_config, but here we use defaults.
+        from vqg import VQG
+        from vqa import VQA
+        from vae import VAE
+    except ImportError as e:
+        logger.error(f"Error importing required modules: {e}")
+        sys.exit(1)
+
+    # Define a simple evaluation configuration dictionary.
+    sample_eval_config = {
+        "affirmative_patterns": [r"\byes\b", r"\byep\b", r"\byeah\b", r"\bindeed\b", r"\bcorrect\b"],
+        "negative_patterns": [r"\bno\b", r"\bnot\b", r"\bdon't\b", r"\bcannot\b"],
+        "api_retry_limit": 3,
+        "api_retry_delay": 2,
+        "api_timeout": 10,
+        "default_general_result": False,
+        "chatgpt_model": "gpt-3.5-turbo",
+        "eval_prompt_template": ("You are a precise evaluator. Given the model's answer: '{answer}' and the expected answer: '{expected}', "
+                                 "determine if they match semantically. Answer only with 'yes' or 'no'.")
+    }
+
+    # Instantiate VQG, VQA, and VAE with default parameters.
+    dummy_vqg = VQG()  # Uses default general templates and label-specific generation.
+    dummy_vqa = VQA(model_config={})  # Dummy configuration; in practice, provide model details.
+    dummy_vae = VAE(eval_config=sample_eval_config)
+
+    # Instantiate the VDCDetector with threshold obtained from config (default 0.5).
+    detector = VDCDetector(vqg=dummy_vqg, vqa=dummy_vqa, vae=dummy_vae, threshold=0.5)
+
+    # Create a dummy image sample (224x224 blank image).
+    dummy_image = Image.new("RGB", (224, 224), color=(128, 128, 128))
+    sample_label = "cat"
+
+    # Run detection on the sample.
+    detection_result: bool = detector.detect_sample(dummy_image, sample_label)
+    print(f"Detection result for sample with label '{sample_label}': {'Clean' if detection_result else 'Dirty'}")
+```

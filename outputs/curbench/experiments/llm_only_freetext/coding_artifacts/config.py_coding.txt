@@ -1,0 +1,384 @@
+```python
+"""config.py
+
+This module defines the Config class responsible for loading, validating, and managing
+the experimental configuration parameters from the YAML file ("config.yaml").
+
+It enforces explicit type conversions and error handling to ensure that all parameters
+are correctly set before use by other modules.
+"""
+
+import os
+import yaml
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+class Config:
+    """Config class loads and validates the experiment configuration from a YAML file.
+
+    The configuration file must contain the following top-level keys:
+      - training
+      - curriculum
+      - reproducibility
+      - evaluation
+
+    The training section is further divided by domain (cv, nlp, graph) with required sub-keys.
+    Optional curriculum parameters (warmup_epochs, schedule_epochs, growth_rate) are set to None if not provided.
+    """
+
+    def __init__(self, file_path: str = "config.yaml") -> None:
+        """
+        Initialize Config with the path to the configuration YAML file.
+        :param file_path: Path to the YAML configuration file.
+        """
+        self.file_path: str = file_path
+        self.config: Optional[Dict[str, Any]] = None
+
+    def load(self) -> Dict[str, Any]:
+        """
+        Loads and validates the configuration file, performs explicit type conversions,
+        and returns the final configuration dictionary.
+        :return: Validated configuration dictionary.
+        :raises: Exception if any errors occur during file reading, type conversion,
+                 or missing required configuration keys.
+        """
+        # Check if the configuration file exists.
+        if not os.path.exists(self.file_path):
+            logger.error(f"Configuration file '{self.file_path}' does not exist.")
+            raise FileNotFoundError(f"Configuration file '{self.file_path}' not found.")
+
+        # Read and parse the YAML configuration file.
+        try:
+            with open(self.file_path, "r") as stream:
+                config_data = yaml.safe_load(stream)
+        except Exception as e:
+            logger.error(f"Failed to read configuration file '{self.file_path}': {e}")
+            raise e
+
+        if not isinstance(config_data, dict):
+            logger.error("Configuration file content is not a valid dictionary.")
+            raise ValueError("Invalid configuration: expected a top-level dictionary.")
+
+        # Validate presence of top-level keys.
+        required_top_keys = ["training", "curriculum", "reproducibility", "evaluation"]
+        for key in required_top_keys:
+            if key not in config_data:
+                logger.error(f"Missing required configuration key: '{key}'")
+                raise KeyError(f"Missing required configuration key: '{key}'")
+
+        # Process the "training" section.
+        training: Dict[str, Any] = {}
+
+        # Process CV training configuration.
+        try:
+            training_cv = config_data["training"].get("cv", {})
+            required_cv_keys = ["models", "batch_size", "optimizer", "learning_rate", "epochs"]
+            for key in required_cv_keys:
+                if key not in training_cv:
+                    logger.error(f"Missing '{key}' in training -> cv configuration.")
+                    raise KeyError(f"Missing '{key}' in training -> cv configuration.")
+            training_cv_validated = {
+                "models": training_cv["models"]
+                if isinstance(training_cv["models"], list)
+                else [training_cv["models"]],
+                "batch_size": self._to_int(training_cv["batch_size"], "training->cv->batch_size"),
+                "optimizer": str(training_cv["optimizer"]),
+                "learning_rate": self._to_float(training_cv["learning_rate"], "training->cv->learning_rate"),
+                "epochs": self._to_int(training_cv["epochs"], "training->cv->epochs"),
+            }
+            training["cv"] = training_cv_validated
+        except Exception as e:
+            logger.error(f"Error validating training->cv configuration: {e}")
+            raise e
+
+        # Process NLP training configuration.
+        try:
+            training_nlp = config_data["training"].get("nlp", {})
+            # LSTM configuration
+            if "lstm" not in training_nlp:
+                logger.error("Missing 'lstm' in training -> nlp configuration.")
+                raise KeyError("Missing 'lstm' in training -> nlp configuration.")
+            lstm_conf = training_nlp["lstm"]
+            required_lstm_keys = ["model", "batch_size", "optimizer", "learning_rate_range", "epochs"]
+            for key in required_lstm_keys:
+                if key not in lstm_conf:
+                    logger.error(f"Missing '{key}' in training -> nlp -> lstm configuration.")
+                    raise KeyError(f"Missing '{key}' in training -> nlp -> lstm configuration.")
+            lr_range_tuple = self._parse_lr_range(lstm_conf["learning_rate_range"], "training->nlp->lstm->learning_rate_range")
+            lstm_validated = {
+                "model": str(lstm_conf["model"]),
+                "batch_size": self._to_int(lstm_conf["batch_size"], "training->nlp->lstm->batch_size"),
+                "optimizer": str(lstm_conf["optimizer"]),
+                "learning_rate_range": lr_range_tuple,
+                "epochs": self._to_int(lstm_conf["epochs"], "training->nlp->lstm->epochs"),
+            }
+
+            # Transformer configuration
+            if "transformer" not in training_nlp:
+                logger.error("Missing 'transformer' in training -> nlp configuration.")
+                raise KeyError("Missing 'transformer' in training -> nlp configuration.")
+            transformer_conf = training_nlp["transformer"]
+            required_transformer_keys = ["models", "batch_size", "optimizer", "learning_rate", "epochs"]
+            for key in required_transformer_keys:
+                if key not in transformer_conf:
+                    logger.error(f"Missing '{key}' in training -> nlp -> transformer configuration.")
+                    raise KeyError(f"Missing '{key}' in training -> nlp -> transformer configuration.")
+            transformer_validated = {
+                "models": transformer_conf["models"]
+                if isinstance(transformer_conf["models"], list)
+                else [transformer_conf["models"]],
+                "batch_size": self._to_int(transformer_conf["batch_size"], "training->nlp->transformer->batch_size"),
+                "optimizer": str(transformer_conf["optimizer"]),
+                "learning_rate": self._to_float(transformer_conf["learning_rate"], "training->nlp->transformer->learning_rate"),
+                "epochs": self._to_int(transformer_conf["epochs"], "training->nlp->transformer->epochs"),
+            }
+
+            training["nlp"] = {"lstm": lstm_validated, "transformer": transformer_validated}
+        except Exception as e:
+            logger.error(f"Error validating training->nlp configuration: {e}")
+            raise e
+
+        # Process Graph training configuration.
+        try:
+            training_graph = config_data["training"].get("graph", {})
+            required_graph_keys = ["models", "batch_size", "optimizer", "epochs", "learning_rates"]
+            for key in required_graph_keys:
+                if key not in training_graph:
+                    logger.error(f"Missing '{key}' in training -> graph configuration.")
+                    raise KeyError(f"Missing '{key}' in training -> graph configuration.")
+            learning_rates = training_graph["learning_rates"]
+            if not isinstance(learning_rates, dict):
+                logger.error("training->graph->learning_rates must be a dictionary.")
+                raise TypeError("training->graph->learning_rates must be a dictionary.")
+            for ds_key in ["TUDataset", "OGB"]:
+                if ds_key not in learning_rates:
+                    logger.error(f"Missing '{ds_key}' in training -> graph -> learning_rates configuration.")
+                    raise KeyError(f"Missing '{ds_key}' in training -> graph -> learning_rates configuration.")
+            graph_validated = {
+                "models": training_graph["models"]
+                if isinstance(training_graph["models"], list)
+                else [training_graph["models"]],
+                "batch_size": self._to_int(training_graph["batch_size"], "training->graph->batch_size"),
+                "optimizer": str(training_graph["optimizer"]),
+                "epochs": self._to_int(training_graph["epochs"], "training->graph->epochs"),
+                "learning_rates": {
+                    "TUDataset": self._to_float(learning_rates["TUDataset"], "training->graph->learning_rates->TUDataset"),
+                    "OGB": self._to_float(learning_rates["OGB"], "training->graph->learning_rates->OGB"),
+                },
+            }
+            training["graph"] = graph_validated
+        except Exception as e:
+            logger.error(f"Error validating training->graph configuration: {e}")
+            raise e
+
+        # Process the curriculum section.
+        try:
+            curriculum_conf = config_data["curriculum"]
+            curriculum_validated: Dict[str, Optional[Any]] = {}
+            # Optional parameters; if missing or null, default to None.
+            curriculum_validated["warmup_epochs"] = self._optional_int(
+                curriculum_conf.get("warmup_epochs"), "curriculum->warmup_epochs"
+            )
+            curriculum_validated["schedule_epochs"] = self._optional_int(
+                curriculum_conf.get("schedule_epochs"), "curriculum->schedule_epochs"
+            )
+            curriculum_validated["growth_rate"] = self._optional_float(
+                curriculum_conf.get("growth_rate"), "curriculum->growth_rate"
+            )
+        except Exception as e:
+            logger.error(f"Error validating curriculum configuration: {e}")
+            raise e
+
+        # Process the reproducibility section.
+        try:
+            reproducibility_conf = config_data["reproducibility"]
+            if "seeds" not in reproducibility_conf:
+                logger.error("Missing 'seeds' in reproducibility configuration.")
+                raise KeyError("Missing 'seeds' in reproducibility configuration.")
+            seeds_raw = reproducibility_conf["seeds"]
+            if not isinstance(seeds_raw, list):
+                logger.error("reproducibility->seeds must be a list.")
+                raise TypeError("reproducibility->seeds must be a list.")
+            seeds_validated: List[int] = []
+            for idx, seed in enumerate(seeds_raw):
+                try:
+                    seeds_validated.append(int(seed))
+                except Exception as e:
+                    logger.error(f"Error converting seed at index {idx} to int: {seed}")
+                    raise e
+        except Exception as e:
+            logger.error(f"Error validating reproducibility configuration: {e}")
+            raise e
+
+        # Process the evaluation section.
+        try:
+            evaluation_conf = config_data["evaluation"]
+            if "metrics" not in evaluation_conf:
+                logger.error("Missing 'metrics' in evaluation configuration.")
+                raise KeyError("Missing 'metrics' in evaluation configuration.")
+            if "record_complexity" not in evaluation_conf:
+                logger.error("Missing 'record_complexity' in evaluation configuration.")
+                raise KeyError("Missing 'record_complexity' in evaluation configuration.")
+            metrics_conf = evaluation_conf["metrics"]
+            record_complexity_conf = evaluation_conf["record_complexity"]
+
+            # Validate metrics: expect 'cv' as string, 'nlp' as list, 'graph' as string.
+            cv_metric = metrics_conf.get("cv")
+            nlp_metric = metrics_conf.get("nlp")
+            graph_metric = metrics_conf.get("graph")
+            if not isinstance(cv_metric, str):
+                logger.error("evaluation->metrics->cv should be a string.")
+                raise TypeError("evaluation->metrics->cv should be a string.")
+            if not isinstance(nlp_metric, list):
+                logger.error("evaluation->metrics->nlp should be a list.")
+                raise TypeError("evaluation->metrics->nlp should be a list.")
+            if not isinstance(graph_metric, str):
+                logger.error("evaluation->metrics->graph should be a string.")
+                raise TypeError("evaluation->metrics->graph should be a string.")
+
+            # Validate record_complexity: expect booleans for training_time and gpu_memory.
+            training_time_flag = record_complexity_conf.get("training_time")
+            gpu_memory_flag = record_complexity_conf.get("gpu_memory")
+            if not isinstance(training_time_flag, bool):
+                logger.error("evaluation->record_complexity->training_time should be a boolean.")
+                raise TypeError("evaluation->record_complexity->training_time should be a boolean.")
+            if not isinstance(gpu_memory_flag, bool):
+                logger.error("evaluation->record_complexity->gpu_memory should be a boolean.")
+                raise TypeError("evaluation->record_complexity->gpu_memory should be a boolean.")
+
+            evaluation_validated = {
+                "metrics": {
+                    "cv": cv_metric,
+                    "nlp": nlp_metric,
+                    "graph": graph_metric,
+                },
+                "record_complexity": {
+                    "training_time": training_time_flag,
+                    "gpu_memory": gpu_memory_flag,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error validating evaluation configuration: {e}")
+            raise e
+
+        # Construct the final configuration dictionary.
+        final_config: Dict[str, Any] = {
+            "training": training,
+            "curriculum": curriculum_validated,
+            "reproducibility": {
+                "seeds": seeds_validated,
+            },
+            "evaluation": evaluation_validated,
+        }
+        self.config = final_config
+        logger.info("Configuration successfully loaded and validated.")
+        return final_config
+
+    def get_training_config(self, domain: str) -> Dict[str, Any]:
+        """
+        Retrieve the training configuration for a specified domain (e.g., 'cv', 'nlp', or 'graph').
+        :param domain: The domain key for training configuration.
+        :return: The corresponding training configuration dictionary.
+        :raises: ValueError if the configuration has not been loaded or KeyError if domain is missing.
+        """
+        if self.config is None:
+            raise ValueError("Configuration not loaded. Please call load() first.")
+        if domain not in self.config["training"]:
+            raise KeyError(f"Training configuration for domain '{domain}' not found.")
+        return self.config["training"][domain]
+
+    def _to_int(self, value: Any, key_name: str) -> int:
+        """Converts a value to an integer with error handling."""
+        try:
+            return int(value)
+        except Exception as e:
+            logger.error(f"Error converting {key_name} to int: {value}")
+            raise e
+
+    def _to_float(self, value: Any, key_name: str) -> float:
+        """Converts a value to a float with error handling."""
+        try:
+            return float(value)
+        except Exception as e:
+            logger.error(f"Error converting {key_name} to float: {value}")
+            raise e
+
+    def _optional_int(self, value: Any, key_name: str) -> Optional[int]:
+        """
+        Attempts to convert an optional value to an integer.
+        Returns None if value is None or cannot be converted.
+        """
+        if value is None:
+            logger.warning(f"Optional key {key_name} is not provided; defaulting to None.")
+            return None
+        try:
+            return int(value)
+        except Exception as e:
+            logger.warning(
+                f"Optional key {key_name} could not be converted to int; defaulting to None. Error: {e}"
+            )
+            return None
+
+    def _optional_float(self, value: Any, key_name: str) -> Optional[float]:
+        """
+        Attempts to convert an optional value to a float.
+        Returns None if value is None or cannot be converted.
+        """
+        if value is None:
+            logger.warning(f"Optional key {key_name} is not provided; defaulting to None.")
+            return None
+        try:
+            return float(value)
+        except Exception as e:
+            logger.warning(
+                f"Optional key {key_name} could not be converted to float; defaulting to None. Error: {e}"
+            )
+            return None
+
+    def _parse_lr_range(self, value: Any, key_name: str) -> Tuple[float, float]:
+        """
+        Parses a learning rate range from a string formatted as "min-max" into a tuple of floats.
+        :param value: The string representing the range.
+        :param key_name: The configuration key name (for error reporting).
+        :return: A tuple (min_lr, max_lr).
+        :raises: TypeError or ValueError if the input is not properly formatted.
+        """
+        if not isinstance(value, str):
+            logger.error(f"{key_name} should be a string in the format 'min-max', got {value}")
+            raise TypeError(f"{key_name} should be a string in the format 'min-max'")
+        try:
+            parts = value.split('-')
+            if len(parts) != 2:
+                logger.error(f"{key_name} is not in the correct format 'min-max': {value}")
+                raise ValueError(f"{key_name} must be in the format 'min-max'")
+            min_lr = float(parts[0])
+            max_lr = float(parts[1])
+            return (min_lr, max_lr)
+        except Exception as e:
+            logger.error(f"Error parsing learning_rate_range {key_name}: {value}")
+            raise e
+
+
+if __name__ == "__main__":
+    try:
+        config_loader = Config("config.yaml")
+        config_dict = config_loader.load()
+        print("Loaded Configuration:")
+        print(config_dict)
+    except Exception as e:
+        logger.error(f"Failed to load configuration: {e}")
+        raise e
+```

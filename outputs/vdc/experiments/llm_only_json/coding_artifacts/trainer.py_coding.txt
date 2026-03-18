@@ -1,0 +1,322 @@
+```python
+"""
+trainer.py
+
+This module implements the Trainer class for retraining a classifier (ResNet-18)
+on the purified dataset and for evaluating its performance. The Trainer expects
+a dictionary of DataLoaders with keys "train", "test_clean", and "test_triggered".
+It uses configuration from config.yaml to set hyperparameters including epochs, learning rate,
+optimizer parameters, learning rate decay schedule, and the attacker's target label for ASR evaluation.
+
+The training procedure follows these steps:
+  1. Initialization:
+       - Setup device (CUDA if available, else CPU).
+       - Receive purified training DataLoader and separate test DataLoaders.
+       - Extract training hyperparameters, including optimizer (SGD) settings:
+            • learning_rate, momentum (default 0.9), weight_decay (default 5e-4)
+       - Setup the cross-entropy loss function.
+       - Setup SGD optimizer and MultiStepLR scheduler with milestones from the configuration.
+       - Extract the attacker's target label for ASR evaluation (default 0 if not provided).
+  2. Training Loop:
+       - For each epoch, iterate over the training DataLoader:
+            • Forward pass, compute loss, backpropagate, and update parameters.
+            • Accumulate training loss and accuracy.
+       - Step the learning rate scheduler at the end of each epoch.
+       - Evaluate model performance on the clean test set (for ACC) and on the triggered test set (for ASR).
+       - Log epoch training loss, training accuracy, clean test accuracy, and ASR.
+  3. End-of-Training:
+       - Save the final model parameters.
+       - Final logging of overall performance.
+
+Dependencies:
+    numpy==1.21.0
+    torch==1.9.0
+    torchvision==0.10.0
+    transformers==4.15.0
+    openai==0.27.0
+    requests==2.26.0
+    PyYAML (for YAML configuration parsing)
+
+Author: Your Name
+Date: YYYY-MM-DD
+"""
+
+import os
+import logging
+from typing import Any, Dict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import MultiStepLR
+from torchvision.models import resnet18
+
+from utils import load_config, init_seed
+
+# Configure module-level logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class Trainer:
+    """
+    Trainer class for retraining a classifier (ResNet-18) on a purified dataset and evaluating its performance.
+
+    Attributes:
+        model (nn.Module): The classifier model (ResNet-18).
+        train_loader (torch.utils.data.DataLoader): DataLoader for purified training samples.
+        clean_test_loader (torch.utils.data.DataLoader): DataLoader for clean test samples.
+        triggered_test_loader (torch.utils.data.DataLoader): DataLoader for triggered (poisoned/backdoor) test samples.
+        device (torch.device): Computation device ("cuda" or "cpu").
+        criterion (nn.Module): Loss function (cross-entropy loss).
+        optimizer (torch.optim.Optimizer): Optimizer for training (SGD with momentum and weight decay).
+        scheduler (MultiStepLR): Learning rate scheduler.
+        epochs (int): Total number of training epochs.
+        target_label (int): The attacker's target label used for ASR evaluation.
+    """
+
+    def __init__(self, model: nn.Module, data_loaders: Dict[str, Any], hyperparams: Dict[str, Any]) -> None:
+        """
+        Initializes the Trainer with the provided model, data loaders, and training hyperparameters.
+
+        Args:
+            model (nn.Module): The classifier model, e.g., ResNet-18.
+            data_loaders (Dict[str, Any]): Dictionary containing DataLoaders with keys:
+                                           "train", "test_clean", and "test_triggered".
+            hyperparams (Dict[str, Any]): Training hyperparameters from the configuration (config.yaml).
+                                          Expected keys include:
+                                              - epochs: int
+                                              - learning_rate: float
+                                              - optimizer: str (e.g., "SGD")
+                                              - batch_size: dict mapping dataset names to batch sizes.
+                                              - lr_decay_schedule: dict mapping dataset names to a list of
+                                                  milestone epoch dictionaries.
+                                              - (Optional) momentum: float (default 0.9)
+                                              - (Optional) weight_decay: float (default 5e-4)
+                                              - (Optional) target_label: int (attackers target label, default 0)
+                                              - (Optional) dataset_name: str (e.g., "CIFAR-10"; default "CIFAR-10")
+        Raises:
+            ValueError: If required DataLoader keys are missing.
+        """
+        # Validate presence of required DataLoader keys.
+        if "train" not in data_loaders:
+            raise ValueError("Missing 'train' DataLoader in data_loaders dictionary.")
+        if "test_clean" not in data_loaders:
+            raise ValueError("Missing 'test_clean' DataLoader in data_loaders dictionary.")
+        if "test_triggered" not in data_loaders:
+            raise ValueError("Missing 'test_triggered' DataLoader in data_loaders dictionary.")
+
+        self.train_loader = data_loaders["train"]
+        self.clean_test_loader = data_loaders["test_clean"]
+        self.triggered_test_loader = data_loaders["test_triggered"]
+
+        # Load configuration and set seed for reproducibility.
+        self.config: Dict[str, Any] = hyperparams
+        seed_value: int = self.config.get("seed", 42)
+        init_seed(seed_value)
+
+        # Determine dataset name to extract batch size and lr schedule milestones from config.
+        self.dataset_name: str = self.config.get("dataset_name", "CIFAR-10")
+
+        # Extract training hyperparameters.
+        self.epochs: int = int(self.config.get("epochs", 100))
+        self.learning_rate: float = float(self.config.get("learning_rate", 0.1))
+        self.optimizer_name: str = self.config.get("optimizer", "SGD")
+        self.momentum: float = float(self.config.get("momentum", 0.9))
+        self.weight_decay: float = float(self.config.get("weight_decay", 5e-4))
+
+        # Retrieve learning rate decay milestones.
+        lr_decay_schedule: Dict[str, Any] = self.config.get("lr_decay_schedule", {})
+        milestones_list = lr_decay_schedule.get(self.dataset_name, [])
+        self.milestones = [int(milestone.get("epoch", 0)) for milestone in milestones_list]
+
+        # Extract target label from dirty sample generation config if provided; default to 0.
+        dirty_gen_config = self.config.get("dirty_sample_generation", {})
+        self.target_label: int = int(dirty_gen_config.get("target_label", 0))
+
+        # Device setup.
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model: nn.Module = model.to(self.device)
+        self.model.train()  # Set model to training mode initially
+
+        # Loss function: cross-entropy loss.
+        self.criterion: nn.Module = nn.CrossEntropyLoss()
+
+        # Optimizer: using SGD.
+        self.optimizer = optim.SGD(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay
+        )
+
+        # Scheduler: MultiStepLR using milestones with gamma factor of 0.1.
+        self.scheduler = MultiStepLR(self.optimizer, milestones=self.milestones, gamma=0.1)
+
+        logger.info(f"Trainer initialized for dataset '{self.dataset_name}' with epochs={self.epochs}, "
+                    f"learning_rate={self.learning_rate}, momentum={self.momentum}, weight_decay={self.weight_decay}, "
+                    f"milestones={self.milestones}, target_label={self.target_label}.")
+
+    def train(self) -> None:
+        """
+        Runs the training loop for the specified number of epochs, evaluates the model on both
+        clean and triggered test sets, and saves the final model parameters.
+        Logs the training loss, training accuracy, clean test accuracy, and ASR (Attack Success Rate)
+        at each epoch.
+        """
+        total_train_samples = len(self.train_loader.dataset)
+        logger.info(f"Starting training on {total_train_samples} training samples.")
+
+        for epoch in range(1, self.epochs + 1):
+            self.model.train()
+            epoch_loss: float = 0.0
+            correct: int = 0
+            total: int = 0
+
+            # Training mini-batch loop.
+            for batch in self.train_loader:
+                # Expecting batch to be a tuple: (images, labels).
+                images, labels = batch
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                self.optimizer.zero_grad()
+
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
+                self.optimizer.step()
+
+                epoch_loss += loss.item() * images.size(0)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+            average_loss: float = epoch_loss / total if total > 0 else 0.0
+            train_acc: float = correct / total if total > 0 else 0.0
+
+            # Step the scheduler after each epoch.
+            self.scheduler.step()
+
+            # Evaluate on clean test DataLoader.
+            clean_acc: float = self.evaluate_clean_accuracy()
+            # Evaluate Attack Success Rate (ASR) on triggered test DataLoader.
+            asr: float = self.evaluate_asr()
+
+            logger.info(f"Epoch [{epoch}/{self.epochs}] - Loss: {average_loss:.4f}, "
+                        f"Train ACC: {train_acc * 100:.2f}% | Clean ACC: {clean_acc * 100:.2f}% | ASR: {asr * 100:.2f}%")
+
+        # Save the final model parameters.
+        model_save_path: str = f"resnet18_{self.dataset_name.lower()}_final.pth"
+        torch.save(self.model.state_dict(), model_save_path)
+        logger.info(f"Training completed. Final model saved to '{model_save_path}'.")
+
+    def evaluate_clean_accuracy(self) -> float:
+        """
+        Evaluates the trained model on the clean test DataLoader to compute overall classification accuracy.
+
+        Returns:
+            float: Clean test accuracy as a fraction (0.0 - 1.0).
+        """
+        self.model.eval()
+        correct: int = 0
+        total: int = 0
+
+        with torch.no_grad():
+            for batch in self.clean_test_loader:
+                images, labels = batch
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                outputs = self.model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        acc: float = correct / total if total > 0 else 0.0
+        return acc
+
+    def evaluate_asr(self) -> float:
+        """
+        Evaluates the Attack Success Rate (ASR) on the triggered test DataLoader.
+        ASR is computed as the fraction of triggered samples that are classified as
+        the attacker's target label.
+
+        Returns:
+            float: ASR as a fraction (0.0 - 1.0).
+        """
+        self.model.eval()
+        total_triggered: int = 0
+        successful_triggered: int = 0
+
+        with torch.no_grad():
+            for batch in self.triggered_test_loader:
+                images, _ = batch  # Ground truth labels are irrelevant for ASR evaluation.
+                images = images.to(self.device)
+                outputs = self.model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total_triggered += images.size(0)
+                successful_triggered += (predicted == self.target_label).sum().item()
+
+        asr: float = successful_triggered / total_triggered if total_triggered > 0 else 0.0
+        return asr
+        
+
+# Example usage stub:
+if __name__ == "__main__":
+    # Load configuration from config.yaml
+    try:
+        config = load_config("config.yaml")
+    except Exception as e:
+        logger.error(f"Configuration load error: {e}")
+        config = {}
+
+    # Assume the hyperparameters for training are contained in config["training"]
+    training_config = config.get("training", {})
+    # Inject dummy seed if not present.
+    if "seed" not in training_config:
+        training_config["seed"] = 42
+    # Add dataset name if not provided; default to "CIFAR-10"
+    if "dataset_name" not in training_config:
+        training_config["dataset_name"] = "CIFAR-10"
+
+    # Instantiate a ResNet-18 model (pretrained=False for training from scratch).
+    model = resnet18(pretrained=False, num_classes=10)
+    
+    # Assume that data_loaders is a dictionary with keys "train", "test_clean", "test_triggered".
+    # In practice, these should be created by dataset_loader.py. Here we provide dummy DataLoaders for testing.
+    from torch.utils.data import DataLoader, TensorDataset
+    import torchvision.transforms as transforms
+    from PIL import Image
+    import numpy as np
+
+    # Create dummy datasets for illustration.
+    # For training: 100 dummy images of size 32x32 and random labels.
+    dummy_train_images = torch.randn(100, 3, 32, 32)
+    dummy_train_labels = torch.randint(0, 10, (100,))
+    train_dataset = TensorDataset(dummy_train_images, dummy_train_labels)
+    train_loader = DataLoader(train_dataset, batch_size=training_config.get("batch_size", {}).get("CIFAR-10", 128), shuffle=True)
+
+    # For clean test: 20 dummy images.
+    dummy_test_clean_images = torch.randn(20, 3, 32, 32)
+    dummy_test_clean_labels = torch.randint(0, 10, (20,))
+    test_clean_dataset = TensorDataset(dummy_test_clean_images, dummy_test_clean_labels)
+    test_clean_loader = DataLoader(test_clean_dataset, batch_size=training_config.get("batch_size", {}).get("CIFAR-10", 128), shuffle=False)
+
+    # For triggered test: 20 dummy images that are assumed to have triggers (labels are ignored for ASR).
+    dummy_test_triggered_images = torch.randn(20, 3, 32, 32)
+    # For ASR, we assume that the attacker’s target label is 0.
+    dummy_test_triggered_labels = torch.zeros(20, dtype=torch.long)
+    test_triggered_dataset = TensorDataset(dummy_test_triggered_images, dummy_test_triggered_labels)
+    test_triggered_loader = DataLoader(test_triggered_dataset, batch_size=training_config.get("batch_size", {}).get("CIFAR-10", 128), shuffle=False)
+
+    data_loaders = {
+        "train": train_loader,
+        "test_clean": test_clean_loader,
+        "test_triggered": test_triggered_loader
+    }
+
+    # Create Trainer instance.
+    trainer = Trainer(model, data_loaders, training_config)
+    # Run training.
+    trainer.train()
+```

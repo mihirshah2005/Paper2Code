@@ -1,0 +1,133 @@
+Below is the revised logic analysis for utils.py. In this version we update our design commentary to address the critiques regarding error handling, deterministic seeding, trigger parameterization, and API caching, ensuring that all parameters can be sourced from the configuration file. The revised analysis is as follows:
+
+──────────────────────────────
+1. CONFIGURATION LOADING – load_config
+
+• Revised Objective:
+  – Read the YAML configuration file (e.g., config.yaml) and return a dictionary of settings.
+  – Critically, include robust error handling:
+    ▪ Check if the file exists and raise a clear error if not.
+    ▪ Capture YAML parsing errors with try-except blocks, logging a descriptive error message before re-raising an exception.
+    ▪ Optionally, set default values or warn the user if some expected keys (e.g., trigger parameters, seed values) are missing.
+
+• Revised Steps:
+  1. Verify the file’s existence.
+  2. Open and parse the YAML file inside a try-except block.
+  3. If the file is missing or the YAML is malformed, log an error with a clear message (using our centralized logging) and raise a custom exception.
+  4. Return the configuration dictionary.
+
+──────────────────────────────
+2. RANDOM SEED SETUP – set_random_seed
+
+• Revised Objective:
+  – Set seeds for reproducibility across Python’s random module, NumPy, and Torch.
+  – IMPORTANT: Set additional deterministic flags for PyTorch to enforce reproducibility.
+
+• Revised Steps:
+  1. Set Python’s random seed.
+  2. Set NumPy’s seed.
+  3. Set torch.manual_seed and torch.cuda.manual_seed_all (if using GPUs).
+  4. Configure torch.backends.cudnn.deterministic = True and torch.backends.cudnn.benchmark = False (or other deterministic flags) to fully control non-determinism.
+  5. Log the seed setting action for clarity.
+
+──────────────────────────────
+3. IMAGE PREPROCESSING
+
+• Objective remains largely the same:
+  – Provide a function (preprocess_image) that applies dataset-specific transforms. This function uses torchvision transforms, ensuring that the image is resized, normalized, and converted to a tensor.
+  – The function should be configurable via parameters from the configuration file (e.g., image dimensions, normalization means, and stds).
+
+──────────────────────────────
+4. TRIGGER OVERLAY FUNCTIONS
+
+The trigger functions now explicitly source key parameters from the configuration or are passed as arguments, enhancing centralized control.
+
+a. BadNets Trigger – apply_badnets_trigger
+  – Use configuration parameters for the trigger size (e.g., 3×3 for CIFAR-10 and 21×21 for ImageNet datasets) and position (e.g., lower-right corner).
+  – Do not hard-code these values; instead, read them from the config if provided.
+
+b. Blended Trigger – apply_blended_trigger
+  – Use a blend_ratio sourced from the configuration (default 0.1).
+  – Read the trigger image path from the configuration and use it for consistent reproducibility.
+  – Blend the trigger image with the target image by weighting each image accordingly.
+
+c. SIG Trigger – apply_sig_trigger  
+  • Revised Details Include:
+    – Specify that the sinusoidal noise is computed for each column and then broadcasted across all channels.
+    – Use numpy’s broadcasting to replicate the 2D noise array into a shape that matches the multi-channel image.
+    – Define a clipping strategy: after adding the noise (e.g., noise = delta * sin(2π * j * frequency / width)), use numpy’s clip (e.g., np.clip(image + noise, 0, 255)) to ensure that pixel values remain within valid bounds.
+    – Source parameters delta (∆ = 20) and frequency (f = 6) from the configuration rather than hard coding them.
+
+d. TrojanNN Trigger – apply_trojan_trigger
+  • Revised Details Include:
+    – Define a mechanism to load the trigger mask image (e.g., an Apple logo) from a file whose location is specified in the configuration file.
+    – Allow configuration of placement parameters (e.g., location, scaling, and blending method), ensuring that the trigger mask is applied consistently across experiments.
+    – Specify error handling if the trigger mask file is not found.
+    
+e. SSBA and WaNet Triggers – apply_ssba_trigger / apply_wanet_trigger
+  • Revised Details Include:
+    – Instead of using unspecific placeholders, clearly document that these functions are intended to simulate the more-complex backdoor injection.
+    – Specify that detailed model parameters (e.g., encoder-decoder architecture, number of iterations, warping field parameters) must be provided via the configuration.
+    – If full implementation is computationally heavy, the functions should at least raise a NotImplementedError with a message indicating that detailed parameters from the configuration are missing. Alternatively, a simplified simulation must use configuration-provided defaults.
+    – Stress that these functions are critical for experimental validity and that changes in these parameters must be logged and centralized in the configuration file.
+
+f. Global Trigger Parameter Configuration
+  – Ensure that all key numbers (trigger sizes, blend ratios, delta, frequency, trigger mask file path, etc.) are read from the configuration file.
+  – Document in this analysis that no "magic numbers" are hard-coded inside these functions.
+
+──────────────────────────────
+5. LOGGING SETUP – get_logger
+
+• The logger initialization function should:
+  – Use Python’s built-in logging.
+  – Allow setting the log level from configuration.
+  – Define and set a clear format (timestamp, module, level, message).
+  – Return the logger for use throughout the module and other modules.
+  
+──────────────────────────────
+6. API RESPONSE CACHING
+
+• Revised Strategy:
+  – Use an in-memory dictionary to cache responses but ensure thread safety by using a lock (e.g., threading.Lock or a thread-safe data structure).
+  – Key functions:
+    – get_cached_response(key): Check and return a cached response if available.
+    – cache_response(key, response): Save the response in the cache with thread locking.
+  – Optionally provide functions to load and save the cache from/to a file to persist responses for repeated experiments.
+  – Document that the caching mechanism relies on deterministic keys (built from hashes of input prompt, model name, etc.) to guarantee that identical calls reuse prior results.
+
+──────────────────────────────
+7. TEXT AND STRING PROCESSING HELPERS
+
+• Function: clean_text(text)
+  – Convert input text to lowercase.
+  – Remove punctuations and extra whitespace.
+  – This function is essential for the VAE module’s string matching.
+  – Document its use for robust “yes”/“no” determinations.
+
+──────────────────────────────
+8. GENERAL FILE OPERATIONS (if needed)
+
+• Optionally provide helper functions to read/write cached outputs or logging results.
+
+──────────────────────────────
+INTERFACE & REUSE CONSIDERATIONS
+
+• All utility functions are designed to:
+  – Source key parameters (trigger sizes, blend ratios, delta, frequency, trigger mask path, etc.) from the configuration file.
+  – Raise meaningful errors with clear logging and error messages.
+  – Use thread-safe practices where needed (API caching).
+  – Have clear boundary conditions, for instance in apply_sig_trigger (ensuring image dimensions are handled correctly and clipping is applied) and apply_trojan_trigger (ensuring the trigger mask is correctly loaded and positioned).
+
+──────────────────────────────
+SUMMARY
+
+The revised logic analysis for utils.py now includes:
+  – Detailed error handling for configuration loading.
+  – An enhanced random seed setup setting additional deterministic flags.
+  – A complete specification for broadcasting and clipping in apply_sig_trigger.
+  – A redefined process for apply_trojan_trigger that pulls trigger details (mask file, placement) from the configuration.
+  – Clear guidelines for applying SSBA and WaNet triggers that require well-specified model parameters from the configuration (or fail explicitly if not provided).
+  – A caching strategy for API responses that uses thread locks for safety.
+  – All trigger-related parameters are now centrally configured, reducing hard-coded “magic numbers.”
+
+These revisions address the critiques raised by ensuring that each utility function is fully specified, parameterized by the configuration file, and robust against error conditions.

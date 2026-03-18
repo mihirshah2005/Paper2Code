@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Overall, the logic analysis captures the key steps of the detection process very well. It clearly describes how the VQG, VQA, and VAE modules interact to assess whether a sample is “dirty” or “clean” via generated questions, corresponding answers, and then evaluation with a matching score compared against a threshold. However, there are a few points that require clarification or improvement:\n\n1. Question Source Identification:\n • Issue: The analysis suggests that the two sets of questions (gener",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "high",
+      "critique": "Overall, the logic analysis captures the key steps of the detection process very well. It clearly describes how the VQG, VQA, and VAE modules interact to assess whether a sample is “dirty” or “clean” via generated questions, corresponding answers, and then evaluation with a matching score compared against a threshold. However, there are a few points that require clarification or improvement:\n\n1. Question Source Identification:\n • Issue: The analysis suggests that the two sets of questions (gener",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

@@ -1,0 +1,163 @@
+```python
+"""
+main.py
+
+This is the main entry point of the GDEM graph distillation project.
+It performs the following steps:
+
+1. Loads and parses the configuration from "config.yaml".
+2. Instantiates the DatasetLoader and loads the real graph data.
+3. Initializes the distillation Model with synthetic parameters.
+4. Sets up the Trainer and executes the training loop using an alternating
+   update schedule (tau1 and tau2).
+5. After training, the synthetic graph is reconstructed from the learned
+   synthetic eigenbasis and the real graph spectrum.
+6. The Evaluation module trains a standard GNN (here, a 2-layer GCN) on the
+   synthetic graph and evaluates performance on the real graph's test set.
+7. If num_runs > 1, the whole process is repeated multiple times and the test
+   accuracies are aggregated (mean and std).
+
+Note on alternating updates:
+  With the current configuration (tau1 = 0, tau2 = 5), the condition for updating
+  the synthetic eigenbasis (U_syn) is never met. This means that only the synthetic
+  node features (X_syn) are updated during training. This behavior may be intentional
+  (e.g., testing the effect of fixed initialization for U_syn) or might require adjustment.
+
+All configuration values have defaults and are logged for reproducibility.
+"""
+
+import os
+import sys
+import random
+import math
+import numpy as np
+import torch
+
+# Attempt to load configuration from config.yaml. If not found, use default values.
+try:
+    import yaml
+except ImportError:
+    print("PyYAML module not found. Please install it (e.g., pip install pyyaml).")
+    sys.exit(1)
+
+def load_config(config_path: str = "config.yaml") -> dict:
+    if not os.path.exists(config_path):
+        print(f"Configuration file '{config_path}' not found; using default configuration.")
+        # Default configuration as specified
+        default_config = {
+            "training": {
+                "epochs": 1500,
+                "learning_rate_feat": 1e-05,
+                "learning_rate_eigenvecs": 0.01,
+                "tau1": 0,
+                "tau2": 5,
+                "optimizer": "adam",
+                "loss_weights": {"alpha": 1.0, "beta": 1.0, "gamma": 1.0},
+                "num_runs": 10
+            },
+            "synth_graph": {
+                "compression_ratio": 0.15,
+                "r_k": 0.9
+            },
+            "evaluation": {
+                "gnn": {
+                    "spatial": {
+                        "n_layers": 2,
+                        "hidden_units": 256
+                    },
+                    "spectral": {
+                        "polynomial_order": 10,
+                        "hidden_units": 256
+                    }
+                },
+                "evaluation_epochs": 200,
+                "evaluation_lr": 0.01
+            },
+            "dataset": {
+                "name": "Pubmed",
+                "split_method": "public"
+            }
+        }
+        return default_config
+    else:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+            return config
+
+def set_global_seeds(seed: int = 42) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def main():
+    # Load configuration from config.yaml or use defaults.
+    config = load_config("config.yaml")
+    print("Configuration Loaded:")
+    print(config)
+
+    # Set global seeds for reproducibility.
+    base_seed = 42
+    set_global_seeds(base_seed)
+
+    # Import modules from our project.
+    from dataset_loader import DatasetLoader
+    from model import Model
+    from trainer import Trainer
+    from evaluation import Evaluation
+
+    # Instantiate the DatasetLoader with configuration and load the graph data.
+    loader = DatasetLoader(config)
+    graph_data = loader.load_data()
+    num_nodes = graph_data.node_features.shape[0]
+    feature_dim = graph_data.node_features.shape[1]
+    num_classes = len(np.unique(graph_data.labels))
+    print("Dataset Statistics:")
+    print(f"  Number of nodes: {num_nodes}")
+    print(f"  Feature dimension: {feature_dim}")
+    print(f"  Number of classes: {num_classes}")
+
+    # Number of independent runs from configuration.
+    num_runs = config.get("training", {}).get("num_runs", 10)
+    run_test_accuracies = []
+
+    # Execute multiple runs for reproducibility and aggregation.
+    for run in range(1, num_runs + 1):
+        print("\n------------------- Run {}/{} -------------------".format(run, num_runs))
+        # Set run-specific seed based on base seed and run index.
+        current_seed = base_seed + run
+        set_global_seeds(current_seed)
+
+        # Initialize the model with the config and loaded graph data.
+        model_instance = Model(config, graph_data)
+
+        # Set up the trainer with model, graph data, and configuration.
+        trainer_instance = Trainer(model_instance, graph_data, config)
+        print("Starting Training Process...")
+        training_logs = trainer_instance.train()
+        print("Training Process Completed.")
+
+        # Evaluate the synthetic graph using the Evaluation module.
+        # Pass the evaluation configuration section.
+        evaluation_config = config.get("evaluation", {})
+        evaluator = Evaluation(model_instance, graph_data, evaluation_config)
+        print("Starting Evaluation Process...")
+        eval_results = evaluator.evaluate()
+        print("Evaluation Results for Run {}:".format(run))
+        print(eval_results)
+        # Assume we are interested in the "real_test_accuracy" from the GCN evaluation.
+        run_test_accuracies.append(eval_results["GCN"]["real_test_accuracy"])
+
+    # Aggregate the test accuracies across runs.
+    avg_test_acc = np.mean(run_test_accuracies)
+    std_test_acc = np.std(run_test_accuracies)
+    print("\n****************************")
+    print("Aggregated Evaluation over {} runs:".format(num_runs))
+    print("Mean Test Accuracy: {:.2f}%".format(avg_test_acc * 100))
+    print("Std Test Accuracy:  {:.2f}%".format(std_test_acc * 100))
+    print("****************************")
+
+if __name__ == "__main__":
+    main()
+```

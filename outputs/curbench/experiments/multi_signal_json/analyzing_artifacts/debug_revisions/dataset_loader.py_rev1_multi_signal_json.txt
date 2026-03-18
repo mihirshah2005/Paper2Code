@@ -1,0 +1,87 @@
+Below is a detailed logic analysis for the dataset_loader.py module. This analysis specifies how the DatasetLoader class will load and preprocess data for the three domains (CV, NLP, and Graph) while following the paper’s experimental design and the configuration settings provided in config.yaml.
+
+────────────────────────────
+1. Class Initialization and Configuration
+
+• The DatasetLoader class will be initialized with a configuration dictionary (loaded from config.yaml or another central config module).  
+• In __init__(self, config: dict), the class will store the configuration and, if needed, extract any dataset-specific settings (such as the dataset identifier string, which may include modifiers like “-noise-0.4” or “-imbalance-50”) as well as reproducibility settings (e.g., random seeds).
+
+────────────────────────────
+2. load_data() Method
+
+The load_data() method serves as the entry point to:
+  a. Parse the dataset identifier to determine both the target domain (CV, NLP, or Graph) and any preprocessing modifiers (noise injection or imbalance creation).  
+  b. Load the raw dataset using the appropriate library:
+    – For Computer Vision (CV):  
+      • Use torchvision.datasets (e.g., CIFAR-10, CIFAR-100).  
+      • For Tiny-ImageNet, use a custom loader (or adapt existing code) that downloads the dataset from CS231n resources.  
+      • For CIFAR datasets, note that the training set is originally balanced; then, split the original training set into training and validation subsets with a 9:1 ratio (using torch.utils.data.random_split or a similar utility). The test set is taken from the built-in “train=False” split (or, for Tiny-ImageNet, the provided validation set is used as test, per the paper).  
+    – For Natural Language Processing (NLP):  
+      • Use Hugging Face’s datasets or similar utilities to load each GLUE benchmark task. (Exclude WNLI.)  
+      • Utilize the provided splits—for example, use the official “train” split; since external test labels are missing, treat the “validation” split as the test set.  
+    – For Graph Machine Learning:  
+      • When the dataset is ogbg-molhiv, load using the torch_geometric.datasets.ogbg module and use its official split schemes (train/validation/test).  
+      • For other graph datasets (e.g., MUTAG, PROTEINS, NCI1), load them using torch_geometric.datasets.TUDataset. Because these datasets do not have established splits, randomly divide them into training, validation, and test sets using an 8:1:1 ratio (with proper random seed control to guarantee reproducibility).
+
+• After loading the dataset according to domain, the method will then check the identifier string for any modifiers:
+  – If the identifier contains “noise”, extract the noise level p (for example, “noise-0.4”) and call the apply_noise() method on the training dataset.  
+  – If the identifier contains “imbalance”, extract the imbalance factor r (for example, “imbalance-50”) and, if the domain is CV, call the apply_imbalance() method on the training dataset.
+  
+• Finally, load_data() returns a dictionary containing (at least) three keys: “train”, “val”, and “test”. These will either be Dataset objects or DataLoader instances (depending on further integration with the Trainer) that will later be used during training and evaluation.
+
+────────────────────────────
+3. apply_noise(data: Any, p: float) Method
+
+• Purpose: To inject label noise into the training set only.
+• Logic Steps:
+  1. Iterate over each data sample in the input training dataset. Each sample is expected to be composed of an input (e.g., image or text) and its corresponding label.
+  2. For each sample, generate a random float (using torch.rand or numpy.random.rand).  
+  3. If the generated value is less than p (the noise probability), then replace the correct label with a randomly chosen label from the set of possible class indices (ensuring that the new label is not the correct one).  
+  4. Return the modified dataset.  
+• Note: This method should work generically for classification tasks (mainly in CV and possibly NLP), where labels are stored as integers.
+
+────────────────────────────
+4. apply_imbalance(data: Any, r: int) Method
+
+• Purpose: To create a long-tailed (imbalanced) version of the training dataset. This setting is only meant for CV tasks.
+• Logic Steps:
+  1. First, confirm that the current dataset belongs to the CV domain before proceeding (if not, simply return the data unchanged).
+  2. Group or index the training samples by their class labels.  
+  3. Determine the number of classes, C. Since original datasets (like CIFAR-10 or CIFAR-100) are perfectly balanced, the number of samples per class (n₀) will be the same for every class before imbalance is applied.
+  4. Compute the decay factor d such that the desired imbalance factor r (ratio of majority to minority counts) is met. Using the relation r = n₀ / n₍C-1₎ and assuming n₍C-1₎ = n₀ × d^(C–1), solve for d as:  
+    d = (1/r)^(1/(C – 1))
+  5. For each class c (for instance, sorted in natural order), compute the desired sample count by:  
+    desired_count[c] = int(n₀ × (d^(c)))  
+  6. For every class, randomly select the computed number of samples from the full set of indices belonging to that class.  
+  7. Combine the selected indices from all classes and construct a new subset of the training data that exhibits the long-tailed distribution.
+  8. Return this imbalanced training dataset.
+
+────────────────────────────
+5. Additional Considerations
+
+• Reproducibility:  
+  – When performing random splits (for CV or TUDataset in Graph), noise injections, or subsampling for imbalance, use a fixed random seed (as specified under reproducibility.seeds in config.yaml) to ensure that experiments are reproducible.
+
+• Domain-Specific Preprocessing:  
+  – The logic in load_data() will branch based on the dataset identifier. For example, if the identifier starts with “cifar” or “tinyimagenet”, it will use CV-loading logic; if it corresponds to one of the GLUE tasks (e.g., “RTE”, “MRPC”), then NLP-loading logic will be invoked; if it’s a known graph dataset (e.g., “ogbg-molhiv” or “MUTAG”), then graph-loading logic is applied.
+
+• Input/Output Format:  
+  – The method should return data in a consistent format (e.g., as a dictionary with keys “train”, “val”, “test”) so that downstream modules (such as Trainer and Evaluation) can process them without additional format conversion.
+  – Depending on overall architecture, the loader may return Dataset objects (for use with torch.utils.data.DataLoader) or DataLoader instances directly—this should be decided in close consultation with the rest of the pipeline design.
+
+• Dependencies:  
+  – The implementation will import torch, torchvision datasets for CV; for NLP, Transformer utilities (or Hugging Face datasets) to load GLUE tasks; and for Graph, torch_geometric’s dataset classes.
+  – Ensure that all dependencies (as listed in the task and configuration) are honored.
+
+────────────────────────────
+Summary
+
+The dataset_loader.py module will provide a unified interface (through the DatasetLoader class) for loading and preprocessing datasets across domains. Its core method load_data() will:
+  – Parse dataset strings and determine the domain.
+  – Load the raw dataset (using torchvision for images, Hugging Face utilities for GLUE tasks, and torch_geometric for graphs).
+  – Split the raw datasets into training, validation, and test sets as specified (9:1 ratio for CV training/validation splits or 8:1:1 for TUDataset-based graphs; using official splits for ogbg-molhiv and NLP).
+  – Apply label noise on training data if the “noise” modifier is present.
+  – Apply imbalance on training data for CV datasets if the “imbalance” modifier is present.
+Finally, the module will return a structure containing the three splits, thereby providing a standardized data input for the rest of the system (training, curriculum scheduling, and evaluation).
+
+This analysis carefully follows the experimental setups and methodologies outlined in the CurBench paper and adheres strictly to the design and configuration provided.

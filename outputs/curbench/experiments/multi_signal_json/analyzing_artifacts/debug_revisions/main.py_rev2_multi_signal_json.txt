@@ -1,0 +1,107 @@
+Below is the revised logic analysis for main.py. This analysis now explicitly addresses the raised critiques by outlining configurable curriculum update frequency, default handling for curriculum hyperparameters, clear evaluation protocols using only the held‐out test set, and robust error handling for critical operations.
+
+────────────────────────────
+1. Initialization and Configuration Loading
+
+• Import required modules (Config, DatasetLoader, ModelManager, CurriculumScheduler, Trainer, Evaluation) from their respective files.  
+• Load the configuration via Config.load(), which returns a dictionary with training settings (per domain), curriculum settings, reproducibility seeds, and evaluation metrics.  
+• Note: When reading the curriculum hyperparameters (warmup_epochs, schedule_epochs, growth_rate), if they are not provided (null/None), default fallback values should be applied (e.g., warmup_epochs = 5, schedule_epochs = 10, growth_rate = 1.0). This fallback logic MUST be implemented inside CurriculumScheduler.__init__.
+
+────────────────────────────
+2. Experiment Loop over Reproducibility Seeds
+
+• Retrieve the reproducibility seeds list from the config (e.g., [42, 666, 777, 888, 999]).  
+• For each seed in the list, perform the following steps:  
+ – Set the global random seeds (for Python’s random module, NumPy, and PyTorch CPU/GPU) to ensure reproducibility.  
+ – Log the current seed.
+ – Wrap critical operations (e.g., setting the seed, initializing modules) in try-catch blocks to handle potential errors (like GPU memory allocation issues).
+
+────────────────────────────
+3. Data Loading and Preprocessing
+
+• Using a try-catch block, instantiate the DatasetLoader with the configuration.  
+• Call DatasetLoader.load_data() to download, split, and preprocess the data for the selected domain (CV, NLP, or graph).  
+ – This method handles dataset-specific preprocessing such as noise injection (via apply_noise) and imbalance creation (via apply_imbalance).  
+ – Any exceptions during download or preprocessing should be caught and logged to avoid crashes.
+
+────────────────────────────
+4. Model Initialization
+
+• Instantiate the ModelManager using the configuration.  
+• Call ModelManager.build_model() to construct the appropriate backbone model (e.g., ResNet-18 for CV, BERT for NLP, etc.).  
+ – Ensure that input and output layers are adjusted according to dataset properties (like image size, number of classes).  
+• Wrap this instantiation in error handling to catch issues such as model misconfigurations or missing pretrained weights.
+
+────────────────────────────
+5. Curriculum Scheduler Setup
+
+• Instantiate the CurriculumScheduler with the configuration.  
+ – Inside CurriculumScheduler.__init__, check for null hyperparameters provided in config.yaml and assign default values where necessary (e.g., default warmup_epochs, schedule_epochs, and growth_rate).  
+• Additionally, introduce a configurable update frequency (e.g., “update_frequency”: "batch" or "epoch") retrieved from the configuration.  
+ – This parameter will control whether CurriculumScheduler.update_schedule() is called on every batch (default) or only once per epoch, mirroring potential intentions from the original paper.
+
+────────────────────────────
+6. Training Procedure (Objective Fitting)
+
+• Instantiate the Trainer with the following parameters: the built model, dataset dictionary (from DatasetLoader), the CurriculumScheduler instance, and the configuration containing training hyperparameters.  
+• When calling Trainer.train(), note the following changes to address the critique:
+ – The training loop should incorporate a configurable curriculum update schedule.  
+  • For example, check the update frequency parameter from the configuration:  
+   – If “update_frequency” is set to “batch”, call CurriculumScheduler.update_schedule(loss, epoch) after each batch.  
+   – If set to “epoch”, update the curriculum only once per epoch (e.g., at the epoch’s end or beginning).  
+ – Throughout the training loop, enclose critical operations in try-catch blocks. This ensures that network errors, GPU memory overflows, or data issues are caught and logged.
+ – Log the training loss, training time (using Python’s time module), and maximum GPU memory usage (using torch.cuda.max_memory_allocated()).
+
+────────────────────────────
+7. Evaluation
+
+• After training completes for the current seed, instantiate the Evaluation class with the trained model, the dataset dictionary, and the configuration.  
+• IMPORTANT: To strictly adhere to reproducibility protocols and avoid overfitting validation data, ensure that Evaluation.evaluate() processes only the held-out test set (rather than including the validation set).  
+ – The evaluation method should use the test set as specified in the dataset split from DatasetLoader.  
+ – Compute domain-specific metrics (accuracy for CV, appropriate measures for NLP, and AUC for graph).  
+• Wrap the evaluation call in a try-catch block to log any inference errors, ensuring that issues (such as GPU allocation errors during heavy forward passes) don’t break the experiment run.
+
+────────────────────────────
+8. Aggregation of Results and Logging
+
+• For each seed, collect the evaluation metrics along with complexity metrics (total training time and peak GPU memory usage).  
+• Once all seeds have run, compute the average and standard deviation for each metric.  
+• Aggregate and log the final results in a well-formatted summary, output to console (and optionally a file).  
+• Incorporate error notifications or logs if any seed’s experiment encountered critical issues.
+
+────────────────────────────
+9. Final Remarks and Exit
+
+• Once all seed experiments are complete, print a summary message indicating the experiment’s completion.  
+• Optionally, save checkpoints and detailed logs for future reproducibility.  
+• Exit the program gracefully.
+
+────────────────────────────
+Summary Flow Diagram (Revised High-Level Overview)
+
+1. Load configuration using Config.load()  
+  ↓  
+2. For each seed in reproducibility.seeds:  
+  • Set random seeds (with error handling).  
+  • Instantiate DatasetLoader and call load_data() in a try-catch block.  
+  • Instantiate ModelManager and build the model (with error handling).  
+  • Instantiate CurriculumScheduler (assigning default hyperparameters if missing)  
+   – Configure curriculum update frequency (batch vs epoch).  
+  • Instantiate Trainer with (Model, data, CurriculumScheduler, config) and call train(), using configurable curriculum update frequency.  
+  • After training, instantiate Evaluation with (Model, test set, config) and call evaluate()  
+  • Record metrics and complexity measurements for the seed  
+  ↓  
+3. After all seeds:  
+  • Aggregate results (mean and std dev)  
+  • Log final summary  
+  ↓  
+4. End experiment gracefully
+
+────────────────────────────
+Additional Considerations
+
+• Domain Selection: Optionally add CLI argument or config flag in main.py to select the target domain (CV, NLP, or Graph).  
+• Error Handling: Ensure every critical module (dataset downloading, model instantiation, training, and evaluation) is wrapped in appropriate try-catch blocks to capture and log exceptions for increased robustness and reproducibility.  
+• Logging: Incorporate detailed logging (including seed-level logs) for transparency of experiment progress and for debugging purposes if any part fails unexpectedly.
+
+This revised logic analysis ensures that main.py’s orchestration closely follows the CurBench paper’s intent while explicitly addressing the curriculum update frequency, default hyperparameter handling, strict evaluation on a held-out test set, and robust error handling as required.

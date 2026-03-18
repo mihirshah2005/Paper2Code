@@ -1,0 +1,48 @@
+{
+  "all": [
+    {
+      "target_func_name": "Initialization / compute_loss (Lₑ)",
+      "severity_level": "high",
+      "critique": "The procedure for projecting the real eigenbasis (U_r with shape [N, K]) into the synthetic space (U_r_proj with shape [N′, K]) is not explicitly defined. Relying on an external projection or aggregation mechanism without a concrete implementation may lead to dimensional mismatches and could contradict the paper’s intended method if a specific projection approach was assumed.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "compute_loss (L_d computation)",
+      "severity_level": "medium",
+      "critique": "The discrimination loss L_d depends on external category-level representations (real_cat_repr and synthetic_cat_repr) but no internal mechanism or well-defined helper function is provided to compute these values. This reliance on undefined external components could lead to integration issues and ambiguity in reproducing the intended methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reconstruct_graph",
+      "severity_level": "medium",
+      "critique": "The normalization procedure for eigenvalues (using torch.clamp with a fixed range, e.g., [0, 2]) is inadequately justified. If the original paper expects a different normalization or scaling method, this approach might lead to improperly scaled synthetic Laplacian and adjacency matrices, potentially deviating from the intended reconstruction strategy.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "update_eigenbasis / update_features",
+      "severity_level": "low",
+      "critique": "While these methods are intended for manual updates and are managed externally by a Trainer, the reliance on an external alternating update strategy without clear internal integration might introduce minor ambiguities in how the update schedule is coordinated with the optimizers and overall training loop.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "Initialization / compute_loss (Lₑ)",
+      "severity_level": "high",
+      "critique": "The procedure for projecting the real eigenbasis (U_r with shape [N, K]) into the synthetic space (U_r_proj with shape [N′, K]) is not explicitly defined. Relying on an external projection or aggregation mechanism without a concrete implementation may lead to dimensional mismatches and could contradict the paper’s intended method if a specific projection approach was assumed.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "compute_loss (L_d computation)",
+      "severity_level": "medium",
+      "critique": "The discrimination loss L_d depends on external category-level representations (real_cat_repr and synthetic_cat_repr) but no internal mechanism or well-defined helper function is provided to compute these values. This reliance on undefined external components could lead to integration issues and ambiguity in reproducing the intended methodology.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reconstruct_graph",
+      "severity_level": "medium",
+      "critique": "The normalization procedure for eigenvalues (using torch.clamp with a fixed range, e.g., [0, 2]) is inadequately justified. If the original paper expects a different normalization or scaling method, this approach might lead to improperly scaled synthetic Laplacian and adjacency matrices, potentially deviating from the intended reconstruction strategy.",
+      "source": "llm-judge"
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+# main.py – Logic Analysis
+
+"""
+This file serves as the entry point and orchestrator for the entire FiT reproduction pipeline.
+Below is a detailed breakdown of the logic and flow implemented in main.py, in accordance with the paper,
+the reproduction plan, the design specifications, the task instructions, and the provided config.yaml.
+
+1. Load Configuration:
+   • Read the configuration file ("config.yaml") using a YAML parser.
+   • Extract configuration parameters for all modules:
+       - Training: learning_rate, batch_size, training_steps (choose between FiT-B/2 and FiT-XL/2 based on experiment),
+         optimizer details (AdamW, no weight decay), and EMA decay.
+       - Model: patch_size (p = 2), max_token_length (L_max = 256), transformer settings (positional embedding set to "2D RoPE",
+         attention mechanism as "Masked MHSA", and FFN as "SwiGLU"), and the pretrained VAE checkpoint (e.g., "huggingface/stabilityai/sd-vae-ft-ema").
+       - Diffusion: number of sampling steps (250) and the noise schedule (DDPM).
+       - Data: dataset information (using ImageNet), maximum resizing area (65536, i.e. 256×256), and augmentation type ("Horizontal Flip").
+       - Extrapolation: the available interpolation methods (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN) and the scale factor formula.
+       - Evaluation: metrics to compute (FID, sFID, IS, Precision, Recall) and related parameters.
+   • This configuration drives every subsequent component, ensuring fidelity to the experimental design.
+
+2. Dataset Preparation via DatasetLoader:
+   • Instantiate a DatasetLoader object using the loaded config.
+   • Call its load_data() method to obtain a DataLoader that:
+       - Reads the input images from the specified dataset (e.g., ImageNet),
+       - Applies image transformations including resizing (ensuring that high-resolution images are scaled so that HW ≤ 256² while preserving aspect ratio)
+         and horizontal flip augmentation,
+       - Implements any necessary preprocessing steps for later VAE encoding,
+       - And dynamically pads or tokenizes images using the “patchify” process (with patch size = 2) and subsequently pads token sequences to L_max = 256.
+   • The returned DataLoader is used for both training and evaluation pipelines.
+
+3. Model Initialization:
+   • Instantiate a Model object by providing the necessary parameters extracted from the config.
+   • Internally, the Model is built based on the FiT architecture:
+       - It integrates the flexible transformer backbone (built on DiT specifications) with the key modifications:
+            ▸ 2D RoPE for positional embeddings (as specified, with potential decoupled mode for enhanced resolution extrapolation),
+            ▸ Masked Multi-Head Self-Attention to ensure that attention is computed only over “real” tokens (using an appropriate attention mask),
+            ▸ And replacement of the MLP blocks with SwiGLU in the feed-forward network.
+       - The Model also contains methods for patchifying the VAE latent output and subsequently managing variable-length token sequences.
+   • Call Model.load_pretrained_vae(vae_path) with the pretrained VAE checkpoint from the config ("huggingface/stabilityai/sd-vae-ft-ema").
+       - This loads the VAE encoder/decoder. The VAE is used to encode input images into latent codes (which are then patchified) and later decode denoised tokens into images during inference.
+
+4. Training Setup with Trainer:
+   • Create a Trainer instance by passing the Model, the DataLoader from the DatasetLoader, and the configuration settings.
+   • The Trainer is responsible for:
+       - Running the training loop over batches from the DataLoader,
+       - For each training batch:
+            ▸ Forward passing the batch through the Model,
+            ▸ Computing the diffusion process loss (e.g., mean squared error) while using a mask to ensure the loss is calculated only on valid (non-padding) tokens,
+            ▸ Performing backpropagation and updating weights using the AdamW optimizer (with the constant learning rate, no weight decay),
+            ▸ Applying the EMA update to maintain an exponential moving average of the model weights (using decay specified as 0.9999),
+       - Periodically saving checkpoints (via Trainer.save_checkpoint) based on epoch or training step milestones.
+   • Call Trainer.train() to begin this process, iterating for the configured number of steps (e.g., 400,000 steps for FiT-B/2 or 1,800,000 steps for FiT-XL/2).
+
+5. Evaluation & Inference:
+   • After the training finishes (or from a saved checkpoint), instantiate an Evaluation object with the trained Model (typically using the EMA weights),
+         the DataLoader (which may be a separate validation/test loader), and the evaluation configuration.
+   • The Evaluation class:
+       - Implements the diffusion sampling procedure:
+            ▸ Begins with sampling noisy latent tokens (drawn from a Gaussian distribution) of an appropriate length based on the desired output resolution,
+            ▸ Runs K = 250 denoising iterations (according to the DDPM noise schedule) via the Model's forward() method,
+            ▸ Applies the positional embedding interpolation methods (including training-free approaches like VisionNTK and VisionYaRN) when synthesizing images for resolutions out-of-distribution,
+            ▸ Constructs a position map, followed by “unpatchifying” the tokens to reassemble the latent representation,
+            ▸ And finally decodes the latent tokens back to image space using the pretrained VAE decoder.
+       - Computes evaluation metrics (FID, sFID, IS, Precision, and Recall) using the generated images.
+   • Call Evaluation.evaluate() to run these inference steps and capture the evaluations. The returned results (a dictionary of metric values) are printed/logged for analysis.
+
+6. Orchestration & Finalization:
+   • The main.py file binds these components together:
+       - It loads the configuration,
+       - Prepares the data,
+       - Instantiates and bootstraps the model (including VAE loading),
+       - Runs the training through the Trainer,
+       - And finally, evaluates the trained model with the Evaluation module.
+   • After evaluation, the metrics are output so that performance can be compared with the state-of-the-art values reported in the paper.
+   • The program may also include logic for command-line arguments or experiment selection (e.g., selecting between training FiT-B/2 vs. FiT-XL/2), though by default it will run an entire cycle from training to evaluation.
+
+Summary of Call Flow:
+   1. Main initiates configuration loading.
+   2. Main creates DatasetLoader and fetches the DataLoader.
+   3. Main instantiates the Model, then loads the pretrained VAE.
+   4. Main creates the Trainer and starts the training loop.
+   5. Once training is complete, Main instantiates Evaluation and runs evaluate().
+   6. Outputs evaluation metrics (FID, sFID, IS, Precision, Recall) to the console or log files.
+
+This structured approach ensures that all phases—the preprocessing, model construction, training, and evaluation—adhere to the specifications and methodologies described in the FiT paper while also following the design constraints (especially regarding tokenization, positional embedding, masked attention, and diffusion training dynamics).
+"""

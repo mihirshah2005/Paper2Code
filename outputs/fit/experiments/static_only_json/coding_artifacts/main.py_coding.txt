@@ -1,0 +1,117 @@
+```python
+"""main.py
+
+Main entry point for the FiT diffusion model reproduction pipeline.
+This script loads the configuration from config.yaml, initializes the dataset,
+constructs the FiT transformer model and loads a pretrained VAE, starts the training
+process using the Trainer class, and finally runs evaluation using the Evaluation class.
+Evaluation metrics are printed to the log upon completion.
+
+Author: Your Name
+Date: YYYY-MM-DD
+"""
+
+import os
+import logging
+import argparse
+import yaml
+
+def main() -> None:
+    """Main function to orchestrate data loading, model training, and evaluation."""
+    # Setup logging.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logger = logging.getLogger(__name__)
+
+    # Parse command-line arguments.
+    parser = argparse.ArgumentParser(
+        description="FiT: Flexible Vision Transformer for Diffusion - Train and Evaluate"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+        help="Path to the configuration file (default: config.yaml)"
+    )
+    args = parser.parse_args()
+    config_path: str = args.config
+
+    # Load configuration file.
+    if not os.path.exists(config_path):
+        logger.error("Configuration file '%s' does not exist.", config_path)
+        return
+
+    try:
+        with open(config_path, "r") as config_file:
+            config = yaml.safe_load(config_file)
+        logger.info("Configuration loaded successfully from '%s'.", config_path)
+    except Exception as e:
+        logger.error("Error loading configuration: %s", str(e))
+        return
+
+    # Initialize the DatasetLoader and load data.
+    try:
+        from dataset_loader import DatasetLoader
+    except ImportError as e:
+        logger.error("Error importing DatasetLoader: %s", str(e))
+        return
+
+    dataset_loader_instance = DatasetLoader(config)
+    dataloader = dataset_loader_instance.load_data()
+    logger.info("DatasetLoader initialized. Number of samples: %d", len(dataset_loader_instance))
+
+    # Instantiate the FiT Model and load the pretrained VAE.
+    try:
+        from model import Model
+    except ImportError as e:
+        logger.error("Error importing Model: %s", str(e))
+        return
+
+    model = Model(config)
+    try:
+        model.load_pretrained_vae()  # Uses the pretrained VAE path from the config.
+        logger.info("Pretrained VAE loaded successfully in the model.")
+    except Exception as e:
+        logger.error("Error loading pretrained VAE: %s", str(e))
+        return
+
+    # Initialize the Trainer and run the training loop.
+    try:
+        from trainer import Trainer
+    except ImportError as e:
+        logger.error("Error importing Trainer: %s", str(e))
+        return
+
+    trainer = Trainer(model, dataloader, config)
+    logger.info("Starting training process.")
+    trainer.train()
+    logger.info("Training completed successfully.")
+
+    # Initialize the Evaluation object and run inference to compute metrics.
+    try:
+        from evaluation import Evaluation
+    except ImportError as e:
+        logger.error("Error importing Evaluation: %s", str(e))
+        return
+
+    evaluator = Evaluation(model, dataloader, config)
+    logger.info("Starting evaluation process.")
+    evaluation_results = evaluator.evaluate()
+    logger.info("Evaluation completed successfully.")
+
+    # Log the evaluation results.
+    logger.info("Final Evaluation Metrics:")
+    for resolution_label, method_metrics in evaluation_results.items():
+        logger.info("Resolution: %s", resolution_label)
+        for method, metrics in method_metrics.items():
+            logger.info("  Extrapolation Method: %s", method)
+            for metric_name, value in metrics.items():
+                logger.info("    %s: %.4f", metric_name, value)
+
+
+if __name__ == "__main__":
+    main()
+```

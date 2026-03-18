@@ -1,0 +1,400 @@
+"""
+utils.py
+
+This module provides utility functions for configuration loading, random seed setup,
+logging initialization, image preprocessing, backdoor trigger injection, API response caching,
+and text normalization. These helper functions are shared across the VDC project and ensure
+reproducibility, consistency, and robustness.
+"""
+
+import os
+import random
+import yaml
+import logging
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+import re
+from typing import Any, Dict, Optional, Tuple
+from PIL import Image, ImageDraw, ImageOps
+import requests
+
+# Global in-memory API response cache.
+_API_CACHE: Dict[str, str] = {}
+
+
+def load_config(config_file: str) -> Dict[str, Any]:
+    """
+    Load configuration from a YAML file.
+
+    Reads the configuration from the specified file using a YAML parser. In case of
+    any error (file not found or YAML parsing issue), defaults are returned.
+
+    Args:
+        config_file (str): Path to the configuration file (e.g., "config.yaml").
+
+    Returns:
+        dict: Parsed configuration dictionary.
+    """
+    # Default configuration values.
+    default_config: Dict[str, Any] = {
+        "training": {
+            "epochs": 100,
+            "optimizer": "SGD",
+            "learning_rate": 0.1,
+            "batch_size": {
+                "CIFAR-10": 128,
+                "ImageNet-100": 64,
+                "ImageNet-Dog": 64
+            },
+            "lr_decay_schedule": {
+                "CIFAR-10": [{"epoch": 50}, {"epoch": 75}],
+                "ImageNet-100": [{"epoch": 30}, {"epoch": 60}],
+                "ImageNet-Dog": [{"epoch": 30}, {"epoch": 60}]
+            }
+        },
+        "detection": {
+            "threshold": 0.5,
+            "general_questions_count": 2,
+            "label_specific_questions": {
+                "CIFAR-10": 4,
+                "ImageNet-100": 6,
+                "ImageNet-Dog": 4
+            }
+        },
+        "dirty_sample_generation": {
+            "noisy_ratio": 0.4,
+            "poisoning": {
+                "CIFAR-10": {"samples_per_class": [50, 500]},
+                "ImageNet-100": {"samples_per_class": [5, 50]},
+                "ImageNet-Dog": {"samples_per_class": 80}
+            }
+        },
+        "models": {
+            "detector": "VDC",
+            "classifier": "ResNet-18"
+        },
+        "api": {
+            "chatgpt": {"model": "gpt-3.5-turbo"},
+            "instruct_blip": {"model": "Instruct-BLIP"}
+        },
+        "seed": 42,
+        "dataset_paths": {
+            "ImageNet-100_train": "./data/imagenet100/train",
+            "ImageNet-100_val": "./data/imagenet100/val",
+            "ImageNet-Dog_train": "./data/imagenet_dog/train",
+            "ImageNet-Dog_val": "./data/imagenet_dog/val"
+        }
+    }
+    try:
+        with open(config_file, "r") as f:
+            loaded_config: Optional[Dict[str, Any]] = yaml.safe_load(f)
+            if loaded_config is None:
+                logging.warning("The configuration file is empty. Using default configuration.")
+                return default_config
+            merged_config = _merge_dicts(default_config, loaded_config)
+            return merged_config
+    except FileNotFoundError:
+        logging.error(f"Configuration file '{config_file}' not found. Using default configuration.")
+        return default_config
+    except yaml.YAMLError as e:
+        logging.error(f"Error parsing YAML configuration: {e}. Using default configuration.")
+        return default_config
+
+
+def _merge_dicts(default: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively merge two dictionaries, using values from the override dictionary when provided.
+
+    Args:
+        default (dict): The default configuration dictionary.
+        override (dict): The configuration dictionary to override defaults.
+
+    Returns:
+        dict: The merged configuration dictionary.
+    """
+    merged = default.copy()
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def set_random_seed(seed: int) -> None:
+    """
+    Set the random seed for reproducibility across random, numpy, and PyTorch.
+
+    Args:
+        seed (int): The seed value to set.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    logging.info(f"Random seed set to {seed}")
+
+
+def init_logger(log_file: Optional[str] = None) -> logging.Logger:
+    """
+    Initialize and return a logger with both console and optional file handlers.
+
+    Args:
+        log_file (Optional[str]): Path to a file where logs will be written. If None,
+                                  only console logging is used.
+
+    Returns:
+        logging.Logger: The configured logger.
+    """
+    logger = logging.getLogger("VDC_Logger")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # Remove existing handlers to avoid duplicate logs.
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Console handler.
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File handler if log_file provided.
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except Exception as e:
+            logger.error(f"Failed to create log file handler: {e}")
+    return logger
+
+
+def preprocess_image(image: Any, dataset: str) -> torch.Tensor:
+    """
+    Preprocess the input image into a normalized tensor based on the dataset.
+
+    The function converts the input image into a PIL Image (if not already), and
+    applies dataset-specific transformations. For "CIFAR-10", the image is resized to 32x32
+    with corresponding normalization; for "ImageNet-100" and "ImageNet-Dog", the image is resized to 256,
+    center cropped to 224, and normalized accordingly.
+
+    Args:
+        image (Any): Input image (as a PIL Image or numpy array).
+        dataset (str): Name of the dataset ("CIFAR-10", "ImageNet-100", or "ImageNet-Dog").
+
+    Returns:
+        torch.Tensor: The preprocessed image tensor.
+    """
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image.astype(np.uint8))
+
+    if dataset == "CIFAR-10":
+        transform = transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2470, 0.2435, 0.2616))
+        ])
+    elif dataset in ["ImageNet-100", "ImageNet-Dog"]:
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406),
+                                 (0.229, 0.224, 0.225))
+        ])
+    else:
+        transform = transforms.ToTensor()
+
+    return transform(image)
+
+
+def overlay_badnets_trigger(image: np.ndarray, dataset: str, patch_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """
+    Overlay a BadNets trigger (a visible white square) on the input image.
+
+    For CIFAR-10, the default patch size is 3x3; for ImageNet datasets, the default is 21x21.
+    The white square is placed at the lower-right corner of the image.
+
+    Args:
+        image (np.ndarray): Input image as a numpy array of shape (H, W, C).
+        dataset (str): Name of the dataset ("CIFAR-10", "ImageNet-100", "ImageNet-Dog").
+        patch_size (Optional[Tuple[int, int]]): (height, width) of the patch. Defaults are used if None.
+
+    Returns:
+        np.ndarray: The modified image with the trigger applied.
+    """
+    modified_image = image.copy()
+    height, width, channels = modified_image.shape
+    if patch_size is None:
+        patch_size = (3, 3) if dataset == "CIFAR-10" else (21, 21)
+    patch_h, patch_w = patch_size
+    modified_image[height - patch_h: height, width - patch_w: width, :] = 255
+    return modified_image
+
+
+def overlay_blended_trigger(image: np.ndarray, trigger_img: np.ndarray, blend_ratio: float = 0.1) -> np.ndarray:
+    """
+    Overlay a blended trigger onto the input image by combining it with a trigger image.
+
+    The trigger image is resized to match the dimensions of the input image and blended
+    with a specified ratio.
+
+    Args:
+        image (np.ndarray): Input image as a numpy array.
+        trigger_img (np.ndarray): Trigger image as a numpy array.
+        blend_ratio (float): Ratio to blend the trigger; default is 0.1.
+
+    Returns:
+        np.ndarray: The image after blending with the trigger.
+    """
+    base_img = Image.fromarray(image.astype(np.uint8))
+    trigger = Image.fromarray(trigger_img.astype(np.uint8))
+    # Resize trigger image to match the base image.
+    trigger = trigger.resize(base_img.size)
+    blended = Image.blend(base_img, trigger, alpha=blend_ratio)
+    return np.array(blended)
+
+
+def apply_sig_trigger(image: np.ndarray, delta: float = 20.0, frequency: float = 6.0) -> np.ndarray:
+    """
+    Apply an invisible SIG trigger to the image using a sinusoidal pattern along the width.
+
+    The sine signal is computed and added to each channel of the image, and the result is
+    clipped to the range [0, 255].
+
+    Args:
+        image (np.ndarray): Input image as a numpy array.
+        delta (float): Amplitude of the sine signal; default is 20.
+        frequency (float): Frequency of the sine signal; default is 6.
+
+    Returns:
+        np.ndarray: The image with the SIG trigger applied.
+    """
+    modified_image = image.copy().astype(np.float32)
+    height, width, channels = modified_image.shape
+    # Generate sine wave signal across the width.
+    x = np.arange(width)
+    sine_wave = delta * np.sin(2 * np.pi * frequency * x / width)
+    sine_wave = np.tile(sine_wave, (height, 1))
+    for ch in range(channels):
+        modified_image[:, :, ch] += sine_wave
+    modified_image = np.clip(modified_image, 0, 255)
+    return modified_image.astype(np.uint8)
+
+
+def apply_trojanNN_trigger(image: np.ndarray, trigger_img: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Simulate a TrojanNN trigger injection by adding a predefined trigger mask to the image.
+
+    If a trigger image is provided, it is blended into the image; otherwise, a default
+    white square (placed at the top-left corner) is used as a placeholder.
+
+    Args:
+        image (np.ndarray): Input image as a numpy array.
+        trigger_img (Optional[np.ndarray]): Optional trigger image.
+
+    Returns:
+        np.ndarray: The image with the TrojanNN trigger applied.
+    """
+    if trigger_img is None:
+        modified_image = image.copy()
+        height, width, _ = modified_image.shape
+        # Use a default 5x5 white square at the top-left corner.
+        patch_size = (5, 5)
+        modified_image[0:patch_size[0], 0:patch_size[1], :] = 255
+        return modified_image
+    else:
+        # Use blended trigger as a simulation.
+        return overlay_blended_trigger(image, trigger_img, blend_ratio=0.1)
+
+
+def apply_ssba_trigger(image: np.ndarray) -> np.ndarray:
+    """
+    Simulate an SSBA trigger injection by adding a subtle random noise pattern to the image.
+
+    This simplified placeholder adds Gaussian noise scaled by a factor to simulate
+    the SSBA effect.
+
+    Args:
+        image (np.ndarray): Input image as a numpy array.
+
+    Returns:
+        np.ndarray: The image with the simulated SSBA trigger.
+    """
+    modified_image = image.copy().astype(np.float32)
+    height, width, channels = modified_image.shape
+    noise = np.random.normal(loc=0.0, scale=1.0, size=(height, width, channels))
+    modified_image += noise * 5  # Scale factor for noise.
+    modified_image = np.clip(modified_image, 0, 255)
+    return modified_image.astype(np.uint8)
+
+
+def apply_wanet_trigger(image: np.ndarray) -> np.ndarray:
+    """
+    Simulate a WaNet trigger by applying a simplified elastic warping effect.
+
+    For this placeholder implementation, a mild affine translation is applied.
+
+    Args:
+        image (np.ndarray): Input image as a numpy array.
+
+    Returns:
+        np.ndarray: The image after applying the simulated WaNet trigger.
+    """
+    modified_image = image.copy()
+    height, width, _ = modified_image.shape
+    shift_x, shift_y = 5, 5  # Fixed translation values.
+    pil_image = Image.fromarray(modified_image)
+    warped = pil_image.transform(
+        (width, height),
+        Image.AFFINE,
+        (1, 0, shift_x, 0, 1, shift_y),
+        resample=Image.BILINEAR
+    )
+    return np.array(warped)
+
+
+def get_cached_response(key: str) -> Optional[str]:
+    """
+    Retrieve a cached API response from the in-memory cache.
+
+    Args:
+        key (str): Unique key representing the API call.
+
+    Returns:
+        Optional[str]: Cached response string if available; otherwise, None.
+    """
+    return _API_CACHE.get(key)
+
+
+def cache_response(key: str, response: str) -> None:
+    """
+    Cache an API response under a given key.
+
+    Args:
+        key (str): Unique key for the API response.
+        response (str): API response string to be cached.
+    """
+    _API_CACHE[key] = response
+
+
+def clean_text(text: str) -> str:
+    """
+    Clean and normalize the given text by converting to lowercase, stripping whitespace,
+    and removing punctuation. This function is used to standardize text for evaluation
+    in the visual answer evaluation module.
+
+    Args:
+        text (str): The text to clean.
+
+    Returns:
+        str: The cleaned and normalized text.
+    """
+    cleaned_text = text.lower().strip()
+    cleaned_text = re.sub(r'[^\w\s]', '', cleaned_text)
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+    return cleaned_text

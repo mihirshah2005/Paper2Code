@@ -1,0 +1,377 @@
+```python
+"""model.py
+
+This module implements the ModelManager class which is responsible for building
+backbone models across Computer Vision (CV), Natural Language Processing (NLP),
+and Graph domains. It constructs models in a reproducible manner using PyTorch,
+torchvision, Hugging Face Transformers, and torch_geometric. The final classification
+head is adjusted based on dataset-specific properties provided in the configuration.
+
+Supported Models:
+  • CV: LeNet, ResNet-18, ViT
+  • NLP: LSTM, BERT, GPT2
+  • Graph: GCN, GAT, GIN
+
+All critical dataset properties (e.g., num_classes, input_channels, vocab_size, num_node_features)
+are validated with fallback defaults and logged appropriately.
+"""
+
+import logging
+from typing import Any, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Torchvision for CV models
+import torchvision.models as tv_models
+
+# Hugging Face Transformers for NLP models
+from transformers import AutoModelForSequenceClassification, GPT2ForSequenceClassification
+
+# Torch Geometric for Graph models
+try:
+    from torch_geometric.nn import GCNConv, GATConv, GINConv, global_mean_pool
+except ImportError as e:
+    raise ImportError("torch_geometric is required for Graph models. " + str(e))
+
+# Configure logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+# ==================== CV Models ====================
+
+class LeNet(nn.Module):
+    """A simple LeNet model for image classification."""
+    def __init__(self, input_channels: int = 3, num_classes: int = 10) -> None:
+        super(LeNet, self).__init__()
+        # Using standard LeNet architecture for 32x32 input images.
+        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=6, kernel_size=5)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5)
+        # For 32x32 images, after two conv + pool layers the spatial dimension is 5x5.
+        self.fc1 = nn.Linear(in_features=16 * 5 * 5, out_features=120)
+        self.fc2 = nn.Linear(in_features=120, out_features=84)
+        self.fc3 = nn.Linear(in_features=84, out_features=num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(x.size(0), -1)  # flatten
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class VisionTransformer(nn.Module):
+    """A simple Vision Transformer (ViT) implementation for image classification."""
+    def __init__(self,
+                 input_channels: int,
+                 num_classes: int,
+                 image_size: int = 32,
+                 patch_size: int = 8,
+                 emb_dim: int = 64,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 dropout: float = 0.1) -> None:
+        super(VisionTransformer, self).__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+        self.emb_dim = emb_dim
+
+        # Patch embedding layer with conv kernel equal to patch_size
+        self.patch_embed = nn.Conv2d(in_channels=input_channels, out_channels=emb_dim,
+                                     kernel_size=patch_size, stride=patch_size)
+        # Positional embeddings
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, emb_dim))
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=num_heads, dropout=dropout)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Classification head
+        self.fc = nn.Linear(emb_dim, num_classes)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.patch_embed.weight)
+        if self.patch_embed.bias is not None:
+            nn.init.zeros_(self.patch_embed.bias)
+        nn.init.normal_(self.pos_embed, std=0.02)
+        nn.init.xavier_uniform_(self.fc.weight)
+        if self.fc.bias is not None:
+            nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [batch_size, channels, height, width]
+        x = self.patch_embed(x)  # [batch, emb_dim, H', W']
+        x = x.flatten(2)  # [batch, emb_dim, num_patches]
+        x = x.transpose(1, 2)  # [batch, num_patches, emb_dim]
+        x = x + self.pos_embed  # add positional encoding
+        # Transformer expects sequence-first input: [num_patches, batch, emb_dim]
+        x = self.transformer(x.transpose(0, 1)).transpose(0, 1)  # [batch, num_patches, emb_dim]
+        x = x.mean(dim=1)  # Global average pooling over patches
+        x = self.fc(x)
+        return x
+
+
+# ==================== NLP Models ====================
+
+class LSTMClassifier(nn.Module):
+    """An LSTM-based classifier for sequence classification."""
+    def __init__(self,
+                 vocab_size: int,
+                 embed_dim: int,
+                 hidden_dim: int,
+                 num_classes: int,
+                 num_layers: int = 1,
+                 dropout: float = 0.1) -> None:
+        super(LSTMClassifier, self).__init__()
+        self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
+        self.lstm = nn.LSTM(input_size=embed_dim,
+                            hidden_size=hidden_dim,
+                            num_layers=num_layers,
+                            batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0.0)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape expected as [batch_size, sequence_length]
+        x = self.embedding(x)
+        lstm_out, (h_n, _) = self.lstm(x)
+        # Use the last hidden state of the final LSTM layer
+        last_hidden = h_n[-1]
+        x = self.dropout(last_hidden)
+        x = self.fc(x)
+        return x
+
+
+# ==================== Graph Models ====================
+
+class GCNModel(nn.Module):
+    """A simple Graph Convolutional Network (GCN) for graph classification."""
+    def __init__(self, in_channels: int, hidden_dim: int, num_classes: int) -> None:
+        super(GCNModel, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, data: Any) -> torch.Tensor:
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = global_mean_pool(x, batch)
+        x = self.fc(x)
+        return x
+
+
+class GATModel(nn.Module):
+    """A simple Graph Attention Network (GAT) for graph classification."""
+    def __init__(self, in_channels: int, hidden_dim: int, num_classes: int, heads: int = 8) -> None:
+        super(GATModel, self).__init__()
+        self.gat1 = GATConv(in_channels, hidden_dim, heads=heads)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=1)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, data: Any) -> torch.Tensor:
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = F.elu(self.gat1(x, edge_index))
+        x = F.elu(self.gat2(x, edge_index))
+        x = global_mean_pool(x, batch)
+        x = self.fc(x)
+        return x
+
+
+class GINModel(nn.Module):
+    """A simple Graph Isomorphism Network (GIN) for graph classification."""
+    def __init__(self, in_channels: int, hidden_dim: int, num_classes: int) -> None:
+        super(GINModel, self).__init__()
+        mlp1 = nn.Sequential(nn.Linear(in_channels, hidden_dim),
+                             nn.ReLU(),
+                             nn.Linear(hidden_dim, hidden_dim))
+        self.gin1 = GINConv(mlp1)
+        mlp2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
+                             nn.ReLU(),
+                             nn.Linear(hidden_dim, hidden_dim))
+        self.gin2 = GINConv(mlp2)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, data: Any) -> torch.Tensor:
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = F.relu(self.gin1(x, edge_index))
+        x = F.relu(self.gin2(x, edge_index))
+        x = global_mean_pool(x, batch)
+        x = self.fc(x)
+        return x
+
+
+# ==================== Model Manager ====================
+
+class ModelManager:
+    """
+    ModelManager builds backbone models based on domain and model identifiers,
+    adjusting input/output layers according to dataset-specific properties.
+    
+    Args:
+        config (Dict[str, Any]): Experiment configuration from config.yaml.
+        domain (str): Domain of the task ("cv", "nlp", or "graph").
+        model_name (str): The name of the model to instantiate.
+        dataset_props (Dict[str, Any]): Dataset properties that must include at least
+            'num_classes'. Optional keys:
+              - 'input_channels' (default: 3 for CV)
+              - 'vocab_size' (default: 30522 for NLP)
+              - 'num_node_features' (default: 1 for Graph)
+    """
+    def __init__(self,
+                 config: Dict[str, Any],
+                 domain: str,
+                 model_name: str,
+                 dataset_props: Dict[str, Any]) -> None:
+        self.config: Dict[str, Any] = config
+        self.domain: str = domain.lower()
+        self.model_name: str = model_name
+        self.dataset_props: Dict[str, Any] = dataset_props
+
+        # Validate critical dataset properties.
+        if "num_classes" not in self.dataset_props:
+            logger.error("Missing critical dataset property: 'num_classes'")
+            raise ValueError("dataset_props must include 'num_classes'")
+        self.num_classes: int = int(self.dataset_props["num_classes"])
+
+        # For CV models, set input_channels with default value 3.
+        self.input_channels: int = int(self.dataset_props.get("input_channels", 3))
+        # For NLP models, set vocab_size with a common default (e.g., BERT's vocabulary size).
+        self.vocab_size: int = int(self.dataset_props.get("vocab_size", 30522))
+        # For Graph models, set num_node_features with default value 1.
+        self.num_node_features: int = int(self.dataset_props.get("num_node_features", 1))
+
+    def build_model(self) -> nn.Module:
+        """
+        Builds and returns the model based on the domain and model name.
+        
+        Returns:
+            nn.Module: The constructed backbone model.
+            
+        Raises:
+            ValueError: If an unsupported domain or model name is encountered.
+        """
+        if self.domain == "cv":
+            return self._build_cv_model()
+        elif self.domain == "nlp":
+            return self._build_nlp_model()
+        elif self.domain == "graph":
+            return self._build_graph_model()
+        else:
+            logger.error("Unsupported domain: %s", self.domain)
+            raise ValueError(f"Unsupported domain: {self.domain}")
+
+    def _build_cv_model(self) -> nn.Module:
+        """Builds a CV model (LeNet, ResNet-18, or ViT) with adjusted classification head."""
+        model_name_lower = self.model_name.lower()
+        if model_name_lower == "lenet":
+            logger.info("Building LeNet for CV with input_channels=%d and num_classes=%d",
+                        self.input_channels, self.num_classes)
+            return LeNet(input_channels=self.input_channels, num_classes=self.num_classes)
+        elif model_name_lower == "resnet-18":
+            logger.info("Building ResNet-18 for CV with num_classes=%d", self.num_classes)
+            model = tv_models.resnet18(pretrained=False)
+            in_features = model.fc.in_features
+            model.fc = nn.Linear(in_features, self.num_classes)
+            return model
+        elif model_name_lower == "vit":
+            logger.info("Building Vision Transformer (ViT) for CV with input_channels=%d and num_classes=%d",
+                        self.input_channels, self.num_classes)
+            # Default ViT settings: image_size=32, patch_size=8, emb_dim=64, num_layers=6, num_heads=8.
+            return VisionTransformer(input_channels=self.input_channels,
+                                     num_classes=self.num_classes,
+                                     image_size=32,
+                                     patch_size=8,
+                                     emb_dim=64,
+                                     num_layers=6,
+                                     num_heads=8)
+        else:
+            logger.error("Unsupported CV model: %s", self.model_name)
+            raise ValueError(f"Unsupported CV model: {self.model_name}")
+
+    def _build_nlp_model(self) -> nn.Module:
+        """Builds an NLP model (LSTM, BERT, or GPT2) with proper classifier head reinitialization."""
+        model_name_lower = self.model_name.lower()
+        if model_name_lower == "lstm":
+            logger.info("Building LSTM classifier for NLP with vocab_size=%d and num_classes=%d",
+                        self.vocab_size, self.num_classes)
+            # Default settings: embed_dim=128, hidden_dim=128, num_layers=1, dropout=0.1.
+            return LSTMClassifier(vocab_size=self.vocab_size,
+                                  embed_dim=128,
+                                  hidden_dim=128,
+                                  num_classes=self.num_classes,
+                                  num_layers=1,
+                                  dropout=0.1)
+        elif model_name_lower == "bert":
+            logger.info("Building BERT model for NLP with num_classes=%d", self.num_classes)
+            try:
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    "bert-base-uncased", num_labels=self.num_classes)
+            except Exception as e:
+                logger.error("Error loading BERT pretrained model: %s", str(e))
+                raise e
+            # Reinitialize classifier head explicitly.
+            if hasattr(model, 'classifier'):
+                in_features = model.classifier.in_features
+                model.classifier = nn.Linear(in_features, self.num_classes)
+                nn.init.xavier_uniform_(model.classifier.weight)
+                if model.classifier.bias is not None:
+                    nn.init.zeros_(model.classifier.bias)
+                logger.info("Reinitialized BERT classifier head with in_features=%d", in_features)
+            else:
+                logger.error("BERT model does not have a 'classifier' attribute.")
+                raise ValueError("BERT model missing classifier head.")
+            return model
+        elif model_name_lower == "gpt2":
+            logger.info("Building GPT2 model for NLP with num_classes=%d", self.num_classes)
+            try:
+                model = GPT2ForSequenceClassification.from_pretrained("gpt2", num_labels=self.num_classes)
+            except Exception as e:
+                logger.error("Error loading GPT2 pretrained model: %s", str(e))
+                raise e
+            # Set pad_token_id if missing
+            if model.config.pad_token_id is None:
+                model.config.pad_token_id = model.config.eos_token_id
+                logger.info("Set GPT2 pad_token_id to eos_token_id: %s", str(model.config.eos_token_id))
+            # Reinitialize GPT2 classification head (attribute 'score')
+            if hasattr(model, 'score'):
+                in_features = model.score.in_features
+                model.score = nn.Linear(in_features, self.num_classes)
+                nn.init.xavier_uniform_(model.score.weight)
+                if model.score.bias is not None:
+                    nn.init.zeros_(model.score.bias)
+                logger.info("Reinitialized GPT2 classification head with in_features=%d", in_features)
+            else:
+                logger.error("GPT2 model does not have a 'score' attribute.")
+                raise ValueError("GPT2 model missing classification head attribute 'score'.")
+            return model
+        else:
+            logger.error("Unsupported NLP model: %s", self.model_name)
+            raise ValueError(f"Unsupported NLP model: {self.model_name}")
+
+    def _build_graph_model(self) -> nn.Module:
+        """Builds a Graph model (GCN, GAT, or GIN) with appropriate layers for classification."""
+        hidden_dim = 32  # Default hidden dimension for graph models
+        model_name_lower = self.model_name.lower()
+        if model_name_lower == "gcn":
+            logger.info("Building GCN model for Graph with num_node_features=%d and num_classes=%d",
+                        self.num_node_features, self.num_classes)
+            return GCNModel(in_channels=self.num_node_features, hidden_dim=hidden_dim, num_classes=self.num_classes)
+        elif model_name_lower == "gat":
+            logger.info("Building GAT model for Graph with num_node_features=%d and num_classes=%d",
+                        self.num_node_features, self.num_classes)
+            return GATModel(in_channels=self.num_node_features, hidden_dim=hidden_dim, num_classes=self.num_classes)
+        elif model_name_lower == "gin":
+            logger.info("Building GIN model for Graph with num_node_features=%d and num_classes=%d",
+                        self.num_node_features, self.num_classes)
+            return GINModel(in_channels=self.num_node_features, hidden_dim=hidden_dim, num_classes=self.num_classes)
+        else:
+            logger.error("Unsupported Graph model: %s", self.model_name)
+            raise ValueError(f"Unsupported Graph model: {self.model_name}")
+```

@@ -1,0 +1,30 @@
+{
+  "all": [
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "low",
+      "critique": "The method does not specify how to handle cases where the API returns more than the expected number of questions. Without explicitly trimming or selecting the correct subset, extra questions may lead to inconsistent behavior downstream.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The fallback strategy relies on appending a set of default, safe template questions but does not clearly define the source or structure of these defaults (e.g., whether they come from config.yaml or an internal constant). This ambiguity may lead to inconsistencies with the intended design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "__init__",
+      "severity_level": "low",
+      "critique": "Although the logic mentions the use of configuration parameters (such as question counts, maximum retries, and delay durations) from config.yaml, it does not describe how these parameters are loaded or validated. This omission could result in mismatches between the configuration file and the module's behavior.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "generate_label_specific_questions",
+      "severity_level": "medium",
+      "critique": "The fallback strategy relies on appending a set of default, safe template questions but does not clearly define the source or structure of these defaults (e.g., whether they come from config.yaml or an internal constant). This ambiguity may lead to inconsistencies with the intended design.",
+      "source": "llm-judge"
+    }
+  ]
+}

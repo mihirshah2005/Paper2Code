@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is a plain‐language review of the analysis with notes on potential issues and their severity:\n\n1. Dirty Sample Injection Order and Overlap  \n • The analysis describes two separate injections—noisy label injection and backdoor (poisoned) injection—but it isn’t completely clear whether these are applied one after the other or if they are meant to be mutually exclusive. For example, what happens when a sample is selected for both modifications? This lack of precision might lead to unpredictab",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is a plain‐language review of the analysis with notes on potential issues and their severity:\n\n1. Dirty Sample Injection Order and Overlap  \n • The analysis describes two separate injections—noisy label injection and backdoor (poisoned) injection—but it isn’t completely clear whether these are applied one after the other or if they are meant to be mutually exclusive. For example, what happens when a sample is selected for both modifications? This lack of precision might lead to unpredictab",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

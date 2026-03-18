@@ -1,0 +1,78 @@
+{
+  "all": [
+    {
+      "target_func_name": "load_data",
+      "severity_level": "medium",
+      "critique": "The procedure for selecting ImageNet-100 and ImageNet-Dog subsets is underspecified. The analysis mentions random selection of classes and images per class without clarifying how reproducibility or deterministic splits (as might be expected from the original paper) are ensured.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The logic does not clarify how to handle cases where a single sample might qualify for both noisy label injection and poisoning. It is unclear whether these modifications are mutually exclusive or if one operation should precede the other, which could lead to conflicting alterations on the same data sample.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Data Augmentation Pipeline / inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "There is a potential conflict between applying data augmentation (e.g., random cropping or flipping) and maintaining the integrity of injected backdoor triggers. The analysis fails to specify measures to ensure that augmentation does not inadvertently remove or distort the trigger features.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "DatasetLoader Initialization / Configuration Handling",
+      "severity_level": "low",
+      "critique": "While the configuration from config.yaml is referenced, there is no detailed discussion on validating the presence and correctness of critical parameters (such as target label, noisy_ratio, or samples_per_class). Lack of such validation may cause runtime issues if the config is incomplete or misconfigured.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Utility/Trigger Injection Functions",
+      "severity_level": "medium",
+      "critique": "The design references several utility functions (e.g., for BadNets, Blended, SIG, etc.) without defining their interfaces, expected parameters, or outputs. This reliance on undefined components may lead to integration issues if these functions’ implementations do not align with the expectations of DatasetLoader.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Randomness in Sampling Procedures",
+      "severity_level": "medium",
+      "critique": "Random selection of samples for both dataset splitting and dirty sample injection is mentioned without explicit control over random seeds or reproducibility mechanisms. This omission could make experimental replication difficult.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Noisy Label Injection",
+      "severity_level": "low",
+      "critique": "The asymmetric noise rule is described generically as '(current_label mod K) + 1', which may oversimplify or misrepresent the more nuanced noise injection strategy found in the original paper. A clearer, paper-consistent definition should be provided.",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "load_data",
+      "severity_level": "medium",
+      "critique": "The procedure for selecting ImageNet-100 and ImageNet-Dog subsets is underspecified. The analysis mentions random selection of classes and images per class without clarifying how reproducibility or deterministic splits (as might be expected from the original paper) are ensured.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "The logic does not clarify how to handle cases where a single sample might qualify for both noisy label injection and poisoning. It is unclear whether these modifications are mutually exclusive or if one operation should precede the other, which could lead to conflicting alterations on the same data sample.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Data Augmentation Pipeline / inject_dirty_samples",
+      "severity_level": "medium",
+      "critique": "There is a potential conflict between applying data augmentation (e.g., random cropping or flipping) and maintaining the integrity of injected backdoor triggers. The analysis fails to specify measures to ensure that augmentation does not inadvertently remove or distort the trigger features.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Utility/Trigger Injection Functions",
+      "severity_level": "medium",
+      "critique": "The design references several utility functions (e.g., for BadNets, Blended, SIG, etc.) without defining their interfaces, expected parameters, or outputs. This reliance on undefined components may lead to integration issues if these functions’ implementations do not align with the expectations of DatasetLoader.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "Randomness in Sampling Procedures",
+      "severity_level": "medium",
+      "critique": "Random selection of samples for both dataset splitting and dirty sample injection is mentioned without explicit control over random seeds or reproducibility mechanisms. This omission could make experimental replication difficult.",
+      "source": "llm-judge"
+    }
+  ]
+}

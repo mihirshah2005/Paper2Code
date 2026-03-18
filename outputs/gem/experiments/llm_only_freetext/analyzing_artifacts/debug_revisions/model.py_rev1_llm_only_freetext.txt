@@ -1,0 +1,103 @@
+Below is a detailed logic analysis for the model.py module. This document explains how the Model class will implement the synthetic graph distillation mechanism, including parameter initialization, forward-pass computation, loss components, and graph reconstruction. All steps will use configuration settings (for example, learning rates and loss weights from config.yaml) and adhere strictly to the design specifications.
+
+──────────────────────────────
+1. Class Initialization
+
+• The Model class __init__ method will receive a dictionary of parameters (from the config and potentially other hyperparameters) and possibly information from the real graph (such as the synthetic graph size, feature dimension, and the number of eigenvectors K to match). In our design:
+ – We determine the synthetic node count (N′) based on the compression ratio. (For Pubmed, compression_ratio is 0.15%, so N′ would be computed as int(0.15/100 * N_real); note that the dataset loader or a helper function will have computed N_real.)
+ – We decide on K (the number of eigenvectors to be matched) using the ratio rₖ from the config. For instance, K is split into two parts: K₁ = rₖ × N′ (for the lowest frequencies) and K₂ = (1 – rₖ) × N′ (for the highest frequencies). Their sum gives the effective “K.”  
+ – The synthetic node features X′ and the synthetic eigenbasis U′_K will be created as learnable parameters.  
+  • X′ is a torch.nn.Parameter initialized (e.g., from a normal distribution) with shape (N′, d), where d is the feature dimension.  
+  • U′_K is a torch.nn.Parameter initialized with a random orthogonal matrix of shape (N′, K). (If available, one could instead initialize using an SBM-based method; however, we use a random orthogonal initialization here.)  
+ – The loss weight values α, β, and γ are taken directly from config.yaml (each set to 1.0 in our configuration).
+
+──────────────────────────────
+2. Forward Method
+
+• The forward(x: torch.Tensor) method is intended to compute the synthetic graph’s properties using the learned parameters. In our design:
+ – Although “forward” typically applies to a network producing predictions, here it will be used to “propagate” the current synthetic node features (X′) and eigenbasis (U′_K). In many cases, the method can simply return these parameters for use by the Trainer.
+ – If any additional transformation or projection is required on the synthetic features (for example, to compute a category-level representation or as part of a mini forward pass), it can be included here. For now, the forward pass is kept minimal—returning (or storing) the current U′_K and X′.
+
+──────────────────────────────
+3. Loss Computation – compute_loss Method
+
+The Model class will implement a compute_loss method that takes as input several tensors (provided from the dataset loader or computed externally) and returns the total loss. The loss is a weighted sum of three components:
+
+A. Eigenbasis Matching Loss (Lₑ)
+ • Purpose: Enforce the synthetic eigenbasis to “align” with the principal eigenbasis from the real graph.  
+ • Formulation (per the paper):
+  – For each selected eigenvector, the loss measures the discrepancy between the outer-product matrices from the real graph (uₖuₖᵀ) and the synthetic eigenbasis (u′ₖu′ₖᵀ).  
+  – A straightforward formulation is:
+   Lₑ = || (U_real @ U_realᵀ) − (U′ @ U′ᵀ) ||²_F  
+  where U_real is the truncated eigenbasis provided by the dataset loader (assumed to be preprocessed to have dimensions matching the synthetic graph) and U′ is self.synthetic_eigenbasis.
+ • Note: Given that the dimensions of the full real eigenbasis (N × K) and the synthetic eigenbasis (N′ × K) ordinarily differ, we assume here that the real eigenbasis has been appropriately reduced (or selected) so that it is comparable to U′. Alternatively, a projection or mapping could be applied if needed.
+
+B. Discrimination Constraint Loss (L_d)
+ • Purpose: Preserve category-level (class) information (i.e., the inter-class dissimilarity and intra-class similarity).  
+ • How to Compute:
+  – The real graph’s category-level representation (H) and the synthetic graph’s representation (H′) must be computed externally (for example, by aggregating node features weighted by their labels or via a secondary network).  
+  – Then, one can compute L_d using a cosine-similarity loss. For example:
+   L_d = 1 – mean(cosine_similarity(H, H′))
+  where cosine_similarity can be computed on a per-class basis, and then averaged.
+ • The Model.compute_loss method receives real_cat_repr and synthetic_cat_repr as inputs to compute this loss component.
+
+C. Orthogonality Regularization Loss (L_o)
+ • Purpose: Maintain that the synthetic eigenbasis remains orthogonal and normalized.  
+ • Formulation:
+  – Compute the Gram matrix: G = U′ᵀ @ U′.
+  – The loss enforces G to be close to the identity matrix I (of size K×K):
+   L_o = || G − I ||²_F  
+ • This prevents the learnable synthetic eigenbasis from collapsing into degenerate solutions.
+
+D. Total Loss Combination
+ • The total loss is then:
+  L_total = α * Lₑ + β * L_d + γ * L_o  
+ • The weights α, β, and γ are read from the configuration (loss_weights in config.yaml).
+
+──────────────────────────────
+4. Graph Reconstruction – reconstruct_graph Method
+
+Once training has converged, the synthetic graph’s structure is rebuilt by “replicating” the real spectrum.
+ • Input Requirements:  
+  – The method requires the real eigenvalues corresponding to the selected eigenbasis (provided as a torch.Tensor of shape (K,)).  
+ • Computation:
+  – The synthetic Laplacian L′ is computed as:
+   L′ = U′ @ diag(λ_real) @ U′ᵀ  
+   where diag(λ_real) creates a K×K diagonal matrix with the selected eigenvalues.  
+  – The synthetic adjacency matrix A′ is similarly computed by:
+   A′ = U′ @ diag(1 − λ_real) @ U′ᵀ  
+ • The method returns the tuple (L′, A′).
+
+──────────────────────────────
+5. Utility Functions and Parameter Updates
+
+• Although the Trainer module will handle the alternating updates (with tau1 and tau2 defining when to update eigenbasis versus node features), the Model class includes:
+ – update_eigenbasis(gradients: torch.Tensor) and update_features(gradients: torch.Tensor) methods as “hooks” (if needed), though in a typical PyTorch implementation these updates are performed via backpropagation on the registered parameters.
+ – For our purposes, the synthetic parameters (X′ and U′) are torch.nn.Parameter objects, and their update will be managed via the optimizer (e.g., Adam using learning_rate_feat and learning_rate_eigenvecs from config).
+
+──────────────────────────────
+6. Dependencies and Integration
+
+• The Model class will rely on torch and numpy for mathematical operations:
+ – torch.nn.Parameter will define learnable parameters.
+ – torch.matmul, torch.diag, and torch.norm operations will implement the loss formulas.
+ – Configuration values (from config.yaml) like loss weights, learning rates, tau1/tau2, etc., are stored in the common config dictionary.
+• The computed losses and reconstructed graph outputs from this Model class will be passed to the Trainer and Evaluation modules (as specified in the program call flow).
+
+──────────────────────────────
+Summary
+
+In summary, model.py will include:
+• An initialization section that sets up synthetic node features and a learnable synthetic eigenbasis U′_K using a random orthogonal initializer.
+• A forward() method that returns the current synthetic parameters (and possibly intermediate computed properties) for subsequent loss computation.
+• A compute_loss() method that calculates:
+ – Lₑ by comparing the projection matrices of the real (provided) eigenbasis and synthetic eigenbasis,
+ – L_d by computing a cosine similarity loss using the category-level representations provided from external sources,
+ – L_o via the Frobenius norm of the difference between (U′ᵀU′) and the identity matrix.
+ – The total loss is then returned as the weighted sum using α, β, γ from the config.
+• A reconstruct_graph() method that takes the real eigenvalues and uses the learned synthetic eigenbasis U′_K to rebuild the Laplacian (L′) and adjacency matrix (A′) of the distilled synthetic graph using the formulas:
+  L′ = ∑ₖ λₖ (u′ₖu′ₖᵀ)  A′ = ∑ₖ (1 – λₖ)(u′ₖu′ₖᵀ)
+ 
+By following this analysis, the implementation of model.py will respect the methodology described in the paper while remaining consistent with the overall project design and configuration settings.
+
+This logic analysis will serve as the blueprint when writing the actual code in model.py.

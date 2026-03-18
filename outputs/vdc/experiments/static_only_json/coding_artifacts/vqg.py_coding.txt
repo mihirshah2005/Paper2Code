@@ -1,0 +1,169 @@
+## Code: vqg.py
+```python
+"""
+vqg.py
+
+This module implements the Visual Question Generation (VQG) class, which is responsible
+for generating visual questions for an input image-label pair. It produces two sets of questions:
+  1. General questions: A fixed set of template-based questions.
+  2. Label-specific questions: Automatically generated using the ChatGPT API based on a prompt template.
+
+The VQG class leverages caching to avoid redundant API calls. It reads configuration
+details (such as the number of questions and API settings) from the supplied configuration
+dictionary (loaded from config.yaml).
+  
+Dependencies:
+  - openai, re, logging, and standard typing modules.
+  - Utilities: load_config, get_logger, cache_api_response, and get_cached_api_response (from utils.py).
+  
+Author: [Your Name]
+Date: [Date]
+"""
+
+import re
+from typing import List, Dict, Optional, Any
+
+import openai
+
+from utils import load_config, get_logger, cache_api_response, get_cached_api_response
+
+
+class VQG:
+    """
+    VQG (Visual Question Generation) class generates both fixed general questions and
+    label-specific questions for a given label as part of the VDC pipeline.
+    """
+    def __init__(self, dataset_name: str, config: Optional[Dict[str, Any]] = None,
+                 general_templates: Optional[List[str]] = None) -> None:
+        """
+        Initializes the VQG instance.
+
+        Args:
+            dataset_name (str): Identifier for the dataset (e.g. "CIFAR-10", "ImageNet-100", "ImageNet-Dog").
+            config (Optional[Dict[str, Any]]): Configuration dictionary loaded from config.yaml.
+                If None, the configuration will be loaded from "config.yaml" by default.
+            general_templates (Optional[List[str]]): List of fixed general question templates.
+                If None, default templates will be used.
+        """
+        # Load configuration if not provided.
+        if config is None:
+            config = load_config("config.yaml")
+        self.config: Dict[str, Any] = config
+
+        self.dataset_name: str = dataset_name
+
+        # Number of general questions from configuration.
+        self.general_questions_count: int = int(self.config.get("detection", {}).get("general_questions_count", 2))
+        
+        # Get the number of label-specific questions based on dataset name.
+        label_spec_config: Dict[str, Any] = self.config.get("detection", {}).get("label_specific_questions", {})
+        self.label_specific_questions_count: int = int(label_spec_config.get(dataset_name, 4))
+        
+        # Set general question templates.
+        if general_templates is None:
+            self.general_templates: List[str] = [
+                "Describe the image briefly.",
+                "Describe the image in detail."
+            ]
+        else:
+            self.general_templates = general_templates
+        
+        # Ensure we have enough general question templates (repeat if needed).
+        if len(self.general_templates) < self.general_questions_count:
+            multiplier = (self.general_questions_count // len(self.general_templates)) + 1
+            self.general_templates = (self.general_templates * multiplier)[:self.general_questions_count]
+        
+        # Define the prompt template for label-specific question generation.
+        # Placeholders: {n} for number of questions, {label} for the target label.
+        self.label_specific_prompt_template: str = (
+            "Please generate {n} label-specific visual questions to verify if an image indeed represents the label "
+            "'{label}'. The questions should be succinct, targeting specific attributes such as usage, appearance, "
+            "and function, and would naturally be answered with 'yes' if the label is correct. Please list each question on a new line."
+        )
+        
+        # Internal cache to store generated label-specific questions per label.
+        self.label_specific_cache: Dict[str, List[str]] = {}
+
+        # Initialize logger.
+        self.logger = get_logger("VQG")
+
+    def generate_general_questions(self, label: str) -> List[str]:
+        """
+        Generates general questions using fixed templates.
+        The provided 'label' parameter is not used to customize the questions.
+
+        Args:
+            label (str): The image label (unused for general questions).
+
+        Returns:
+            List[str]: A list of general questions.
+        """
+        # Return exactly the configured number of general questions.
+        return self.general_templates[:self.general_questions_count]
+
+    def generate_label_specific_questions(self, label: str) -> List[str]:
+        """
+        Generates label-specific questions for verifying if an image truly represents the given label.
+        It constructs a prompt using configuration parameters and calls the ChatGPT API (gpt-3.5-turbo)
+        to generate a list of questions. Results are cached for efficiency.
+
+        Args:
+            label (str): The target label for which to generate questions.
+
+        Returns:
+            List[str]: A list of label-specific questions.
+        """
+        # Check internal cache first.
+        if label in self.label_specific_cache:
+            return self.label_specific_cache[label]
+
+        # Use the global API cache from utils as well.
+        cache_key: str = f"VQG_{self.dataset_name}_{label}"
+        cached_result: Optional[Any] = get_cached_api_response(cache_key)
+        if cached_result is not None:
+            self.label_specific_cache[label] = cached_result
+            return cached_result
+
+        n_questions: int = self.label_specific_questions_count
+
+        # Construct the detailed prompt string.
+        prompt: str = self.label_specific_prompt_template.format(n=n_questions, label=label)
+        self.logger.info(f"Generating label-specific questions for label '{label}' with prompt: {prompt}")
+
+        try:
+            # Call ChatGPT API using the configured model.
+            response = openai.ChatCompletion.create(
+                model=self.config.get("api", {}).get("chatgpt", {}).get("model", "gpt-3.5-turbo"),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            response_text: str = response.choices[0].message.content.strip()
+            # Split response into individual lines.
+            raw_questions: List[str] = response_text.splitlines()
+            questions: List[str] = []
+            # Clean and extract questions from each line.
+            for line in raw_questions:
+                question: str = line.strip()
+                if not question:
+                    continue
+                # Remove leading numbering, bullets, or other extraneous symbols.
+                question = re.sub(r"^\s*[\d\.\-\)\:]*\s*", "", question)
+                if question:
+                    questions.append(question)
+            
+            # Ensure we have exactly the expected number of questions.
+            if len(questions) > n_questions:
+                questions = questions[:n_questions]
+            elif len(questions) < n_questions:
+                self.logger.warning(
+                    f"Expected {n_questions} label-specific questions but only received {len(questions)} for label '{label}'."
+                )
+            # Cache the result in the internal cache and global cache.
+            self.label_specific_cache[label] = questions
+            cache_api_response(cache_key, questions)
+            return questions
+        except Exception as ex:
+            self.logger.error(f"Error during label-specific question generation for label '{label}': {ex}")
+            # In case of error, return an empty list.
+            return []
+```

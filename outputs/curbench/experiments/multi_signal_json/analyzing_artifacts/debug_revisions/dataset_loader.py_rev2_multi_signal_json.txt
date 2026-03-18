@@ -1,0 +1,87 @@
+Below is the revised detailed logic analysis for dataset_loader.py. This updated version explicitly defines the ordering when both “noise” and “imbalance” modifiers are present for CV datasets and clarifies the handling of imbalance when the input dataset is not perfectly balanced.
+
+────────────────────────────
+1. Class Initialization and Configuration
+
+• The DatasetLoader class is initialized with a configuration dictionary (loaded from config.yaml) that includes experiment hyperparameters, reproducibility settings, and dataset-specific parameters.  
+• During initialization (in __init__(self, config: dict)), the class stores the configuration and extracts any dataset identifiers that may include modifiers such as “-noise-0.4” or “-imbalance-50”. It also ensures that a fixed random seed (or a seed from the provided reproducibility.seeds list) is used for any random sampling steps.
+
+────────────────────────────
+2. load_data() Method
+
+The load_data() method serves as the unified entry point to load and preprocess the dataset. Its responsibilities include:
+
+  a. Parsing the dataset identifier to determine:
+    – The target domain (CV, NLP, or Graph) based on string matching (e.g., “cifar”, “tinyimagenet”, “RTE”, “ogbg-molhiv”).
+    – Any preprocessing modifiers present (e.g., “noise-0.4” and/or “imbalance-50”).
+  
+  b. Loading the raw dataset using the appropriate library:
+    – For Computer Vision (CV):
+     – Use torchvision.datasets for CIFAR-10, CIFAR-100.
+     – For Tiny-ImageNet, use a custom file loader (adapting code from CS231n resources) and note that the validation set is used as test due to unreleased test labels.
+     – Split the original training set into training and validation subsets (a 9:1 ratio).
+    – For Natural Language Processing (NLP):
+     – Use Hugging Face datasets or similar utilities to load the GLUE benchmark (excluding WNLI), treating available validation sets as the test set.
+    – For Graph:
+     – Load ogbg-molhiv via torch_geometric’s OGB module using its official split.
+     – Load other graph datasets (e.g., MUTAG, PROTEINS, NCI1) using torch_geometric.datasets.TUDataset and randomly split them into training, validation, and test sets (8:1:1 ratio) using a fixed seed.
+  
+  c. Applying Preprocessing Modifiers with an Explicit Order for CV Domains:
+    – If both “imbalance” and “noise” modifiers are present in the dataset identifier, the defined order is to first apply the imbalance transformation and then inject label noise.  
+     • Rationale: The imbalance function reduces the training set to form a long-tailed distribution based on the original clean labels. Once the imbalanced subset is created, noise injection will modify the labels of the already selected samples. This ordering ensures that the imbalance ratio is as intended and that noise is consistently applied on the reduced set.
+    – Call apply_imbalance() first (if the modifier for imbalance exists), and subsequently call apply_noise() (if the modifier for noise exists).
+  
+  d. Return Value:
+    – The method returns a dictionary with keys “train”, “val”, and “test” where each value is either a Dataset object or a DataLoader prepared for subsequent processing.
+
+────────────────────────────
+3. apply_noise(data: Any, p: float) Method
+
+• Purpose: To inject random label noise into the training set.
+• Process:
+  1. Iterate over each sample in the input training dataset.
+  2. For each data sample, generate a random number (using a reproducible random function such as torch.rand or numpy.random.rand).
+  3. If the generated value is less than p, randomly select a new incorrect label from the list of valid class indices (ensuring the new label differs from the correct one).
+  4. Return the modified dataset with noise injected only on training labels.
+• Note: This function is generic and applies primarily to classification tasks (CV and some NLP tasks). Its application follows only after any imbalance processing (if both modifiers are specified).
+
+────────────────────────────
+4. apply_imbalance(data: Any, r: int) Method
+
+• Purpose: To create a long-tailed, imbalanced version of the training dataset for CV tasks.
+• Process:
+  1. Verify that the current data belongs to a CV dataset (since the imbalance setting is designed for originally balanced datasets such as CIFAR or Tiny-ImageNet).  
+  2. Group training samples by their class labels.
+  3. Assess the baseline distribution:
+    – Ideally, these datasets are balanced (i.e., each class contains roughly the same number of samples).  
+    – However, if the dataset is not perfectly balanced, the function will compute a baseline count n₀ as the maximum count across all classes. A warning (or logged message) should be issued to indicate that the dataset was not ideally balanced.
+  4. Compute the decay factor d needed to achieve the target imbalance ratio r using:
+    d = (1 / r)^(1 / (C – 1))
+    where C is the total number of classes.
+  5. For each class c (ordered using natural or numerical label order), compute the desired sample count:
+    desired_count[c] = int(n₀ × d^c)
+  6. Randomly select the desired number of samples from each class’s available samples, ensuring reproducibility by using a fixed seed.
+  7. Combine the selected samples from all classes to form the new, imbalanced training dataset.
+  8. Return the imbalanced dataset.
+• Note: This method assumes that the dataset is balanced to begin with. If not, the selection is based on the maximum class count and might not perfectly enforce the intended imbalance ratio. Users are advised that this method is tailored for the CV domain datasets in the experiment.
+
+────────────────────────────
+5. General Considerations and Reproducibility
+
+• For every random operation (splitting, noise injection, and subsampling):
+  – Use the provided reproducibility seeds to ensure that all experiments are repeatable.
+• Domain Branching:
+  – The logic in load_data() will split based on dataset identifiers—for CV, NLP, and Graph—ensuring that domain-specific preprocessing (splitting and preprocessing) is applied.
+• Consistent Output Structure:
+  – Regardless of domain, load_data() returns a dictionary with keys “train”, “val”, and “test”. This consistency allows downstream modules (Trainer and Evaluation) to interface with the data without additional formatting.
+
+────────────────────────────
+Summary
+
+The revised dataset_loader.py module provides a clear, ordered approach to handling multiple preprocessing modifiers:
+
+  – In CV datasets, if both imbalance and noise modifiers are present, the module first applies the imbalance transformation (creating a long-tailed distribution from the original balanced data) and then injects label noise into the resulting dataset.
+  – The apply_imbalance() function now includes a check for balanced input and uses the maximum class count as a baseline if the dataset isn’t perfectly balanced, while documenting that the intended imbalance ratio might not be met exactly when this assumption fails.
+  – These revisions ensure that experimental conditions replicate the paper’s design while making the transformation order and assumptions explicit for clarity and reproducibility.
+
+This analysis now addresses the critiques by clearly defining the order of operations for combined preprocessing and ensuring the imbalance logic accounts for potential deviations from perfectly balanced datasets.

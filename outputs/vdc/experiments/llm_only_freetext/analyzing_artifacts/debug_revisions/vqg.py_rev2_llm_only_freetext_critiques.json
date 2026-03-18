@@ -1,0 +1,18 @@
+{
+  "all": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is a plain‐text review of the analysis with a discussion of issues found, including which functions they affect and an assessment of their severity:\n\n1. In generate_general_questions the analysis describes using a fixed set of local templates and a deterministic “first two” (or fixed random) selection when there are more templates than needed. However, the logic does not mention what should happen if there are fewer available templates than the configured count. This omission can be proble",
+      "source": "llm-judge-freetext"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "<parsed-from-freetext>",
+      "severity_level": "medium",
+      "critique": "Below is a plain‐text review of the analysis with a discussion of issues found, including which functions they affect and an assessment of their severity:\n\n1. In generate_general_questions the analysis describes using a fixed set of local templates and a deterministic “first two” (or fixed random) selection when there are more templates than needed. However, the logic does not mention what should happen if there are fewer available templates than the configured count. This omission can be proble",
+      "source": "llm-judge-freetext"
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+The detection.py file is responsible for integrating the three main modules—VQG, VQA, and VAE—to decide whether an input sample (an image paired with a label) is “clean” or “dirty.” Below is a detailed logical breakdown of how the VDCDetector class (implemented in detection.py) should work.
+
+──────────────────────────────
+1. Initialization
+
+• The VDCDetector class is constructed with three module instances:
+  – An instance of VQG (Visual Question Generation), which receives a label and generates two sets of questions:
+    ▪ General Questions (using fixed templates, with count from config = 2)
+    ▪ Label-Specific Questions (the number depends on the dataset, e.g., 4 for CIFAR-10, 6 for ImageNet-100, etc.)
+  – An instance of VQA (Visual Question Answering) that, given an image and a text question, returns an answer string.
+  – An instance of VAE (Visual Answer Evaluation) that evaluates the correctness of the answer.
+• Also, a detection threshold (α) is provided via the configuration (α = 0.5). This threshold is used to decide if a sample’s matching score is low enough to be considered “dirty.”
+
+──────────────────────────────
+2. Detection Process: The detect_sample() Method
+
+When detect_sample(image, label) is called, the following steps are taken:
+
+Step 1: Question Generation  
+  • The VQG module is called twice:
+    – generate_general_questions(label): Returns a list of general questions (e.g., “Describe the image briefly.”).
+    – generate_label_specific_questions(label): Returns a list of questions tailored to the label (e.g., “Does the image show a [label] with its expected attributes?”).
+  • Both lists are combined into one overall list.  
+  • It is useful to tag each question with its type (for example, “general” or “label_specific”) because the evaluation procedure in VAE will vary accordingly.
+
+Step 2: Answer Retrieval  
+  • For each question in the union list:
+    – The VQA module is invoked with the sample image and the current question.
+    – The module returns an answer string.  
+  • Note: The VQA answer might be non-deterministic; in practice, proper image preprocessing and (if needed) seeding for deterministic behavior should be ensured.
+
+Step 3: Answer Evaluation  
+  • For each answer:
+    – The VAE module is used to evaluate the correctness of the answer.
+    – If the question is label-specific, the evaluation is based on simple string matching: for instance, if the answer contains “yes” (after lowercasing and stripping punctuation), the answer is judged as correct.
+    – For general questions, where a simple string match is insufficient (as answers are longer and more descriptive), the VAE module will likely call the ChatGPT API with a designed evaluation prompt. The evaluator returns a binary value (True if the answer’s semantics match the expected content, False otherwise).  
+  • Each evaluation returns a boolean value indicating whether that particular question was “answered correctly.”
+
+Step 4: Compute the Matching Score  
+  • After processing all questions, the detector computes the matching score sᵢ as:
+  
+        sᵢ = (Number of questions with a "correct" evaluation) / (Total number of questions generated)
+
+Step 5: Decision Making  
+  • The computed matching score sᵢ is compared with the threshold (α = 0.5):
+    – If sᵢ ≥ 0.5, then the sample is considered clean.
+    – If sᵢ < 0.5, then the sample is flagged as dirty.
+  • This binary decision is returned (or stored) so that downstream processes (such as dataset purification) can remove dirty samples.
+
+──────────────────────────────
+3. Additional Considerations
+
+• Exception Handling:  
+  – The detector should appropriately handle any API failures (e.g., if the ChatGPT call in VAE fails) and provide fallback behavior (maybe a default evaluation or a retry mechanism).
+
+• Logging and Caching:  
+  – The code should log each stage (question generation, answer obtained, evaluation result per question, matching score, final decision) for debugging purposes.
+  – Caching of API calls might be implemented in the underlying utility functions (in utils.py) to manage rate limits and improve reproducibility.
+
+• Modularity and Dependency:
+  – The VDCDetector class depends on proper implementations of the methods inside VQG, VQA, and VAE.
+  – It should only call the predefined public member functions (e.g., generate_general_questions, generate_label_specific_questions, answer_question, evaluate_answer) as established by the design.
+  – The configuration values (e.g., threshold = 0.5, question counts per dataset) are to be read from the config.yaml file and passed into the respective modules.
+
+──────────────────────────────
+4. Pseudocode Outline
+
+A simplified pseudocode for the detect_sample function might read as follows:
+
+  def detect_sample(self, image, label) -> bool:
+      # Generate questions
+      general_questions = self.vqg.generate_general_questions(label)
+      label_specific_questions = self.vqg.generate_label_specific_questions(label)
+      
+      # Combine questions with type tags; e.g.:
+      all_questions = [(q, "general") for q in general_questions] + [(q, "label_specific") for q in label_specific_questions]
+      
+      total = len(all_questions)
+      correct_count = 0
+      
+      # Process each question-answer pair
+      for question, q_type in all_questions:
+          answer = self.vqa.answer_question(image, question)
+          
+          # For label-specific questions, expected answer might implicitly be "yes"
+          if q_type == "label_specific":
+              expected_answer = "yes"
+          else:
+              expected_answer = None  # For general questions, the evaluation prompt in VAE will handle it
+          
+          evaluation_correct = self.vae.evaluate_answer(answer, expected_answer, q_type)
+          
+          if evaluation_correct:
+              correct_count += 1
+              
+      # Compute matching score
+      matching_score = correct_count / total
+      
+      # Compare with threshold (from config)
+      if matching_score >= self.threshold:
+          return True   # Sample is clean
+      else:
+          return False  # Sample is dirty
+
+──────────────────────────────
+5. Summary
+
+In summary, detection.py contains the VDCDetector class whose core logic is:
+• Generate a set of questions (both general and label-specific) using VQG.
+• For each generated question, use VQA to obtain an answer.
+• Evaluate each answer’s correctness using VAE.
+• Compute a vote-based matching score.
+• Return a detection decision based on whether the matching score meets the configured threshold (0.5).
+
+This logic fully aligns with the experimental design described in the paper and follows the code architecture and configuration settings provided.

@@ -1,0 +1,126 @@
+{
+  "paper_name": "fit",
+  "mode": "multi_signal",
+  "feedback_format": "json",
+  "max_iterations": 3,
+  "total_prompt_tokens": 348276,
+  "total_completion_tokens": 121724,
+  "total_tokens": 470000,
+  "per_file_iterations": {
+    "dataset_loader.py": [
+      {
+        "iteration": 1,
+        "high": 1,
+        "medium": 2,
+        "low": 2,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 2,
+        "total_critiques": 5
+      }
+    ],
+    "model.py": [
+      {
+        "iteration": 1,
+        "high": 1,
+        "medium": 2,
+        "low": 1,
+        "total_critiques": 4
+      },
+      {
+        "iteration": 2,
+        "high": 0,
+        "medium": 4,
+        "low": 2,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 3,
+        "low": 1,
+        "total_critiques": 4
+      }
+    ],
+    "trainer.py": [
+      {
+        "iteration": 1,
+        "high": 1,
+        "medium": 1,
+        "low": 1,
+        "total_critiques": 3
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 3,
+        "low": 1,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 0,
+        "medium": 4,
+        "low": 3,
+        "total_critiques": 7
+      }
+    ],
+    "evaluation.py": [
+      {
+        "iteration": 1,
+        "high": 2,
+        "medium": 2,
+        "low": 3,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 2,
+        "high": 2,
+        "medium": 3,
+        "low": 0,
+        "total_critiques": 5
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 4,
+        "low": 3,
+        "total_critiques": 8
+      }
+    ],
+    "main.py": [
+      {
+        "iteration": 1,
+        "high": 1,
+        "medium": 4,
+        "low": 2,
+        "total_critiques": 7
+      },
+      {
+        "iteration": 2,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+        "total_critiques": 6
+      },
+      {
+        "iteration": 3,
+        "high": 1,
+        "medium": 4,
+        "low": 1,
+        "total_critiques": 6
+      }
+    ]
+  }
+}

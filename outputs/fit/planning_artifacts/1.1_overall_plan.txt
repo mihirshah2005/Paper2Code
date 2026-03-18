@@ -1,0 +1,220 @@
+Below is a comprehensive reproduction plan that outlines every major component of the FiT paper. This plan is organized into sections covering the methodology, model implementation, training/inference pipelines, experimental setup, and evaluation. You can use this roadmap to guide the subsequent coding process.
+
+──────────────────────────────
+1. OVERVIEW & OBJECTIVES
+
+• Objective:  
+  – Reproduce FiT (Flexible Vision Transformer for Diffusion) that is capable of generating images at arbitrary resolutions and aspect ratios.  
+  – Implement a transformer-based diffusion model with a flexible training pipeline that avoids cropping/resizing low-resolution images (only high-res images are resized) and uses dynamic token packing.  
+  – Adapt the DiT baseline by integrating key changes such as 2D rotary positional embeddings (RoPE), Masked Multi-Head Self-Attention (MHSA), and replacing the MLP block with SwiGLU.
+
+• Major methodological contributions:
+  – Flexible image tokenization (by patchifying latent codes from a pretrained VAE with a fixed maximum token length Lₘₐₓ = 256).
+  – Use of a dynamic, padded token sequence where the loss is computed only on “real” (non-padding) tokens.
+  – Replacing absolute positional embeddings with 2D RoPE (or decoupled 2D RoPE), which is crucial for resolution extrapolation.
+  – Modifying attention and FFN modules with Masked MHSA and SwiGLU, respectively.
+  – Training-free resolution extrapolation techniques (VisionNTK and VisionYaRN) for handling out-of-distribution resolutions.
+
+──────────────────────────────
+2. DATA PREPARATION & PREPROCESSING
+
+• Dataset Requirements:
+  – Use ImageNet (or another high-resolution image dataset as in DiT) to replicate experiments.
+  – Note: The paper stresses diverse aspect ratios (1:1, 1:2, and 1:3), so preserve the natural aspect ratio during preprocessing.
+
+• Preprocessing Steps:
+  – For high-resolution images: Resize them so that the area (HW) does not exceed 256² while preserving aspect ratio.
+  – Avoid cropping or upscaling low-resolution images.
+  – Apply Horizontal Flip Augmentation as done in DiT.
+  – Ensure that after VAE encoding (see section below) the latent representation is “patchified” using a patch size, p = 2.
+
+──────────────────────────────
+3. MODEL COMPONENTS & ARCHITECTURE
+
+A. VAE Encoder/Decoder Module:
+  – Use the off-the-shelf pretrained VAE from Stable Diffusion (e.g., from https://huggingface.co/stabilityai/sd-vae-ft-ema).
+  – Use the VAE encoder to map images → latent codes and the VAE decoder to reconstruct generated images during inference.
+  – Ensure that the VAE encoding complies with the HW ⩽ 256² requirement.
+
+B. Latent Tokenization & Flexible Training Pipeline:
+  – Convert latent codes into token sequences ("patchify" the latent maps with patch size p = 2).  
+  – The natural token sequence length L will vary across samples; pad these sequences to a fixed maximum length Lₘₐₓ = 256.
+  – Similarly, generate/pad positional embeddings to Lₘₐₓ.
+  – Modify the loss calculation to only compute the error on denoised output tokens (ignore the contributions from padding tokens).
+
+C. Transformer Backbone – FiT Architecture:
+  • Base Architecture:
+    – Base it on DiT-B/2 or DiT-XL/2 (depending on experiment scale) keeping the same number of layers, hidden size, and attention heads.
+    – Retain the overall diffusion framework and hyperparameters as in DiT.
+
+  • Key Modifications:
+    1. 2D RoPE for Positional Embedding:
+       – Implement the 2D positional encoding by computing separate 1D RoPE for height and width coordinates (apply them independently and then concatenate).  
+       – Consider also implementing the decoupled variant (computing rotary frequencies for h and w separately) to achieve improved resolution extrapolation.
+       – Ensure the formula follows the paper formulas (using rotary base, e.g., b = 10000, and the scaling factors as defined).
+       – When the test resolution exceeds the training resolution, adjust the scale factor s = max(max(H_test, W_test) / L_train, 1.0).
+
+    2. Masked Multi-Head Self-Attention (MHSA):
+       – Replace the standard MHSA with a masked version that uses an attention mask M.
+       – Build M such that “real” (noised/active) tokens are assigned 0 and padding tokens are assigned –∞ when passed into the Softmax (to block their contribution).
+       – This will ensure the transformer only computes attention on valid tokens.
+
+    3. Feed-Forward Network (FFN) – SwiGLU:
+       – Replace the standard MLP block in the transformer’s FFN with a SwiGLU block (learned weighted gating, similar to recent LLM architectures such as LLaMA).
+       – Implement according to the formula: f(x) = (SiLU(W₁x) ⊗ W₂x) followed by a linear projection (with weight matrices defined without bias).
+      
+    4. Integration with Diffusion Process:
+       – Follow the DDPM / DDIM framework as used in DiT.
+       – Use the same noise schedules and diffusion hyperparameters as reported from DiT.
+
+D. Positional Embedding Interpolation during Inference (Resolution Extrapolation):
+  – Implement both the baseline methods (Position Interpolation [PI] and Embedding Interpolation [EI]) and the training-free methods (NTK-aware/YaRN, and their vision-specific variants: VisionNTK and VisionYaRN).
+  – For VisionNTK/VisionYaRN:
+       – Use the modified formulas (as per Definitions 3.1 and 3.2) that compute separate scale factors for height and width.
+       – For YaRN, use hyperparameters α = 1 and β = 32.
+  – These interpolations should be applied when synthesizing images at resolutions beyond training distribution.
+
+──────────────────────────────
+4. TRAINING PIPELINE
+
+A. Hyperparameters & Optimization:
+  – Learning Rate: Constant learning rate of 1×10⁻⁴.
+  – Optimizer: AdamW without weight decay.
+  – Batch Size: 256.
+  – EMA: Maintain an exponential moving average (EMA) of the model weights (decay rate 0.9999) and use the EMA model for evaluation/generation.
+  – Training Steps:
+       • For FiT-B/2 experiments, roughly 400K steps are used for ablation studies.
+       • For larger models like FiT-XL/2, train for up to 1.8M steps.
+  – Diffusion Hyperparameters: Follow DiT/Stable Diffusion’s settings (e.g., 250 DDPM sampling steps during evaluation).
+
+B. Data Loader:
+  – Implement a data loader that can handle the variable image resolutions while preserving aspect ratio.
+  – During batching, dynamically pad token sequences to Lₘₐₓ = 256.
+  – Include horizontal flip augmentation.
+
+C. Loss Function:
+  – Compute loss on the denoising output (likely mean squared error against the target noise) computed on only active tokens (use mask to ignore padded tokens).
+  
+D. Training Monitoring:
+  – Log training loss, token utilization (i.e. how many tokens are “real” vs. padding), and update EMA weights.
+  – Save checkpoints periodically for later evaluation.
+
+──────────────────────────────
+5. INFERENCE & IMAGE GENERATION
+
+A. Inference Pipeline:
+  – Define a position map covering the desired output resolution.
+  – Begin with sampling noisy tokens (sampled from a Gaussian distribution in latent space) of the appropriate number (the token count will depend on the desired resolution).
+  – Run the model for K iterations (250 denoising DDPM steps) to obtain denoised latent tokens.
+  – Reshape and “unpatchify” the latent tokens following the predefined position map.
+  – Decode using the pretrained VAE decoder to yield the final image.
+
+B. Resolution Extrapolation:
+  – For resolutions within training distribution: Use the pipeline as standard.
+  – For out-of-distribution resolutions:
+       • Apply the training-free positional embedding interpolation techniques.
+       • Experiment with PI, EI, vanilla NTK/YaRN strategies, then compare vs. VisionNTK/VisionYaRN methods.
+       • Use the scale factor adjustment based on max(H_test, W_test)/L_train.
+
+──────────────────────────────
+6. EXPERIMENTS & EVALUATION SETUP
+
+A. Resolution Settings:
+  – In-distribution resolutions:
+       • 256×256 (aspect ratio 1:1): 256 tokens.
+       • 160×320 (aspect ratio 1:2): 200 tokens.
+       • 128×384 (aspect ratio 1:3): 192 tokens.
+  – Out-of-distribution resolutions:
+       • 320×320 (1:1): ~400 latent tokens.
+       • 224×448 (1:2): ~392 tokens.
+       • 160×480 (1:3): ~300 tokens.
+
+B. Evaluation Metrics:
+  – Primary Metric: Fre’chet Inception Distance (FID-50K) computed using a TensorFlow evaluation module (ADM’s evaluation framework) with 250 DDPM steps.
+  – Additional Metrics:
+       • sFID
+       • Inception Score (IS)
+       • Improved Precision & Recall
+  – All metrics should be computed on generated samples and compared with baselines (e.g., DiT-B/2, U-ViT, etc.).
+
+C. Ablation Studies:
+  – Architecture Ablations: Compare configurations with different choices:
+       • Absolute PE vs. 2D RoPE (and decoupled 2D RoPE).
+       • Standard MLP vs. SwiGLU in FFN.
+       • Standard MHSA vs. Masked MHSA.
+  – Resolution Extrapolation Ablations:
+       • Test different positional embedding interpolation methods (PI, EI, NTK, YaRN, VisionNTK, VisionYaRN) on out-of-distribution resolutions.
+       • Report FID, sFID, IS, Precision, and Recall for each method.
+       
+D. Comparison with State-of-the-Art:
+  – When reproducing the experiments, compare the performance of the reproduced FiT model against reported numbers from state-of-the-art methods (e.g., DiT, U-ViT, ADM, LDM, MDT).
+  – For in-distribution and out-of-distribution resolutions.
+  
+E. Reporting:
+  – Organize results in tables similar to those in the paper.
+  – Visualize samples from both in-distribution and out-of-distribution resolutions.
+  – Show failure cases (if any) especially for DiT compared with FiT.
+
+──────────────────────────────
+7. IMPLEMENTATION CONSIDERATIONS & CLARIFICATIONS
+
+• Some aspects might require further clarification or assumptions:
+  – The exact details of the diffusion noise schedule and hyperparameters are referenced from DiT. It would help to closely review the DiT paper/codebase to match these parameters.
+  – The detailed mathematical formulations for the 2D RoPE and its decoupled version are given through equations in the paper. It may require careful implementation – possibly cross-check against related open-source implementations of RoPE in vision transformers.
+  – Details regarding the “patchification” of latent codes (e.g., dimensions, reshaping) should be compared with the DiT implementation.
+  – The implementation of VisionNTK/VisionYaRN interpolation may need experimental tuning based on the provided formulas.
+  – Hardware and multi-GPU training issues: Since training can be expensive (up to 1.8M steps for XL), plan for distributed training if needed.
+
+• Recommended Preparations:
+  – Look at existing open-source diffusion models (e.g., guided-diffusion, DiT implementations) for inspiration in the baseline code.
+  – Prepare logging and checkpointing infrastructure.
+  – Consider writing modular code so that each component (VAE processing, tokenization, transformer encoder block, attention module, FFN, interpolation module) can be tested independently.
+
+──────────────────────────────
+8. FINAL ROADMAP SUMMARY
+
+Step 1: Data & Preprocessing  
+ – Set up dataset loader (ImageNet) preserving aspect ratios  
+ – Resize high-res images to comply with HW ≤ 256²  
+ – Apply horizontal flip augmentation
+
+Step 2: VAE Encoding & Tokenization  
+ – Use pretrained Stable Diffusion VAE provided by Hugging Face  
+ – Patchify latent codes (p = 2) to obtain variable-length sequences and pad to Lₘₐₓ = 256
+
+Step 3: FiT Transformer Backbone  
+ – Build transformer layers following DiT specifications  
+ – Replace absolute positional embedding with 2D RoPE (and optionally decoupled version)  
+ – Replace MHSA with Masked MHSA (apply proper attention mask)  
+ – Replace MLP module with SwiGLU
+
+Step 4: Diffusion Process Integration  
+ – Integrate FiT into a diffusion model framework (using DDPM/DDIM schedule)  
+ – Use the same diffusion hyperparameters as DiT
+
+Step 5: Training Pipeline  
+ – Setup optimizer (AdamW, lr=1e-4, no weight decay), EMA (0.9999), and batch size 256  
+ – Compute loss only on real tokens (ignore padding)  
+ – Train for 400K steps (for ablations) or up to 1.8M (for XL experiments)
+
+Step 6: Inference Pipeline & Resolution Extrapolation  
+ – Implement sampling procedure (start from Gaussian noise, K = 250 denoising iterations)  
+ – Map tokens back to latent space and decode via VAE  
+ – Apply positional embedding interpolation techniques for out-of-distribution resolutions (experiment with VisionNTK/VisionYaRN)
+
+Step 7: Experimental Evaluation  
+ – Evaluate using FID, sFID, IS, Precision, and Recall  
+ – Test on both in-distribution (256×256, 160×320, 128×384) and out-of-distribution (320×320, 224×448, 160×480) resolutions  
+ – Run ablations on architecture design and extrapolation approaches  
+ – Compare results with baselines (DiT, U-ViT, ADM, etc.)
+
+Step 8: Reporting & Analysis  
+ – Generate tables and figures that replicate those in the paper  
+ – Analyze performance trends, especially in resolution extrapolation
+
+──────────────────────────────
+Closing Notes
+
+While this roadmap is detailed, certain numerical details (especially within the diffusion mechanism and token patchification) might need cross-referencing with DiT’s code or related published implementations. Keep a record of any assumptions made when details are not fully clear from the paper. Once you have the individual components tested, you can integrate and then run end-to-end training and evaluation.
+
+This plan should give you a strong foundation to implement FiT and eventually write clean, modular Python code for reproducing the experiments.

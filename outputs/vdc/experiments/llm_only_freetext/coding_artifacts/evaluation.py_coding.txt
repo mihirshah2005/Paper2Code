@@ -1,0 +1,373 @@
+## Code: evaluation.py
+```python
+"""
+evaluation.py
+
+This module implements the Evaluation class which assesses the performance of the final
+purified classifier (ResNet-18) on the test set by computing several key metrics:
+    - Classification Accuracy (ACC)
+    - Attack Success Rate (ASR)
+    - (Optionally) Detection metrics (TPR and FPR) if a detector is provided and
+      ground-truth dirty flags are available.
+      
+The Evaluation class takes as input the trained classifier model, the test dataset,
+an optional detector object, and the experimental configuration (loaded from config.yaml).
+It then computes the metrics by:
+    1. Running classification on clean test images.
+    2. Running classification on triggered images (using a backdoor trigger applied via a utility routine)
+       and comparing predictions with the target label (assumed to be 0).
+    3. Optionally, if the test set contains dirty flags, running the detector on each sample to compute
+       detection metrics (TPR and FPR).
+
+All configuration values (e.g., batch sizes, dataset name, threshold) are read from the configuration.
+Strong type annotations and default values are used throughout.
+"""
+
+import os
+import logging
+import time
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, Subset
+from PIL import Image
+import torchvision.transforms as transforms
+from torchvision.transforms import ToPILImage
+
+# Import utility functions from utils.py
+from utils import (
+    preprocess_image,
+    overlay_badnets_trigger,
+    load_config,
+    init_logger,
+)
+
+# Set up module-level logger.
+logger = init_logger()
+
+
+class Evaluation:
+    """
+    Evaluation class for assessing classifier performance.
+    
+    Attributes:
+        model (torch.nn.Module): The trained classifier model (e.g., ResNet-18).
+        test_data (Dataset): The test dataset containing samples (image, label) or (image, label, dirty_flag).
+        config (Dict[str, Any]): Configuration dictionary loaded from config.yaml.
+        detector (Optional[Any]): Optional detector instance (e.g., VDCDetector) for evaluating detection performance.
+        device (torch.device): Computation device.
+        dataset_name (str): Name of the dataset ("CIFAR-10", "ImageNet-100", or "ImageNet-Dog").
+        test_batch_size (int): Batch size to use for evaluation.
+    """
+    
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        test_data: Dataset,
+        config: Dict[str, Any],
+        detector: Optional[Any] = None
+    ) -> None:
+        """
+        Initialize Evaluation instance.
+        
+        Args:
+            model (torch.nn.Module): The trained classifier model.
+            test_data (Dataset): The test dataset.
+            config (Dict[str, Any]): Configuration dictionary (from config.yaml).
+            detector (Optional[Any]): Optional detector instance for detection metric evaluation.
+        """
+        self.model: torch.nn.Module = model
+        self.test_data: Dataset = test_data
+        self.config: Dict[str, Any] = config
+        self.detector: Optional[Any] = detector
+        
+        # Determine device.
+        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        
+        # Determine dataset name; default to "CIFAR-10" if not provided.
+        self.dataset_name: str = config.get("dataset_name", "CIFAR-10")
+        # Get evaluation batch size from training config if available, else set default.
+        training_config: Dict[str, Any] = config.get("training", {})
+        batch_size_dict: Dict[str, Any] = training_config.get("batch_size", {"CIFAR-10": 128, "ImageNet-100": 64, "ImageNet-Dog": 64})
+        self.test_batch_size: int = int(batch_size_dict.get(self.dataset_name, 128))
+        
+        logger.info("Evaluation initialized on dataset '%s' with test batch size %d.", self.dataset_name, self.test_batch_size)
+
+    def evaluate_classifier(self) -> float:
+        """
+        Evaluate the classifier's clean classification accuracy (ACC) on the test set.
+        
+        Returns:
+            float: The classification accuracy (ACC) as a fraction.
+        """
+        self.model.eval()
+        test_loader: DataLoader = DataLoader(
+            self.test_data,
+            batch_size=self.test_batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+        total_samples: int = 0
+        correct_predictions: int = 0
+        
+        with torch.no_grad():
+            for batch_idx, (images, labels, *rest) in enumerate(test_loader):
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                outputs = self.model(images)
+                _, predicted = torch.max(outputs, 1)
+                total_samples += labels.size(0)
+                correct_predictions += (predicted == labels).sum().item()
+        
+        acc: float = correct_predictions / total_samples if total_samples > 0 else 0.0
+        logger.info("Classifier Evaluation - Total Samples: %d, Correct Predictions: %d, ACC: %.4f", 
+                    total_samples, correct_predictions, acc)
+        return acc
+
+    def _tensor_to_pil(self, tensor_image: torch.Tensor) -> Image.Image:
+        """
+        Convert a torch.Tensor image (possibly normalized) to a PIL Image.
+        Applies un-normalization based on the dataset.
+        
+        Args:
+            tensor_image (torch.Tensor): Image tensor of shape (C, H, W).
+            
+        Returns:
+            Image.Image: The un-normalized PIL image.
+        """
+        # Define normalization parameters based on dataset
+        if self.dataset_name == "CIFAR-10":
+            mean = [0.4914, 0.4822, 0.4465]
+            std  = [0.2470, 0.2435, 0.2616]
+        elif self.dataset_name in ["ImageNet-100", "ImageNet-Dog"]:
+            mean = [0.485, 0.456, 0.406]
+            std  = [0.229, 0.224, 0.225]
+        else:
+            mean = [0.5, 0.5, 0.5]
+            std  = [0.5, 0.5, 0.5]
+        
+        # Clone tensor to avoid modifying original, and unnormalize
+        unnorm_tensor = tensor_image.clone().cpu()
+        for t, m, s in zip(unnorm_tensor, mean, std):
+            t.mul_(s).add_(m)
+        # Clip to [0,1]
+        unnorm_tensor = torch.clamp(unnorm_tensor, 0, 1)
+        pil_image: Image.Image = ToPILImage()(unnorm_tensor)
+        return pil_image
+
+    def _get_raw_image(self, index: int) -> Image.Image:
+        """
+        Retrieve the raw (untransformed) image for a given index from the test dataset.
+        
+        If the underlying dataset has an attribute "data" (e.g., CIFAR-10), use it.
+        Otherwise, fall back to converting the transformed tensor to PIL using un-normalization.
+        
+        Args:
+            index (int): The index of the sample in the test set.
+            
+        Returns:
+            Image.Image: The raw PIL image.
+        """
+        try:
+            # If test_data is a Subset and its underlying dataset has "data"
+            if isinstance(self.test_data, Subset) and hasattr(self.test_data.dataset, "data"):
+                raw_data = self.test_data.dataset.data
+                subset_indices = self.test_data.indices  # type: ignore
+                raw_np = raw_data[subset_indices[index]]
+                return Image.fromarray(raw_np)
+            elif hasattr(self.test_data, "data"):
+                raw_np = self.test_data.data[index]
+                return Image.fromarray(raw_np)
+            else:
+                # Fall back: get the transformed tensor and convert back to PIL
+                sample = self.test_data[index]
+                image_tensor = sample[0]
+                return self._tensor_to_pil(image_tensor)
+        except Exception as e:
+            logger.error("Error retrieving raw image at index %d: %s", index, str(e))
+            raise e
+
+    def evaluate_asr(self, target_label: int = 0) -> float:
+        """
+        Evaluate the Attack Success Rate (ASR) on the test set.
+        
+        The ASR is computed by applying a backdoor trigger (using the BadNets trigger)
+        to each test image and checking if the classifier predicts the target label (default 0).
+        
+        Returns:
+            float: The ASR as a fraction.
+        """
+        self.model.eval()
+        # Create a simple DataLoader with batch size 1 to iterate over test samples individually.
+        test_loader: DataLoader = DataLoader(
+            self.test_data,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+        total_samples: int = 0
+        target_count: int = 0
+
+        # For each test image, retrieve raw image (PIL), apply trigger, preprocess, and predict.
+        for idx, sample in enumerate(test_loader):
+            # sample is a tuple: (transformed_image, label, *optional)
+            # Get raw image using _get_raw_image for consistency.
+            try:
+                raw_image: Image.Image = self._get_raw_image(idx)
+            except Exception:
+                continue
+
+            # Convert raw_image to numpy array.
+            raw_np = np.array(raw_image)
+            # Apply backdoor trigger using overlay_badnets_trigger from utils.
+            triggered_np = overlay_badnets_trigger(raw_np, self.dataset_name)
+            # Preprocess the triggered image using the same preprocessing as during evaluation.
+            triggered_tensor = preprocess_image(triggered_np, self.dataset_name)
+            triggered_tensor = triggered_tensor.unsqueeze(0).to(self.device)  # add batch dimension
+            with torch.no_grad():
+                outputs = self.model(triggered_tensor)
+                _, predicted = torch.max(outputs, 1)
+            total_samples += 1
+            if predicted.item() == target_label:
+                target_count += 1
+
+        asr: float = target_count / total_samples if total_samples > 0 else 0.0
+        logger.info("ASR Evaluation - Total Samples: %d, Triggered Samples Predicted as Target (%d): %d, ASR: %.4f", 
+                    total_samples, target_label, target_count, asr)
+        return asr
+
+    def evaluate_detector_metrics(self) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Evaluate detection metrics (TPR and FPR) if ground-truth dirty flags are available and
+        a detector is provided.
+        
+        Assumes that each test sample is a tuple of (image, label, dirty_flag),
+        where dirty_flag is True for dirty samples and False for clean samples.
+        
+        Returns:
+            Tuple[Optional[float], Optional[float]]:
+                - TPR: True Positive Rate (fraction of dirty samples correctly detected)
+                - FPR: False Positive Rate (fraction of clean samples wrongly flagged as dirty)
+                
+            If no dirty_flag is provided or detector is None, returns (None, None).
+        """
+        if self.detector is None:
+            logger.info("No detector provided; skipping detection metric evaluation.")
+            return None, None
+        
+        # Check if test_data samples have a dirty flag.
+        sample = self.test_data[0]
+        if len(sample) < 3:
+            logger.info("Test samples do not contain dirty flag information; skipping detection metrics.")
+            return None, None
+        
+        test_loader: DataLoader = DataLoader(
+            self.test_data,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+        
+        true_positive_count: int = 0
+        false_positive_count: int = 0
+        total_dirty: int = 0
+        total_clean: int = 0
+        
+        for idx, (image, label, dirty_flag) in enumerate(test_loader):
+            # Run detector on the image.
+            # Note: Detector expects (image, label) where image can be a PIL image or numpy array.
+            # Use the provided image directly (assume it's already transformed appropriately)
+            is_dirty, _ = self.detector.detect_sample(image, str(label.item()))
+            
+            if dirty_flag:
+                total_dirty += 1
+                if is_dirty:
+                    true_positive_count += 1
+            else:
+                total_clean += 1
+                if is_dirty:
+                    false_positive_count += 1
+        
+        tpr: Optional[float] = true_positive_count / total_dirty if total_dirty > 0 else None
+        fpr: Optional[float] = false_positive_count / total_clean if total_clean > 0 else None
+        
+        logger.info("Detection Metrics - Total Dirty: %d, True Positives: %d, Total Clean: %d, False Positives: %d, TPR: %s, FPR: %s", 
+                    total_dirty, true_positive_count, total_clean, false_positive_count, 
+                    f"{tpr:.4f}" if tpr is not None else "N/A", f"{fpr:.4f}" if fpr is not None else "N/A")
+        return tpr, fpr
+
+    def evaluate(self) -> Dict[str, Any]:
+        """
+        Perform the full evaluation: compute ACC, ASR, and optionally detection metrics (TPR, FPR).
+        
+        Returns:
+            Dict[str, Any]: A dictionary containing:
+                "ACC": classification accuracy,
+                "ASR": attack success rate,
+                "TPR": true positive rate (if computed, else None),
+                "FPR": false positive rate (if computed, else None)
+        """
+        logger.info("Starting full evaluation of the classifier ...")
+        acc: float = self.evaluate_classifier()
+        asr: float = self.evaluate_asr(target_label=0)  # Target label is assumed to be 0.
+        
+        tpr: Optional[float]
+        fpr: Optional[float]
+        if self.detector is not None:
+            tpr, fpr = self.evaluate_detector_metrics()
+        else:
+            tpr, fpr = None, None
+        
+        results: Dict[str, Any] = {
+            "ACC": acc,
+            "ASR": asr,
+            "TPR": tpr,
+            "FPR": fpr
+        }
+        logger.info("Evaluation results: %s", results)
+        return results
+
+
+# For standalone testing of the evaluation module (example usage)
+if __name__ == "__main__":
+    import sys
+    import torch.nn as nn
+    from torchvision import models
+    from dataset_loader import DatasetLoader
+
+    # Load configuration.
+    config_path: str = "config.yaml"
+    config_dict: Dict[str, Any] = load_config(config_path)
+    
+    # Initialize DatasetLoader and load test data.
+    dataset_loader = DatasetLoader(config_dict)
+    data_dict = dataset_loader.load_data()
+    # For demonstration, evaluate on CIFAR-10 test set.
+    cifar10_test = data_dict.get("CIFAR-10", {}).get("test", None)
+    if cifar10_test is None:
+        logger.error("CIFAR-10 test data not found.")
+        sys.exit(1)
+    
+    # Build a dummy ResNet-18 classifier.
+    model = models.resnet18(pretrained=False)
+    num_features = model.fc.in_features
+    model.fc = nn.Linear(num_features, 10)  # Assuming CIFAR-10 (10 classes)
+    
+    # Load classifier weights if available (for demonstration, we use an untrained model).
+    # model.load_state_dict(torch.load("trained_classifier.pth", map_location="cpu"))
+
+    # Optionally, if a detector is available, set detector to None or a dummy.
+    detector = None
+
+    # Instantiate Evaluation.
+    evaluator = Evaluation(model=model, test_data=cifar10_test, config=config_dict, detector=detector)
+    
+    # Run evaluation.
+    results = evaluator.evaluate()
+    logger.info("Final Evaluation Metrics: %s", results)
+```

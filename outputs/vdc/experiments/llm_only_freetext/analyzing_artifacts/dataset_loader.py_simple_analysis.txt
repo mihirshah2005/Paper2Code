@@ -1,0 +1,94 @@
+Below is the updated logic analysis for dataset_loader.py, which now further clarifies the injection order and the handling of potential overlap between the noisy label injection and the backdoor (poisoned) injection schemes.
+
+──────────────────────────────
+1. Overall Structure and Initialization
+
+• The DatasetLoader class is initialized with a configuration dictionary (parsed from config.yaml). In the __init__ method:
+ – The configuration parameters (including paths, batch sizes, transformation settings, and dirty sample generation parameters) are stored for later use.
+ – Dataset-specific image preprocessing transforms are set up using torchvision.transforms. For example, CIFAR-10 will have random cropping, horizontal flipping, and normalization (using CIFAR-specific means and standard deviations), while ImageNet-based datasets will use resizing, center-cropping, and normalization (with ImageNet statistics).
+ – A fixed random seed is established (typically by invoking a helper function in utils) to ensure that all random choices—especially during dirty sample injection—are reproducible.
+
+──────────────────────────────
+2. Loading Datasets (load_data Method)
+
+The load_data() method handles loading the three target datasets:
+ – For CIFAR-10:
+  • Loaded using torchvision.datasets.CIFAR10, with separate instances for training and testing.
+  • The appropriate transforms are applied as part of the dataset initialization.
+ – For ImageNet-100:
+  • An ImageFolder-based loader is used in order to select exactly 100 classes.
+  • A filtering step ensures that only 500 training images per class and 100 testing images per class are retained.
+ – For ImageNet-Dog:
+  • Again using an ImageFolder-based loader, the dataset is filtered to include only the desired dog classes.
+  • The split ensures 800 training images and 200 testing images per class.
+ – The method returns a structured object (e.g., a dictionary) that contains both training and testing datasets.
+
+──────────────────────────────
+3. Image Preprocessing
+
+• Dedicated transformation pipelines (via torchvision.transforms.Compose) are configured for each dataset:
+ – CIFAR-10: Apply random crop, horizontal flip, conversion to tensor, and normalization.
+ – ImageNet-100 and ImageNet-Dog: Apply resizing (to the input dimensions required by downstream components such as Instruct-BLIP or ResNet-18), center cropping, tensor conversion, and normalization.
+• These transforms ensure consistency with the expected input format for both detection (VDCDetector) and classification (ResNet-18) stages.
+
+──────────────────────────────
+4. Dirty Sample Injection (inject_dirty_samples Method)
+
+This method is central to simulating the experimental conditions and involves two independent injections:
+ A. Noisy Label Injection  
+ B. Backdoor (Poisoned) Sample Injection
+
+A. Noisy Label Injection:
+ – Using the noisy ratio provided (η = 0.4 in the configuration), iterate over each sample in the training set.
+ – For each sample, with probability η, modify the sample’s label.  
+  • For symmetric noise, the original label is replaced by randomly selecting one of the remaining (K – 1) labels.
+  • For asymmetric noise, the label is modified by following a predetermined rule such as replacing it with the “next” label; mathematically, (i mod K) + 1.
+ – This process simulates annotation errors and is applied to the dataset as a whole.
+
+B. Backdoor (Poisoned) Sample Injection:
+ – Based on the poisoning configuration for the given dataset, randomly select a specified number of samples per class (e.g., 50 or 500 for CIFAR-10, 5 or 50 for ImageNet-100, 80 for ImageNet-Dog).
+ – For each selected sample (typically taken from non-target classes), a backdoor trigger is injected by overlaying a predefined pattern.  
+  • Examples:  
+   – For BadNets, a 3×3 white square is inserted in the lower-right corner (CIFAR-10), scaled appropriately for ImageNet images.  
+   – For Blended attacks, a “Hello Kitty” image is blended with the original image with a ratio of 0.1.  
+   – For SIG and other attacks (TrojanNN, SSBA, WaNet), follow the specific parameters provided, with the overlay details delegated to utility functions.
+ – After the visual trigger is applied, the sample’s label is changed to the designated target label (commonly fixed as class 0).
+
+C. Injection Order and Overlap Clarification:
+ – The default design applies the two injection schemes sequentially on the same training dataset:
+  1. First, the noisy label injection is applied to all samples based on the noisy ratio.
+  2. Then, the backdoor injection is performed by selecting samples from the (already modified) dataset.
+ – With this sequential order, overlap is permitted; that is, a sample that has already received a noisy label may also be chosen for backdoor injection. This results in hybrid dirty samples—an experimental setup that reflects scenarios where datasets contain both types of errors.
+ – Alternatively, an optional configuration flag may be introduced in the future to enforce mutual exclusivity (i.e., to prevent overlapping modifications). By default, however, the design follows the sequential approach, allowing both injections to occur on the same sample.
+ – This detailed order is documented in the code comments to avoid any ambiguity for future maintainers and ensure that the injection process is fully reproducible.
+
+After processing through both steps, the modified training dataset (which now may contain clean, noisy, poisoned, and hybrid dirty samples) is returned. Detailed logging (using helper functions from utils) is performed to record the number of samples modified by each injection, which later assists in computing metrics such as TPR and FPR.
+
+──────────────────────────────
+5. Integration and Reproducibility
+
+• The DatasetLoader class interfaces with other modules (such as VDCDetector, Trainer, and Evaluation) by supplying a preprocessed and injected dataset.
+• Utility functions from utils.py are used for:
+ – Overlaying trigger patterns.
+ – Data augmentation.
+ – Setting random seeds for consistent sample selection.
+ – Logging and caching where needed.
+• The sequential injection process (first noisy labels, then backdoor injection) is clearly documented and applied consistently, ensuring students and developers understand the potential for overlap and the rationale behind it.
+
+──────────────────────────────
+6. Expected API and Flow Summary
+
+– __init__(config: dict):  
+ • Reads configuration parameters and sets up dataset-specific transforms.
+– load_data() -> dict:  
+ • Loads raw datasets (CIFAR-10 via torchvision.datasets; ImageNet-based datasets using ImageFolder) and applies the appropriate transforms.
+– inject_dirty_samples(data: dict) -> dict:  
+ • Applies noisy label injection based on the defined ratio and noise strategy.
+ • Follows by applying backdoor injection using the configured poisoning parameters.
+ • By default, the process allows samples to receive both modifications, forming hybrid dirty samples. This behavior is clearly documented and logged.
+– Returns the modified training dataset and the unmodified test dataset for downstream processing.
+
+──────────────────────────────
+Conclusion
+
+This revised logic analysis for dataset_loader.py provides additional clarifications regarding the injection order and potential overlap between the two dirty sample injection methods. By explicitly stating that the default approach is to first modify labels for noise and then overlay backdoor triggers (allowing hybrid modifications), the analysis addresses concerns about ambiguity in the injection process. Detailed documentation, configurable behavior, and comprehensive logging ensure that the process is reproducible and aligns with the experimental setup described in the paper.

@@ -1,0 +1,54 @@
+{
+  "all": [
+    {
+      "target_func_name": "load_data",
+      "severity_level": "medium",
+      "critique": "The analysis does not specify the ordering of operations when both 'noise' and 'imbalance' modifiers are present for CV datasets. Applying label noise before versus after creating an imbalanced split could yield different experimental outcomes and should be clearly defined.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "load_data",
+      "severity_level": "low",
+      "critique": "The random splitting for CV (9:1) and for non-standard graph datasets (8:1:1) does not mention the use of stratified sampling. Without stratification, even originally balanced datasets might lead to splits that do not preserve the class distribution exactly, which can affect reproducibility and downstream performance evaluations.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_noise",
+      "severity_level": "low",
+      "critique": "The noise injection method assumes that labels are integer-encoded for classification tasks. Although this fits most CV tasks and some NLP tasks, the logic does not account for cases where labels might be non-integer (or for regression tasks), which should be noted even if out of scope.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_imbalance",
+      "severity_level": "medium",
+      "critique": "The imbalance logic assumes the dataset is perfectly balanced before applying the long-tailed transformation (e.g., for CIFAR). If applied to a dataset that isn’t originally balanced, the decay factor (and resulting sample counts) may not meet the intended imbalance ratio as described in the paper, potentially deviating from the experimental design.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "reproducibility (across methods)",
+      "severity_level": "low",
+      "critique": "While the analysis stresses using a fixed random seed from the configuration, it does not specify how seeds are set uniformly across all involved libraries (e.g., torch, numpy, and Python's random module), which is key to ensuring complete reproducibility.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "load_data (NLP branch)",
+      "severity_level": "low",
+      "critique": "The approach for NLP datasets assumes that the official 'train' split is used and that the 'validation' split can serve as the test set, which generally fits GLUE tasks but may not be ideal for all tasks (e.g., tasks with very small validation sets or additional development splits).",
+      "source": "llm-judge"
+    }
+  ],
+  "high_medium": [
+    {
+      "target_func_name": "load_data",
+      "severity_level": "medium",
+      "critique": "The analysis does not specify the ordering of operations when both 'noise' and 'imbalance' modifiers are present for CV datasets. Applying label noise before versus after creating an imbalanced split could yield different experimental outcomes and should be clearly defined.",
+      "source": "llm-judge"
+    },
+    {
+      "target_func_name": "apply_imbalance",
+      "severity_level": "medium",
+      "critique": "The imbalance logic assumes the dataset is perfectly balanced before applying the long-tailed transformation (e.g., for CIFAR). If applied to a dataset that isn’t originally balanced, the decay factor (and resulting sample counts) may not meet the intended imbalance ratio as described in the paper, potentially deviating from the experimental design.",
+      "source": "llm-judge"
+    }
+  ]
+}

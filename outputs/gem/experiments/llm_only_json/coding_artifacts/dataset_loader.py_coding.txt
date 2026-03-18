@@ -1,0 +1,360 @@
+```python
+"""
+dataset_loader.py
+
+This module implements the DatasetLoader class and associated data structures
+for loading graph datasets, computing the normalized Laplacian, truncated
+eigen-decomposition, and generating split indices. The loaded data is packaged
+into a GraphData object which is then passed to downstream modules.
+
+The DatasetLoader supports configurable parameters via a configuration dictionary,
+including:
+    - dataset.name (e.g., "Pubmed")
+    - dataset.split_method (e.g., "public")
+    - synth_graph.compression_ratio (if <= 1 then treated as fraction, if > 1 then as percentage)
+    - synth_graph.r_k, which specifies the fraction of eigenpairs for the lower frequency (K1)
+      with the remainder taken as higher frequency (K2).
+
+Dependencies:
+    numpy, scipy, networkx, logging, os, dataclasses
+"""
+
+import os
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Tuple
+
+import numpy as np
+import networkx as nx
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.hasHandlers():
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+
+@dataclass
+class GraphData:
+    """
+    Data structure to store graph information.
+    Attributes:
+        adjacency (np.ndarray): Adjacency matrix of the graph.
+        node_features (np.ndarray): Matrix of node features (X).
+        labels (np.ndarray): Array of node labels (Y).
+        laplacian (np.ndarray): Normalized Laplacian matrix of the graph.
+        eigenvalues (np.ndarray): Array of selected eigenvalues (ordered as required).
+        eigenvectors (np.ndarray): Matrix whose columns are the selected eigenvectors.
+        split_indices (dict): Dictionary containing split indices with keys such as "train", 
+                              "validation", and "test".
+    """
+    adjacency: np.ndarray
+    node_features: np.ndarray
+    labels: np.ndarray
+    laplacian: np.ndarray
+    eigenvalues: np.ndarray
+    eigenvectors: np.ndarray
+    split_indices: Dict[str, np.ndarray] = field(default_factory=dict)
+
+
+class DatasetLoader:
+    """
+    DatasetLoader loads a graph dataset, computes the normalized Laplacian,
+    performs a truncated eigen-decomposition and generates training/validation/test splits.
+    """
+
+    def __init__(self, config: dict) -> None:
+        """
+        Initialize DatasetLoader with the provided configuration.
+
+        Args:
+            config (dict): Configuration dictionary read from config.yaml.
+        """
+        dataset_config = config.get("dataset", {})
+        synth_config = config.get("synth_graph", {})
+
+        self.dataset_name: str = dataset_config.get("name", "Pubmed")
+        self.split_method: str = dataset_config.get("split_method", "public")
+        raw_compression_ratio: float = synth_config.get("compression_ratio", 0.15)
+        self.r_k: float = synth_config.get("r_k", 0.9)
+
+        # Validate and normalize the compression ratio.
+        # If the value is greater than 1, treat it as a percentage.
+        if raw_compression_ratio <= 0:
+            raise ValueError("Compression ratio must be a positive value.")
+        if raw_compression_ratio > 1:
+            # e.g., 15 means 15%
+            self.compression_ratio = raw_compression_ratio / 100.0
+            logger.info(
+                f"Compression ratio provided as percentage. Converted {raw_compression_ratio} to fraction {self.compression_ratio:.4f}."
+            )
+        else:
+            # Assume value is already a fraction.
+            self.compression_ratio = raw_compression_ratio
+            logger.info(
+                f"Compression ratio set as fraction: {self.compression_ratio:.4f}."
+            )
+
+        logger.info(
+            f"DatasetLoader initialized with dataset '{self.dataset_name}', split method '{self.split_method}', "
+            f"compression_ratio {self.compression_ratio} and r_k {self.r_k}."
+        )
+
+    def load_data(self) -> GraphData:
+        """
+        Load the graph data, compute the normalized Laplacian, perform truncated eigen-decomposition,
+        and generate train/validation/test splits.
+
+        Returns:
+            GraphData: An object containing all required datasets and computed matrices.
+        """
+        # Load dataset based on dataset name.
+        if self.dataset_name.lower() == "pubmed":
+            graph_data: GraphData = self._load_pubmed_data()
+        else:
+            # If dataset not recognized, generate synthetic data.
+            logger.warning(
+                f"Dataset '{self.dataset_name}' not recognized. Falling back to synthetic data."
+            )
+            graph_data = self._generate_synthetic_data()
+
+        # Compute normalized Laplacian matrix.
+        graph_data.laplacian = self._compute_normalized_laplacian(graph_data.adjacency)
+        logger.info("Computed normalized Laplacian matrix.")
+
+        # Perform truncated eigen-decomposition on the Laplacian.
+        eigenvalues, eigenvectors = self.truncated_eigen_decomposition(
+            graph_data.laplacian, num_nodes=graph_data.adjacency.shape[0]
+        )
+        graph_data.eigenvalues = eigenvalues
+        graph_data.eigenvectors = eigenvectors
+        logger.info("Truncated eigen-decomposition completed.")
+
+        # Generate or load split indices for the dataset.
+        graph_data.split_indices = self._generate_or_load_splits(graph_data.labels)
+        logger.info("Dataset split indices generated.")
+        return graph_data
+
+    def _compute_normalized_laplacian(self, adjacency: np.ndarray) -> np.ndarray:
+        """
+        Compute the normalized graph Laplacian: L = I - D^(-1/2) * A * D^(-1/2).
+
+        Args:
+            adjacency (np.ndarray): Adjacency matrix of the graph.
+
+        Returns:
+            np.ndarray: Normalized Laplacian matrix.
+        """
+        # Compute degree of each node.
+        degree: np.ndarray = np.sum(adjacency, axis=1)
+        # Avoid division by zero.
+        degree[degree == 0] = 1.0
+        d_inv_sqrt: np.ndarray = np.power(degree, -0.5)
+        D_inv_sqrt: np.ndarray = np.diag(d_inv_sqrt)
+        identity: np.ndarray = np.eye(adjacency.shape[0])
+        # Normalized Laplacian.
+        L: np.ndarray = identity - D_inv_sqrt @ adjacency @ D_inv_sqrt
+        return L
+
+    def truncated_eigen_decomposition(
+        self, laplacian: np.ndarray, num_nodes: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute a truncated eigen-decomposition of the Laplacian to extract two groups of eigenpairs:
+        the K1 smallest and K2 largest eigenpairs, where K1 + K2 = total_k,
+        with total_k computed from the synthetic node count.
+
+        Args:
+            laplacian (np.ndarray): Normalized Laplacian matrix.
+            num_nodes (int): Total number of nodes in the real graph.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: A tuple (eigenvalues, eigenvectors) where:
+                - eigenvalues is an array of shape (K,) containing ordered eigenvalues.
+                - eigenvectors is a matrix of shape (num_nodes, K) with corresponding eigenvectors.
+        """
+        # Determine the number of synthetic nodes based on the compression ratio.
+        synthetic_node_count: int = max(1, int(round(self.compression_ratio * num_nodes)))
+        total_k: int = synthetic_node_count
+        # Partition total_k into K1 (smallest eigenpairs) and K2 (largest eigenpairs) based on r_k.
+        K1: int = int(round(self.r_k * total_k))
+        K2: int = total_k - K1
+
+        logger.info(
+            f"Performing eigen-decomposition: total eigenpairs = {total_k} (K1 = {K1} smallest, K2 = {K2} largest)."
+        )
+
+        # Convert the Laplacian to a sparse format.
+        L_sparse = csr_matrix(laplacian)
+
+        eigenvalues_list = []
+        eigenvectors_list = []
+
+        # Compute K1 smallest eigenpairs (low-frequency components).
+        if K1 > 0:
+            try:
+                eigen_small_vals, eigen_small_vecs = eigsh(L_sparse, k=K1, which='SM')
+            except Exception as e:
+                logger.warning(
+                    f"Error computing smallest eigenpairs: {e}. Retrying with adjusted parameters."
+                )
+                eigen_small_vals, eigen_small_vecs = eigsh(
+                    L_sparse, k=K1, which='SM', tol=1e-3, maxiter=5000
+                )
+            # Sort the eigenpairs in ascending order.
+            sort_idx_small = np.argsort(eigen_small_vals)
+            eigen_small_vals = eigen_small_vals[sort_idx_small]
+            eigen_small_vecs = eigen_small_vecs[:, sort_idx_small]
+            eigenvalues_list.append(eigen_small_vals)
+            eigenvectors_list.append(eigen_small_vecs)
+            logger.info("K1 smallest eigenpairs computed and sorted.")
+
+        # Compute K2 largest eigenpairs (high-frequency components).
+        if K2 > 0:
+            try:
+                eigen_large_vals, eigen_large_vecs = eigsh(L_sparse, k=K2, which='LA')
+            except Exception as e:
+                logger.warning(
+                    f"Error computing largest eigenpairs: {e}. Retrying with adjusted parameters."
+                )
+                eigen_large_vals, eigen_large_vecs = eigsh(
+                    L_sparse, k=K2, which='LA', tol=1e-3, maxiter=5000
+                )
+            # Sort these eigenpairs in ascending order for consistency.
+            sort_idx_large = np.argsort(eigen_large_vals)
+            eigen_large_vals = eigen_large_vals[sort_idx_large]
+            eigen_large_vecs = eigen_large_vecs[:, sort_idx_large]
+            eigenvalues_list.append(eigen_large_vals)
+            eigenvectors_list.append(eigen_large_vecs)
+            logger.info("K2 largest eigenpairs computed and sorted.")
+
+        if not eigenvalues_list:
+            raise ValueError("No eigenpairs were computed for the given Laplacian.")
+
+        # Concatenate the eigenvalues and eigenvectors from both groups.
+        final_eigenvalues: np.ndarray = np.concatenate(eigenvalues_list)
+        final_eigenvectors: np.ndarray = np.hstack(eigenvectors_list)
+
+        # The final ordering is [smallest group, largest group] (each group sorted in ascending order).
+        return final_eigenvalues, final_eigenvectors
+
+    def _generate_or_load_splits(self, labels: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Load predefined split indices if available (for 'public' split method), or generate
+        fallback random splits. For Pubmed, the fallback splits are set to:
+            train: 60 nodes, validation: 500 nodes, test: 1000 nodes.
+        For other datasets, fallback uses a 60/20/20 partitioning.
+
+        Args:
+            labels (np.ndarray): Array of node labels used to determine the number of nodes.
+
+        Returns:
+            Dict[str, np.ndarray]: Dictionary with keys "train", "validation", "test" and corresponding indices.
+        """
+        split_file: str = f"splits_{self.dataset_name.lower()}.npz"
+        if os.path.exists(split_file):
+            try:
+                with np.load(split_file) as data:
+                    splits = {key: data[key] for key in data.files}
+                logger.info(f"Loaded predefined split indices from '{split_file}'.")
+                return splits
+            except Exception as e:
+                logger.warning(f"Error loading split file '{split_file}': {e}. Using fallback splits.")
+
+        num_nodes: int = labels.shape[0]
+        if self.dataset_name.lower() == "pubmed":
+            # As per paper's settings for Pubmed.
+            train_count, valid_count, test_count = 60, 500, 1000
+        else:
+            # Default fallback: 60% train, 20% validation, 20% test.
+            train_count = int(0.6 * num_nodes)
+            valid_count = int(0.2 * num_nodes)
+            test_count = num_nodes - train_count - valid_count
+
+        # Ensure indices do not exceed the number of nodes.
+        indices = np.random.permutation(num_nodes)
+        train_idx = indices[:train_count]
+        valid_idx = indices[train_count:train_count + valid_count]
+        test_idx = indices[train_count + valid_count:train_count + valid_count + test_count]
+
+        splits = {"train": train_idx, "validation": valid_idx, "test": test_idx}
+        logger.info("Generated fallback random split indices for the dataset.")
+        return splits
+
+    def _load_pubmed_data(self) -> GraphData:
+        """
+        Load the Pubmed dataset. In a production environment, this method would load the
+        dataset from disk or an online repository. For demonstration purposes, if the dataset
+        is not available, this function simulates the Pubmed dataset by generating a random graph
+        with similar characteristics.
+
+        Returns:
+            GraphData: A GraphData object populated with simulated Pubmed data.
+        """
+        np.random.seed(42)  # Ensure reproducibility.
+        # Typical Pubmed dataset statistics: 19,717 nodes, ~500 feature dimensions, 3 classes.
+        num_nodes: int = 19717
+        num_features: int = 500
+        num_classes: int = 3
+
+        # Generate simulated node features.
+        node_features: np.ndarray = np.random.randn(num_nodes, num_features).astype(np.float32)
+        # Generate random labels in the range [0, num_classes-1].
+        labels: np.ndarray = np.random.randint(0, num_classes, size=(num_nodes,))
+        # Generate a random Erdos-Renyi graph approximating Pubmed's connectivity.
+        probability: float = 8.0 / (num_nodes - 1)
+        G = nx.erdos_renyi_graph(n=num_nodes, p=probability, seed=42)
+        adjacency: np.ndarray = nx.to_numpy_array(G)
+        # Ensure the adjacency matrix is binary with zero diagonal.
+        np.fill_diagonal(adjacency, 0)
+        adjacency = np.where(adjacency > 0, 1, 0).astype(np.float32)
+
+        logger.info("Simulated Pubmed dataset loaded.")
+        return GraphData(
+            adjacency=adjacency,
+            node_features=node_features,
+            labels=labels,
+            laplacian=None,
+            eigenvalues=None,
+            eigenvectors=None,
+            split_indices={}
+        )
+
+    def _generate_synthetic_data(self) -> GraphData:
+        """
+        Generate a synthetic graph dataset for unrecognized dataset names.
+        This function creates a small random graph with arbitrary node features and labels.
+
+        Returns:
+            GraphData: A GraphData object with synthetic data.
+        """
+        np.random.seed(42)
+        num_nodes: int = 100
+        num_features: int = 50
+        num_classes: int = 2
+
+        node_features: np.ndarray = np.random.randn(num_nodes, num_features).astype(np.float32)
+        labels: np.ndarray = np.random.randint(0, num_classes, size=(num_nodes,))
+        probability: float = 0.1  # Sparse connectivity.
+        G = nx.erdos_renyi_graph(n=num_nodes, p=probability, seed=42)
+        adjacency: np.ndarray = nx.to_numpy_array(G)
+        np.fill_diagonal(adjacency, 0)
+        adjacency = np.where(adjacency > 0, 1, 0).astype(np.float32)
+
+        logger.info("Synthetic graph dataset generated.")
+        return GraphData(
+            adjacency=adjacency,
+            node_features=node_features,
+            labels=labels,
+            laplacian=None,
+            eigenvalues=None,
+            eigenvectors=None,
+            split_indices={}
+        )
+```

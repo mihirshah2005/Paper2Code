@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""
+dataset_loader.py
+
+This module implements the DatasetLoader class along with associated helper classes for
+loading and processing datasets for translation/parsing tasks. It includes functionality
+for:
+  - Reading raw datasets from local text files in a unified schema.
+  - Training (if needed) and loading SentencePiece subword tokenizers.
+  - Dynamically grouping examples into batches based on cumulative token counts.
+  - Wrapping the processed examples into a PyTorch Dataset and DataLoader with a
+    custom batch sampler and collate function.
+
+The design follows the structure outlined in "Attention Is All You Need," ensuring
+reproducibility by reading configuration values from the provided config.yaml.
+
+Author: [Your Name]
+Date: [Date]
+"""
+
+import os
+import logging
+import random
+import tempfile
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.nn.utils.rnn import pad_sequence
+
+import sentencepiece as spm
+
+# Configure module-level logger
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
+
+
+class TranslationDataset(Dataset):
+    """Custom Dataset for translation tasks.
+
+    Each example is a dict with keys:
+        "source": List[int]
+        "target": List[int]
+    """
+
+    def __init__(self, examples: List[Dict[str, Any]]):
+        """
+        Args:
+            examples: List of tokenized examples.
+        """
+        self.examples = examples
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        return self.examples[index]
+
+
+class ParsingDataset(Dataset):
+    """Custom Dataset for parsing tasks.
+
+    Each example is a dict with keys:
+        "sentence": List[int]
+        Optionally "parse": str (or any associated parse info)
+    """
+
+    def __init__(self, examples: List[Dict[str, Any]]):
+        """
+        Args:
+            examples: List of tokenized examples.
+        """
+        self.examples = examples
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        return self.examples[index]
+
+
+class DynamicBatchSampler(Sampler[List[int]]):
+    """Custom batch sampler that groups examples based on cumulative token counts.
+
+    For translation tasks, both source and target token counts are considered so that the
+    cumulative token count for each side does not exceed the specified limit.
+    For parsing tasks, the sentence token count is used.
+
+    Args:
+        dataset: The dataset object implementing __getitem__.
+        token_limit: The approximate maximum total tokens per batch (int).
+        task: Task type; either "translation" or "parsing".
+    """
+
+    def __init__(self, dataset: Dataset, token_limit: int, task: str):
+        self.dataset = dataset
+        self.token_limit = token_limit
+        if task not in ["translation", "parsing"]:
+            raise ValueError(f"Unsupported task type for batch sampler: {task}")
+        self.task = task
+        # Precompute batches based on token counts
+        self.batches = self._create_batches()
+
+    def _create_batches(self) -> List[List[int]]:
+        # Create list of indices and sort them by length to minimize padding.
+        indices = list(range(len(self.dataset)))
+        # Determine length key based on task.
+        if self.task == "translation":
+            # Use max(source, target) length
+            get_length = lambda idx: max(
+                len(self.dataset[idx]["source"]), len(self.dataset[idx]["target"])
+            )
+        else:  # parsing
+            get_length = lambda idx: len(self.dataset[idx]["sentence"])
+
+        # Sort indices by token-length
+        indices_sorted = sorted(indices, key=get_length)
+
+        batches = []
+        current_batch = []
+        current_src_sum = 0
+        current_tgt_sum = 0
+        current_sum = 0  # Used only for parsing
+        for idx in indices_sorted:
+            if self.task == "translation":
+                src_len = len(self.dataset[idx]["source"])
+                tgt_len = len(self.dataset[idx]["target"])
+                # If a single example exceeds the token_limit on either side,
+                # yield it as a single batch.
+                if src_len > self.token_limit or tgt_len > self.token_limit:
+                    if current_batch:  # yield batch built so far first.
+                        batches.append(current_batch)
+                        current_batch = []
+                        current_src_sum = 0
+                        current_tgt_sum = 0
+                    LOGGER.warning(
+                        f"Example {idx} has tokens (src: {src_len}, tgt: {tgt_len}) "
+                        f"exceeding the token limit ({self.token_limit}). Yielding it as a standalone batch."
+                    )
+                    batches.append([idx])
+                    continue
+                # If adding current example does not exceed token limits, add it.
+                if (current_src_sum + src_len <= self.token_limit) and (current_tgt_sum + tgt_len <= self.token_limit):
+                    current_batch.append(idx)
+                    current_src_sum += src_len
+                    current_tgt_sum += tgt_len
+                else:
+                    # Current batch is full; yield it and start a new batch.
+                    if current_batch:
+                        batches.append(current_batch)
+                    current_batch = [idx]
+                    current_src_sum = src_len
+                    current_tgt_sum = tgt_len
+            else:  # parsing
+                sent_len = len(self.dataset[idx]["sentence"])
+                if sent_len > self.token_limit:
+                    if current_batch:
+                        batches.append(current_batch)
+                        current_batch = []
+                        current_sum = 0
+                    LOGGER.warning(
+                        f"Parsing example {idx} with {sent_len} tokens exceeds the token limit ({self.token_limit}). "
+                        "Yielding it as a standalone batch."
+                    )
+                    batches.append([idx])
+                    continue
+                if current_sum + sent_len <= self.token_limit:
+                    current_batch.append(idx)
+                    current_sum += sent_len
+                else:
+                    if current_batch:
+                        batches.append(current_batch)
+                    current_batch = [idx]
+                    current_sum = sent_len
+
+        if current_batch:
+            batches.append(current_batch)
+        LOGGER.info(f"DynamicBatchSampler created {len(batches)} batches from {len(self.dataset)} examples.")
+        return batches
+
+    def __iter__(self):
+        # Optionally, shuffle the batch order for training
+        random.shuffle(self.batches)
+        for batch in self.batches:
+            yield batch
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
+def dynamic_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """
+    Collate function that pads sequences in a batch.
+    It supports both translation (with "source" and "target") and parsing tasks ("sentence", optionally "parse").
+
+    Args:
+        batch: List of examples, where each example is a dict containing lists of token ids.
+
+    Returns:
+        A dictionary mapping keys to padded tensors.
+    """
+    collated = {}
+    if "source" in batch[0]:
+        # Translation task: pad "source" and "target"
+        sources = [torch.tensor(example["source"], dtype=torch.long) for example in batch]
+        targets = [torch.tensor(example["target"], dtype=torch.long) for example in batch]
+        collated["source"] = pad_sequence(sources, batch_first=True, padding_value=0)
+        collated["target"] = pad_sequence(targets, batch_first=True, padding_value=0)
+    elif "sentence" in batch[0]:
+        # Parsing task: pad "sentence"; also include "parse" if available (left unpadded)
+        sentences = [torch.tensor(example["sentence"], dtype=torch.long) for example in batch]
+        collated["sentence"] = pad_sequence(sentences, batch_first=True, padding_value=0)
+        if "parse" in batch[0]:
+            # For parse trees, we keep raw strings in a list.
+            collated["parse"] = [example["parse"] for example in batch]
+    else:
+        raise ValueError("Batch examples do not contain expected keys for collation.")
+    return collated
+
+
+class DatasetLoader:
+    """
+    DatasetLoader is responsible for:
+      - Validating and parsing the configuration dictionary.
+      - Loading raw datasets for the specified task ("translation" or "parsing").
+      - Training (if needed) and loading a SentencePiece tokenizer.
+      - Tokenizing the raw examples.
+      - Creating PyTorch Dataset objects and DataLoaders with a dynamic batch sampler.
+
+    Methods:
+      load_data() -> Tuple[DataLoader, DataLoader, DataLoader]
+    """
+
+    def __init__(self, config: Dict[str, Any], task: str = "translation", dataset_key: Optional[str] = None,
+                 parsing_mode: Optional[str] = None) -> None:
+        """
+        Initializes the DatasetLoader.
+
+        Args:
+            config: Configuration dictionary parsed from config.yaml.
+            task: The task type ("translation" or "parsing"). Default is "translation".
+            dataset_key: For translation tasks, the key in config.data.translation.datasets to use.
+                         If None, the first available key will be used.
+            parsing_mode: For parsing tasks, the key for vocabulary selection (e.g., "wsj_only" or "semi_supervised").
+                         If None, defaults to "wsj_only".
+        Raises:
+            ValueError: If required configuration keys are missing or invalid.
+        """
+        self.config = config
+        self.task = task.lower()
+        if "data" not in config:
+            raise ValueError("Configuration error: key 'data' not found in config.")
+        if self.task == "translation":
+            if "translation" not in config["data"]:
+                raise ValueError("Configuration error: key 'data.translation' not found in config.")
+            translation_config = config["data"]["translation"]
+            if "datasets" not in translation_config or "vocabulary" not in translation_config:
+                raise ValueError("Configuration error: 'datasets' and 'vocabulary' must be provided under data.translation.")
+            # Select dataset key
+            if dataset_key is None:
+                dataset_keys = list(translation_config["datasets"].keys())
+                if not dataset_keys:
+                    raise ValueError("No translation dataset keys found in config.data.translation.datasets.")
+                self.dataset_key = dataset_keys[0]
+            else:
+                if dataset_key not in translation_config["datasets"]:
+                    raise ValueError(f"Dataset key '{dataset_key}' not found in config.data.translation.datasets.")
+                self.dataset_key = dataset_key
+            # Get dataset name and vocabulary size
+            self.translation_dataset_name = translation_config["datasets"][self.dataset_key]
+            self.translation_vocab_size = int(translation_config["vocabulary"][self.dataset_key])
+        elif self.task == "parsing":
+            if "parsing" not in config["data"]:
+                raise ValueError("Configuration error: key 'data.parsing' not found in config.")
+            parsing_config = config["data"]["parsing"]
+            if "dataset" not in parsing_config or "vocabulary" not in parsing_config:
+                raise ValueError("Configuration error: 'dataset' and 'vocabulary' must be provided under data.parsing.")
+            self.parsing_dataset_name = parsing_config["dataset"]
+            # Use parsing_mode to select vocabulary; default to "wsj_only"
+            if parsing_mode is None:
+                self.parsing_mode = "wsj_only"
+            else:
+                self.parsing_mode = parsing_mode
+            if self.parsing_mode not in parsing_config["vocabulary"]:
+                raise ValueError(f"Parsing vocabulary mode '{self.parsing_mode}' not found in config.data.parsing.vocabulary.")
+            self.parsing_vocab_size = int(parsing_config["vocabulary"][self.parsing_mode])
+        else:
+            raise ValueError(f"Unsupported task type: {self.task}")
+
+        # Read batch token limit from configuration
+        if "training" not in config or "batch_size_tokens" not in config["training"]:
+            raise ValueError("Configuration error: 'training.batch_size_tokens' must be provided.")
+        self.batch_token_limit = int(config["training"]["batch_size_tokens"])
+
+    def load_raw_datasets(self) -> Dict[str, List[Dict[str, str]]]:
+        """
+        Loads raw datasets from local text files.
+
+        For translation tasks, expected file paths:
+            data/translation/{dataset_name}/train.txt, val.txt, test.txt
+        Files should be tab-separated lines: "source[TAB]target"
+        For parsing tasks, expected file path:
+            data/parsing/{dataset_name}/train.txt, val.txt, test.txt
+        Files should be tab-separated lines: "sentence[TAB]parse" (if parse is available)
+        Returns:
+            A dict with keys "train", "val", "test", each a list of raw examples (dicts of strings).
+        """
+        splits = ["train", "val", "test"]
+        raw_datasets: Dict[str, List[Dict[str, str]]] = {}
+        if self.task == "translation":
+            base_dir = os.path.join("data", "translation", self.translation_dataset_name)
+        else:  # parsing
+            base_dir = os.path.join("data", "parsing", self.parsing_dataset_name)
+
+        for split in splits:
+            split_path = os.path.join(base_dir, f"{split}.txt")
+            examples: List[Dict[str, str]] = []
+            if not os.path.exists(split_path):
+                LOGGER.warning(f"File not found: {split_path}. Returning empty list for split '{split}'.")
+                raw_datasets[split] = examples
+                continue
+            with open(split_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Split by tab
+                    parts = line.split("\t")
+                    if self.task == "translation":
+                        if len(parts) < 2:
+                            LOGGER.warning(f"Line skipped in {split_path} (expected at least 2 columns): {line}")
+                            continue
+                        example = {"source": parts[0], "target": parts[1]}
+                    else:  # parsing
+                        if len(parts) >= 2:
+                            example = {"sentence": parts[0], "parse": parts[1]}
+                        else:
+                            example = {"sentence": parts[0]}
+                    examples.append(example)
+            LOGGER.info(f"Loaded {len(examples)} examples for split '{split}' from {split_path}.")
+            raw_datasets[split] = examples
+        return raw_datasets
+
+    def _train_sentencepiece_model(self, training_texts: List[str], model_prefix: str,
+                                   vocab_size: int) -> str:
+        """
+        Trains a SentencePiece model on the provided training texts.
+
+        Args:
+            training_texts: List of text strings to train on.
+            model_prefix: Prefix for the SentencePiece model files.
+            vocab_size: Target vocabulary size.
+
+        Returns:
+            The file path to the trained SentencePiece model (e.g., "spm_<prefix>.model").
+        """
+        # Write training data to a temporary file.
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", encoding="utf-8") as tmp_file:
+            tmp_filepath = tmp_file.name
+            for line in training_texts:
+                tmp_file.write(line.strip() + "\n")
+        spm_model_file = f"{model_prefix}.model"
+        try:
+            spm.SentencePieceTrainer.train(
+                input=tmp_filepath,
+                model_prefix=model_prefix,
+                vocab_size=vocab_size,
+                model_type="unigram",  # You may choose "bpe" or "unigram" as needed.
+                character_coverage=1.0,
+                pad_id=0,
+                unk_id=1,
+                bos_id=-1,
+                eos_id=-1,
+            )
+            LOGGER.info(f"Trained SentencePiece model saved as {spm_model_file}.")
+        finally:
+            os.remove(tmp_filepath)
+        return spm_model_file
+
+    def get_sentencepiece_processor(self, training_texts: List[str], vocab_size: int) -> spm.SentencePieceProcessor:
+        """
+        Loads a SentencePieceProcessor. If a model file for the current task and dataset does not exist,
+        trains a new model using the provided training texts.
+
+        Args:
+            training_texts: List of text strings from training examples.
+            vocab_size: Target vocabulary size.
+
+        Returns:
+            A loaded SentencePieceProcessor instance.
+        """
+        if self.task == "translation":
+            prefix = f"spm_{self.task}_{self.dataset_key}"
+        else:
+            prefix = f"spm_{self.task}_{self.parsing_dataset_name}_{self.parsing_mode}"
+        model_file = f"{prefix}.model"
+        if not os.path.exists(model_file):
+            LOGGER.info(f"SentencePiece model file {model_file} not found. Training a new model.")
+            self._train_sentencepiece_model(training_texts, prefix, vocab_size)
+        sp_proc = spm.SentencePieceProcessor(model_file=model_file)
+        return sp_proc
+
+    def tokenize_example(self, example: Dict[str, str], sp: spm.SentencePieceProcessor) -> Dict[str, List[int]]:
+        """
+        Tokenizes an individual example using the provided SentencePieceProcessor.
+
+        For translation tasks, tokenizes both "source" and "target".
+        For parsing tasks, tokenizes "sentence" and passes "parse" unchanged if present.
+
+        Args:
+            example: A raw example dict with string fields.
+            sp: A loaded SentencePieceProcessor.
+
+        Returns:
+            A dict with tokenized fields (lists of integers).
+        """
+        if self.task == "translation":
+            tokenized = {
+                "source": sp.encode_as_ids(example["source"]),
+                "target": sp.encode_as_ids(example["target"]),
+            }
+        else:  # parsing
+            tokenized = {"sentence": sp.encode_as_ids(example["sentence"])}
+            if "parse" in example:
+                tokenized["parse"] = example["parse"]
+        return tokenized
+
+    def build_dataset(self, raw_dataset: List[Dict[str, str]], sp: spm.SentencePieceProcessor) -> Dataset:
+        """
+        Applies tokenization to raw dataset examples and wraps them in a Dataset object.
+
+        Args:
+            raw_dataset: List of raw examples.
+            sp: A loaded SentencePieceProcessor.
+
+        Returns:
+            A PyTorch Dataset object.
+        """
+        tokenized_examples = []
+        for example in raw_dataset:
+            try:
+                tokenized = self.tokenize_example(example, sp)
+                tokenized_examples.append(tokenized)
+            except Exception as e:
+                LOGGER.error(f"Tokenization failed for example: {example} with error: {e}")
+        if self.task == "translation":
+            dataset = TranslationDataset(tokenized_examples)
+        else:
+            dataset = ParsingDataset(tokenized_examples)
+        LOGGER.info(f"Built dataset with {len(dataset)} examples.")
+        return dataset
+
+    def load_data(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        """
+        Main function to load processed datasets and return DataLoaders for train, validation, and test splits.
+
+        Returns:
+            A tuple (train_loader, val_loader, test_loader) of PyTorch DataLoader objects.
+        """
+        # Load raw datasets
+        raw_datasets = self.load_raw_datasets()
+
+        # Collect training texts for SentencePiece training. For translation, combine source and target.
+        training_texts: List[str] = []
+        if self.task == "translation":
+            for example in raw_datasets.get("train", []):
+                training_texts.append(example["source"])
+                training_texts.append(example["target"])
+            vocab_size = self.translation_vocab_size
+        else:
+            for example in raw_datasets.get("train", []):
+                training_texts.append(example["sentence"])
+            vocab_size = self.parsing_vocab_size
+
+        if not training_texts:
+            raise ValueError("No training texts found to train SentencePiece model.")
+
+        # Load or train SentencePiece processor
+        sp_processor = self.get_sentencepiece_processor(training_texts, vocab_size)
+
+        # Build tokenized datasets for each split
+        train_dataset = self.build_dataset(raw_datasets.get("train", []), sp_processor)
+        val_dataset = self.build_dataset(raw_datasets.get("val", []), sp_processor)
+        test_dataset = self.build_dataset(raw_datasets.get("test", []), sp_processor)
+
+        # Create DataLoaders with custom dynamic batch sampler and collate function.
+        train_batch_sampler = DynamicBatchSampler(train_dataset, self.batch_token_limit, self.task)
+        val_batch_sampler = DynamicBatchSampler(val_dataset, self.batch_token_limit, self.task)
+        test_batch_sampler = DynamicBatchSampler(test_dataset, self.batch_token_limit, self.task)
+
+        train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, collate_fn=dynamic_collate_fn, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, collate_fn=dynamic_collate_fn, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_sampler=test_batch_sampler, collate_fn=dynamic_collate_fn, num_workers=4)
+
+        LOGGER.info("DataLoaders created for train, validation, and test splits.")
+        return train_loader, val_loader, test_loader
